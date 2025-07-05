@@ -5,10 +5,10 @@
 ## Features
 
 - **100% Rust** - No Python dependencies whatsoever
-- **All Diffusion Models** - SD 1.5, SD 2.1, SDXL, SD 3.5, Flux, and more
-- **All Training Methods** - LoRA, LoKr, DoRA, LoCoN, DreamBooth, Textual Inversion
-- **Production Ready** - 6.6+ it/s on RTX 3090 Ti
+- **SD 3.5 LoKr Training** - Currently implemented and working at 6.6+ it/s on RTX 3090 Ti
+- **More Models Coming** - SDXL, Flux, and others in development
 - **Memory Efficient** - Gradient checkpointing, mixed precision, and intelligent caching
+- **Pure Candle Framework** - No PyTorch, no Python
 
 ## Quick Start
 
