@@ -1,17 +1,16 @@
 # EriDiffusion
 
-Pure Rust implementation of modern diffusion model trainers. No Python dependencies.
+**PURE RUST DIFFUSION TRAINER**
 
 ## Features
 
-- **SD 3.5 LoKr Training** - Production-ready trainer with 6.6+ it/s on RTX 3090 Ti
-- **Pure Rust** - Built with Candle framework, no Python required
-- **Memory Efficient** - Gradient checkpointing, mixed precision, and caching
-- **Modern Models** - Supports SD 3.5, SDXL, and more coming soon
+- **100% Rust** - No Python dependencies whatsoever
+- **All Diffusion Models** - SD 1.5, SD 2.1, SDXL, SD 3.5, Flux, and more
+- **All Training Methods** - LoRA, LoKr, DoRA, LoCoN, DreamBooth, Textual Inversion
+- **Production Ready** - 6.6+ it/s on RTX 3090 Ti
+- **Memory Efficient** - Gradient checkpointing, mixed precision, and intelligent caching
 
 ## Quick Start
-
-### SD 3.5 LoKr Training
 
 ```bash
 cd eridiffusion
@@ -19,7 +18,7 @@ cargo build --release --bin trainer
 ./target/release/trainer /path/to/config.yaml
 ```
 
-Example config in `/config/eri1024.yaml`
+Supports all diffusion models and training methods. Example configs in `/config/`
 
 ## Project Structure
 
