@@ -1,0 +1,33 @@
+[package]
+name = "eridiffusion-web"
+version = "0.1.0"
+edition = "2021"
+authors = ["AI-Toolkit Contributors"]
+description = "Web UI and API server for ai-toolkit"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+eridiffusion-core = { path = "../core" }
+eridiffusion-inference = { path = "../inference" }
+
+# Web framework
+axum = { version = "0.7", features = ["multipart"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["fs", "cors"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async
+tokio = { version = "1.40", features = ["full"] }
+async-trait = "0.1"
+
+# WebSocket
+tokio-tungstenite = "0.21"
+
+# Templates
+askama = "0.12"
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }

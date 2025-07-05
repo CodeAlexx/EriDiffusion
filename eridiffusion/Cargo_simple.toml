@@ -1,0 +1,21 @@
+[package]
+name = "lokr-trainer"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "train_lokr"
+path = "train_lokr.rs"
+
+[dependencies]
+candle-core = { version = "0.9", features = ["cuda"] }
+candle-nn = "0.9"
+safetensors = "0.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+tokio = { version = "1.40", features = ["full"] }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+image = "0.25"
+rand = "0.8"

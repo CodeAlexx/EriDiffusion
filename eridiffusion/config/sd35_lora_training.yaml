@@ -1,0 +1,80 @@
+# SD 3.5 LoRA Training Configuration
+
+model:
+  type: sd35
+  variant: medium  # medium, large, or large-turbo
+  path: /home/alex/SwarmUI/Models/diffusion/sd3.5_medium.safetensors
+  
+text_encoders:
+  clip_l_path: /home/alex/SwarmUI/Models/clip/clip_l.safetensors
+  clip_g_path: /home/alex/SwarmUI/Models/clip/clip_g.safetensors
+  t5_path: /home/alex/SwarmUI/Models/text_encoder/t5-v1_1-xxl.safetensors
+
+vae:
+  path: /home/alex/SwarmUI/Models/VAE/sd3_vae.safetensors
+  scaling_factor: 1.5305
+
+lora:
+  rank: 32
+  alpha: 32.0
+  dropout: 0.0
+  include_mlp: false  # Whether to include MLP layers
+  target_modules:
+    # Joint attention blocks
+    - "joint_blocks.*.attn.qkv"
+    - "joint_blocks.*.attn.qkv_context"
+    - "joint_blocks.*.attn.proj"
+    - "joint_blocks.*.attn.proj_context"
+
+training:
+  output_dir: ./output/sd35_lora
+  num_train_epochs: 100
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-4
+  train_text_encoders: false
+  text_encoder_lr_multiplier: 0.1
+  mixed_precision: true
+  gradient_checkpointing: true
+  save_steps: 1000
+  validation_steps: 100
+  logging_steps: 10
+  max_grad_norm: 1.0
+  seed: 42
+  cfg_scale: 7.0
+  
+dataset:
+  type: directory
+  path: /path/to/training/data
+  resolution: 1024
+  center_crop: true
+  random_flip: true
+  caption_dropout: 0.1
+  
+scheduler:
+  type: cosine_annealing
+  num_warmup_steps: 500
+  num_cycles: 1
+  
+optimizer:
+  type: adamw
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  
+loss:
+  type: flow_matching
+  weight: 1.0
+  reduction: mean
+  
+validation:
+  prompts:
+    - "a beautiful landscape painting in the style of Monet"
+    - "a futuristic robot in a cyberpunk city"
+    - "a majestic dragon flying over mountains"
+  num_inference_steps: 28
+  guidance_scale: 7.0
+  
+device: cuda
+resume_from: null
+push_to_hub: false

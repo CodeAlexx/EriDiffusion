@@ -1,0 +1,62 @@
+# Example training configuration for AI-Toolkit
+
+model:
+  architecture: sdxl
+  path: "stabilityai/stable-diffusion-xl-base-1.0"
+  
+network:
+  adapter_type: lora
+  rank: 32
+  alpha: 16
+  target_modules:
+    - "to_q"
+    - "to_v"
+    - "to_k"
+    - "to_out.0"
+  dropout: 0.1
+
+data:
+  dataset_path: "./data/training_images"
+  caption_extension: "txt"
+  num_workers: 4
+  enable_bucket: true
+  resolution: 1024
+  center_crop: true
+  random_flip: true
+  shuffle_tags: true
+  keep_tokens: 1
+
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  num_epochs: 10
+  learning_rate: 5e-5
+  lr_scheduler: "cosine"
+  lr_warmup_steps: 100
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 0.01
+  adam_epsilon: 1e-8
+  max_grad_norm: 1.0
+  gradient_checkpointing: true
+  mixed_precision: "fp16"
+  save_steps: 500
+  eval_steps: 100
+  logging_steps: 10
+  output_dir: "./outputs/sdxl_lora"
+  seed: 42
+
+optimizer:
+  type: "adamw"
+  use_8bit: false
+
+loss:
+  type: "mse"
+  snr_gamma: 5.0
+
+validation:
+  prompts:
+    - "a beautiful landscape, highly detailed"
+    - "portrait of a person, professional photography"
+  num_inference_steps: 25
+  guidance_scale: 7.5

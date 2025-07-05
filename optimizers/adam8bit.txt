@@ -1,0 +1,181 @@
+Key Improvements Made
+
+Better Numerical Stability: Added checks for empty tensors, non-finite values, and improved zero-point computation to prevent overflow/underflow issues.
+Adaptive Quantization: The quantization can now adapt based on quantization error - if error becomes too high, it automatically uses more conservative quantization.
+Quantization Warmup: During the first N steps, the optimizer uses less aggressive quantization (or no quantization) to allow the optimization to stabilize before applying aggressive compression.
+Enhanced Error Handling: Added validation for gradients and proper error propagation throughout the quantization pipeline.
+Memory Monitoring: Added methods to track actual memory usage and quantization statistics for debugging and optimization.
+Improved Configuration: More configurable quantization parameters with sensible defaults.
+
+Usage Example
+rust// Create optimizer with custom quantization settings
+let config = AdamW8bitConfig {
+    lr: 1e-4,
+    quantile_alpha: 0.995, // More conservative clipping
+    adaptive_quantization: true,
+    quantization_warmup_steps: 200,
+    ..Default::default()
+};
+
+let optimizer = AdamW8bit::new(var_map, config)?;
+
+// Monitor memory usage
+println!("Quantized state memory: {:.2} MB", 
+         optimizer.quantized_memory_usage() as f64 / 1e6);
+
+// Check quantization quality
+let (m_error, v_error) = optimizer.quantization_stats();
+println!("Quantization errors - Momentum: {:.6}, Velocity: {:.6}", 
+         m_error, v_error);
+The enhanced version should be more robust for production use while maintaining the memory efficiency benefits of 8-bit quantization.RetryACan you give me prodigyEditI'll help you implement the Prodigy optimizer! Prodigy is a recent adaptive learning rate optimizer that automatically estimates and adjusts the learning rate during training, making it very convenient as it requires minimal hyperparameter tuning.Prodigy Optimizer ImplementationCode //! Prodigy optimizer implementation for Candle
+//! Based on "Prodigy: An Expeditiously Adaptive Parameter-Free Learner"
+//! https://arxiv.org/abs/2306.06101
+
+use candle_core::{DType, Device, Result, Tensor, D, Var};
+use candle_nn::{Optimizer as CanOHere's a complete implementation of the Prodigy optimizer! This is based on the paper "Prodigy: An Expeditiously Adaptive Parameter-Free Learner" and provides automatic learning rate adaptation.
+Key Features of Prodigy
+Parameter-Free: Automatically estimates and adjusts the learning rate during training, requiring minimal hyperparameter tuning.
+Adaptive Learning Rate: Uses the D-estimate mechanism to continuously adapt the learning rate based on the optimization trajectory.
+Robust: Works well across different domains (NLP, vision, etc.) with the same hyperparameters.
+Usage Examples
+rust// Basic usage with default settings
+let config = ProdigyConfig::default();
+let optimizer = create_prodigy_optimizer(vars, Some(config))?;
+
+// Use preset configurations for different domains
+let llm_optimizer = create_prodigy_preset(vars, "language")?;
+let vision_optimizer = create_prodigy_preset(vars, "vision")?;
+let finetune_optimizer = create_prodigy_preset(vars, "finetune")?;
+
+// Custom configuration
+let custom_config = ProdigyConfig {
+    d0: 1e-6,           // Initial learning rate estimate
+    growth_rate: f64::INFINITY,  // Allow unlimited growth
+    beta1: 0.9,         // Momentum coefficient
+    beta2: 0.999,       // Second moment coefficient  
+    beta3: 0.999,       // D-estimation coefficient
+    epsilon: 1e-8,      // Numerical stability
+    weight_decay: 0.01, // L2 regularization
+};
+
+// Monitor optimization progress
+let mut monitor = ProdigyMonitor::new();
+
+// Training loop
+for step in 0..num_steps {
+    let loss = model.forward(&batch)?;
+    optimizer.backward_step(&loss)?;
+    
+    // Record progress every 100 steps
+    if step % 100 == 0 {
+        monitor.record(&optimizer);
+        println!("Step {}: D-estimate = {:.2e}", 
+                 step, optimizer.current_learning_rate());
+    }
+}
+
+// Print summary
+println!("{}", monitor.summary());
+Key Advantages
+
+No Learning Rate Tuning: Automatically finds and adjusts the learning rate
+Domain Agnostic: Works well for language models, vision tasks, and more
+Stable Training: Built-in mechanisms prevent learning rate from becoming too large
+Easy Migration: Drop-in replacement for Adam/AdamW with better convergence
+
+Configuration Notes
+
+d0: Initial learning rate estimate (start small, like 1e-6)
+growth_rate: Maximum allowed growth for D-estimate (use inf for unlimited)
+beta3: Controls how quickly D-estimate adapts (0.999 is usually good)
+weight_decay: Standard L2 regularization (0.01 for LLMs, 0.05 for vision)
+
+The implementation includes monitoring capabilities to track how the learning rate evolves during training, which can be very useful for understanding your model's optimization dynamics!RetryALion if possibleEditI'll implement the Lion (EvoLved Sign Momentum) optimizer for you! Lion is a simple yet effective optimizer that uses only the sign of gradients and momentum, making it very memory efficient.Lion Optimizer ImplementationCode //! Lion (EvoLved Sign Momentum) optimizer implementation for Candle
+//! Based on "Symbolic Discovery of Optimization Algorithms"
+//! https://arxiv.org/abs/2302.06675
+
+use candle_core::{DType, Device, Result, Tensor, D, Var};
+use candle_nn::{OptimizeHere's a complete implementation of the Lion (EvoLved Sign Momentum) optimizer! Lion is remarkably simple yet effective - it only uses the sign of gradients and momentum, making it extremely memory efficient.
+Key Features of Lion
+Memory Efficient: Uses only momentum states (same memory as SGD with momentum) - 33% less memory than Adam/AdamW!
+Sign-Based Updates: Uses only the sign of gradients, making it robust to gradient scaling and outliers.
+Simple Algorithm: Much simpler than Adam but often performs comparably or better.
+Fast Convergence: Despite using smaller learning rates, often converges faster than Adam.
+Usage Examples
+rust// Basic usage - note the smaller learning rate!
+let config = LionConfig {
+    lr: 1e-4,           // Much smaller than Adam (typically 1e-3)
+    beta1: 0.9,         // Momentum for update direction
+    beta2: 0.99,        // Momentum for momentum update
+    weight_decay: 0.01,
+};
+let optimizer = create_lion_optimizer(vars, Some(config))?;
+
+// Use presets for different domains
+let llm_optimizer = create_lion_preset(vars, "language")?;
+let vision_optimizer = create_lion_preset(vars, "vision")?;
+let finetune_optimizer = create_lion_preset(vars, "finetune")?;
+
+// Convert from Adam learning rate
+let adam_lr = 1e-3;
+let lion_lr = LionTrainingGuide::convert_adam_lr(adam_lr); // Returns 1e-4
+
+// Lion with learning rate scheduling
+let schedule = LionSchedule::Cosine {
+    total_steps: 10000,
+    min_lr: 1e-6,
+};
+let scheduled_optimizer = create_scheduled_lion(vars, config, schedule)?;
+
+// Memory usage comparison
+compare_optimizer_memory(1_000_000_000); // 1B parameters
+
+// Training tips
+LionTrainingGuide::print_tips();
+The Lion Algorithm
+Lion is beautifully simple:
+
+Update Direction: sign(β₁ * momentum + (1-β₁) * gradient)
+Parameter Update: param = param - lr * (update_direction + weight_decay * param)
+Momentum Update: momentum = β₂ * momentum + (1-β₂) * gradient
+
+That's it! No second moments, no bias correction, just signs and momentum.
+Key Advantages
+
+Memory Efficient: Same memory usage as SGD with momentum (33% less than Adam)
+Robust: Sign-based updates are robust to gradient outliers and scaling
+Simple: Much simpler implementation and fewer hyperparameters
+Effective: Often matches or beats Adam performance
+Fast: Despite smaller learning rates, often converges faster
+
+Important Notes
+
+Learning Rate: Use 3-10x smaller learning rate than Adam (1e-4 instead of 1e-3)
+Weight Decay: Lion can be more sensitive to weight decay values
+Sign Function: The key insight is using only gradient signs, not magnitudes
+Memory: Perfect for large models where memory is constrained
+
+Training Tips
+rust// Monitor your training
+let mut monitor = LionMonitor::new();
+
+for step in 0..num_steps {
+    let loss = model.forward(&batch)?;
+    optimizer.backward_step(&loss)?;
+    
+    if step % 100 == 0 {
+        monitor.record(&optimizer);
+        println!("Step {}: LR = {:.2e}, Loss = {:.4}", 
+                 step, optimizer.learning_rate(), loss);
+    }
+}
+
+println!("{}", monitor.summary());
+Lion is particularly effective for:
+
+Large language models (often outperforms Adam)
+Memory-constrained training
+When you want simpler, more robust optimization
+Fine-tuning tasks (very stable)
+
+The implementation includes learning rate scheduling, monitoring, and preset configurations for different use cases!

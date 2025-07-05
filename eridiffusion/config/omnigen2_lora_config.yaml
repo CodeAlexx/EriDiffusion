@@ -1,0 +1,225 @@
+# OmniGen 2 LoRA Training Configuration - Dual-path Architecture
+
+model:
+  # Text model component (Qwen2.5-VL-3B)
+  text_model_path: "/path/to/Qwen2.5-VL-3B"
+  
+  # Diffusion transformer component
+  diffusion_model_path: "/path/to/omnigen2-diffusion"
+  
+  # VAE from SDXL
+  vae_path: "/path/to/sdxl-vae"
+  
+  # Architecture settings
+  text_hidden_size: 3072
+  text_num_layers: 36
+  text_num_heads: 24
+  vocab_size: 151936
+  
+  diffusion_hidden_size: 1536
+  diffusion_num_layers: 28
+  diffusion_num_heads: 24
+  
+  vit_hidden_size: 1024
+  patch_size: 14
+  
+network:
+  type: "lora"
+  rank: 16
+  alpha: 16.0
+  dropout: 0.0
+  
+  # Component-specific target modules
+  text_model_targets:
+    # Qwen2.5-VL attention layers (usually frozen)
+    - "text_model.layers.*.self_attn.q_proj"
+    - "text_model.layers.*.self_attn.k_proj"
+    - "text_model.layers.*.self_attn.v_proj"
+    - "text_model.layers.*.self_attn.o_proj"
+    
+  vit_encoder_targets:
+    # ViT encoder layers (usually frozen)
+    - "vit_encoder.blocks.*.attn.q_proj"
+    - "vit_encoder.blocks.*.attn.k_proj"
+    - "vit_encoder.blocks.*.attn.v_proj"
+    - "vit_encoder.blocks.*.attn.o_proj"
+    
+  diffusion_transformer_targets:
+    # Diffusion transformer layers (main training target)
+    - "diffusion_transformer.blocks.*.attn.q_proj"
+    - "diffusion_transformer.blocks.*.attn.k_proj"
+    - "diffusion_transformer.blocks.*.attn.v_proj"
+    - "diffusion_transformer.blocks.*.attn.o_proj"
+    - "diffusion_transformer.blocks.*.mlp.fc1"
+    - "diffusion_transformer.blocks.*.mlp.fc2"
+
+training:
+  # Component training flags
+  train_text_model: false      # Usually keep frozen
+  train_vit_encoder: false     # Usually keep frozen
+  train_diffusion_transformer: true  # Main training target
+  
+  # Learning rates
+  text_model_lr: 1e-5         # If training text model
+  diffusion_lr: 1e-4          # For diffusion transformer
+  
+  # Basic settings
+  batch_size: 1
+  gradient_accumulation: 4
+  num_steps: 3000
+  warmup_steps: 100
+  
+  # Loss configuration
+  loss_type: "flow_matching"  # Options: flow_matching, epsilon, v_prediction
+  
+  # Optimizer
+  optimizer: "adamw"
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1e-8
+  weight_decay: 0.01
+  
+  # Gradient management
+  gradient_clip_val: 1.0
+  gradient_checkpointing: true
+  
+  # Precision
+  mixed_precision: true
+  dtype: "bf16"
+  
+  # Schedulers
+  lr_scheduler: "cosine"
+  lr_scheduler_num_cycles: 1
+  
+  # Dropout
+  caption_dropout: 0.1
+  
+dataset:
+  # Data paths
+  train_path: "/path/to/train/data"
+  val_path: "/path/to/val/data"
+  
+  # Processing
+  resolution: 1024
+  center_crop: false
+  random_flip: true
+  
+  # Caption settings
+  caption_column: "text"
+  caption_dropout_rate: 0.1
+  
+  # Caching
+  cache_latents: true
+  cache_vae_features: true    # Important for OmniGen 2
+  
+  # Workers
+  num_workers: 4
+  prefetch_factor: 2
+  
+sampling:
+  # Sampling during training
+  sample_every: 250
+  num_samples: 4
+  
+  # Generation settings
+  num_inference_steps: 50
+  guidance_scale: 7.5
+  
+  # Sample prompts
+  prompts:
+    - "A serene lake at sunset with mountains in the background"
+    - "A futuristic city with flying cars and neon lights"
+    - "Portrait of a person in Renaissance style"
+    - "A cat playing piano in a jazz club"
+    - "Abstract art with vibrant colors and geometric shapes"
+    - "A cozy cabin in a snowy forest"
+    
+  # Negative prompt
+  negative_prompt: "low quality, blurry, distorted, watermark"
+  
+checkpointing:
+  # Save settings
+  save_every: 500
+  save_total_limit: 5
+  save_best_only: false
+  
+  # What to save
+  save_model: true
+  save_optimizer: true
+  save_scheduler: true
+  save_training_state: true
+  
+  # Component-specific saves
+  save_text_model: false      # Only if training
+  save_vit_encoder: false     # Only if training
+  save_diffusion_transformer: true
+  save_lora_weights: true
+  
+  # Resume
+  resume_from_checkpoint: null
+  
+output:
+  # Paths
+  output_dir: "output/omnigen2_lora"
+  logging_dir: "logs"
+  
+  # Logging
+  log_every: 10
+  log_with: ["tensorboard"]
+  
+  # Visualization
+  save_samples: true
+  save_sample_grid: true
+  
+validation:
+  # Validation settings
+  val_every: 500
+  val_batch_size: 1
+  
+  # Metrics
+  compute_fid: false
+  compute_clip_score: true
+  
+experiment:
+  # Experiment info
+  name: "omnigen2_lora_diffusion"
+  tags: ["omnigen2", "lora", "dual-path", "diffusion"]
+  
+  # Reproducibility
+  seed: 42
+  deterministic: true
+  
+  # Hardware
+  device: "cuda:0"
+  distributed: false
+  
+# Memory optimization
+memory_optimization:
+  # For limited VRAM (< 24GB)
+  cpu_offload_text_model: true  # Offload Qwen to CPU
+  cpu_offload_vae: false        # Keep VAE on GPU
+  gradient_checkpointing: true
+  
+  # Batch size adjustments
+  effective_batch_size: 4       # Via gradient accumulation
+  
+# Architecture notes
+architecture_info:
+  components:
+    - "Qwen2.5-VL-3B: Text understanding and generation"
+    - "ViT Encoder: Image understanding for text model"
+    - "Diffusion Transformer: ~4B param image generation model"
+    - "SDXL VAE: Image encoding/decoding"
+  
+  data_flow:
+    - "Text → Qwen2.5-VL → Hidden states → Diffusion conditioning"
+    - "Images → ViT → Visual features for text model"
+    - "Images → VAE → Fine-grained features → Diffusion conditioning"
+    - "Diffusion transformer generates in latent space"
+    - "VAE decoder produces final images"
+  
+  training_strategy:
+    - "Usually only train diffusion transformer with LoRA"
+    - "Text model and ViT encoder typically frozen"
+    - "VAE always frozen (from SDXL)"
+    - "Can optionally fine-tune text model for domain adaptation"

@@ -1,0 +1,36 @@
+# Example inference configuration for AI-Toolkit
+
+model:
+  path: "runwayml/stable-diffusion-v1-5"
+  device: "cuda"
+  precision: "fp16"
+  compile_model: false
+  use_flash_attention: true
+
+scheduler:
+  type: "ddim"
+  num_inference_steps: 25
+  eta: 0.0
+
+generation:
+  guidance_scale: 7.5
+  width: 512
+  height: 512
+  batch_size: 1
+  seed: 42
+
+lora:
+  enabled: true
+  path: "./outputs/my_lora.safetensors"
+  scale: 1.0
+
+control_adapters:
+  - type: "controlnet"
+    path: "lllyasviel/sd-controlnet-canny"
+    scale: 1.0
+    conditioning_scale: 1.0
+
+output:
+  format: "png"
+  quality: 95
+  save_metadata: true

@@ -1,0 +1,26 @@
+{
+  "model": "sd35",
+  "dataset": {
+    "path": "/home/alex/40_woman",
+    "resolution": 1024,
+    "repeats": 20,
+    "cache_latents": true
+  },
+  "network": {
+    "type": "lokr",
+    "rank": 16,
+    "alpha": 16,
+    "factor": 4,
+    "use_tucker": true,
+    "target_modules": ["to_q", "to_k", "to_v", "to_out.0"]
+  },
+  "training": {
+    "batch_size": 1,
+    "learning_rate": 0.0001,
+    "steps": 2000,
+    "warmup_steps": 100,
+    "save_every": 250,
+    "sample_every": 250
+  },
+  "output_dir": "output/sd35_lokr_rust"
+}

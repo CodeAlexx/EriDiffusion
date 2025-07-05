@@ -1,0 +1,60 @@
+prodidgy notes
+Here's a complete implementation of the Prodigy optimizer! This is based on the paper "Prodigy: An Expeditiously Adaptive Parameter-Free Learner" and provides automatic learning rate adaptation.
+Key Features of Prodigy
+Parameter-Free: Automatically estimates and adjusts the learning rate during training, requiring minimal hyperparameter tuning.
+Adaptive Learning Rate: Uses the D-estimate mechanism to continuously adapt the learning rate based on the optimization trajectory.
+Robust: Works well across different domains (NLP, vision, etc.) with the same hyperparameters.
+Usage Examples
+rust// Basic usage with default settings
+let config = ProdigyConfig::default();
+let optimizer = create_prodigy_optimizer(vars, Some(config))?;
+
+// Use preset configurations for different domains
+let llm_optimizer = create_prodigy_preset(vars, "language")?;
+let vision_optimizer = create_prodigy_preset(vars, "vision")?;
+let finetune_optimizer = create_prodigy_preset(vars, "finetune")?;
+
+// Custom configuration
+let custom_config = ProdigyConfig {
+    d0: 1e-6,           // Initial learning rate estimate
+    growth_rate: f64::INFINITY,  // Allow unlimited growth
+    beta1: 0.9,         // Momentum coefficient
+    beta2: 0.999,       // Second moment coefficient  
+    beta3: 0.999,       // D-estimation coefficient
+    epsilon: 1e-8,      // Numerical stability
+    weight_decay: 0.01, // L2 regularization
+};
+
+// Monitor optimization progress
+let mut monitor = ProdigyMonitor::new();
+
+// Training loop
+for step in 0..num_steps {
+    let loss = model.forward(&batch)?;
+    optimizer.backward_step(&loss)?;
+    
+    // Record progress every 100 steps
+    if step % 100 == 0 {
+        monitor.record(&optimizer);
+        println!("Step {}: D-estimate = {:.2e}", 
+                 step, optimizer.current_learning_rate());
+    }
+}
+
+// Print summary
+println!("{}", monitor.summary());
+Key Advantages
+
+No Learning Rate Tuning: Automatically finds and adjusts the learning rate
+Domain Agnostic: Works well for language models, vision tasks, and more
+Stable Training: Built-in mechanisms prevent learning rate from becoming too large
+Easy Migration: Drop-in replacement for Adam/AdamW with better convergence
+
+Configuration Notes
+
+d0: Initial learning rate estimate (start small, like 1e-6)
+growth_rate: Maximum allowed growth for D-estimate (use inf for unlimited)
+beta3: Controls how quickly D-estimate adapts (0.999 is usually good)
+weight_decay: Standard L2 regularization (0.01 for LLMs, 0.05 for vision)
+
+The implementation includes monitoring capabilities to track how the learning rate evolves during training, which can be very useful for understanding your model's optimization dynamics!RetryA

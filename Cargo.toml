@@ -1,0 +1,73 @@
+[package]
+name = "diffusers"
+version = "0.5.0"
+edition = "2021"
+authors = ["laurent <laurent.mazare@gmail.com>"]
+keywords = ["deep-learning", "neural-network", "pytorch", "stable-diffusion"]
+categories = ["science"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/LaurentMazare/diffusers-rs"
+description = "An implementation of diffusion models for Rust leveraging libtorch"
+
+[dependencies]
+anyhow = { version = "1", features = ["backtrace"] }
+candle-core = { path = "./candle-official/candle-core", features = ["cuda"] }
+candle-nn = { path = "./candle-official/candle-nn" }
+candle-transformers = { path = "./candle-official/candle-transformers" }
+half = { version = "2.3", features = ["num-traits", "serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+# tch = "0.17"
+serde_json = "1.0"
+image = { version = "0.25", features = ["png"] }
+regex = "1.5"
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+memmap2 = { version = "0.9", features = ["stable_deref_trait"] }
+safetensors = "0.4"
+rand = "0.8"
+
+[dependencies.clap]
+version = "4"
+optional = true
+features = ["derive"]
+
+[dev-dependencies]
+clap = { version = "4", features = ["derive"] }
+
+[features]
+default = []
+clap = ["dep:clap"]
+accelerate = []
+mkl = []
+imageproc = []
+
+[profile.release]
+opt-level = 3
+
+[[bin]]
+name = "train_sd35_lokr_real"
+path = "train_sd35_lokr_minimal.rs"
+required-features = []
+
+[[bin]]
+name = "trainer"
+path = "src/bin/trainer.rs"
+required-features = []
+
+[[example]]
+name = "stable-diffusion"
+required-features = ["clap"]
+
+[[example]]
+name = "stable-diffusion-img2img"
+required-features = ["clap"]
+
+[[example]]
+name = "stable-diffusion-inpaint"
+required-features = ["clap"]
+
+[[example]]
+name = "controlnet"
+required-features = ["clap", "imageproc"]
+

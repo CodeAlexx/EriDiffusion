@@ -1,0 +1,75 @@
+# Flux LoRA Training Configuration
+
+model:
+  type: flux
+  variant: schnell  # or "dev"
+  path: /home/alex/SwarmUI/Models/diffusion/flux1-schnell.safetensors
+  
+text_encoders:
+  clip_path: /home/alex/SwarmUI/Models/clip/clip_l.safetensors
+  t5_path: /home/alex/SwarmUI/Models/text_encoder/t5-v1_1-xxl.safetensors
+
+lora:
+  rank: 32
+  alpha: 32.0
+  dropout: 0.0
+  target_modules:
+    # Double stream blocks - target both image and text attention
+    - "double_blocks.*.img_attn.qkv"
+    - "double_blocks.*.img_attn.proj"
+    - "double_blocks.*.txt_attn.qkv"
+    - "double_blocks.*.txt_attn.proj"
+    # Single stream blocks
+    - "single_blocks.*.linear1"
+    - "single_blocks.*.linear2"
+
+training:
+  output_dir: ./output/flux_lora
+  num_train_epochs: 100
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-4
+  text_encoder_lr_multiplier: 0.1
+  mixed_precision: true
+  gradient_checkpointing: true
+  save_steps: 1000
+  validation_steps: 100
+  logging_steps: 10
+  max_grad_norm: 1.0
+  seed: 42
+  
+dataset:
+  type: directory
+  path: /path/to/training/data
+  resolution: 1024
+  center_crop: true
+  random_flip: true
+  caption_dropout: 0.1
+  
+scheduler:
+  type: cosine_annealing
+  num_warmup_steps: 500
+  num_cycles: 1
+  
+optimizer:
+  type: adamw
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  
+loss:
+  type: flow_matching
+  weight: 1.0
+  reduction: mean
+  
+validation:
+  prompts:
+    - "a beautiful landscape painting"
+    - "a portrait of a person in anime style"
+    - "a futuristic cityscape at night"
+  num_inference_steps: 28
+  guidance_scale: 3.5
+  
+device: cuda
+resume_from: null
+push_to_hub: false

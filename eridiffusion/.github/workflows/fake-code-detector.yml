@@ -1,0 +1,131 @@
+name: Fake Code Detection
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  detect-fake-code:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install ripgrep
+      run: |
+        curl -LO https://github.com/BurntSushi/ripgrep/releases/download/13.0.0/ripgrep_13.0.0_amd64.deb
+        sudo dpkg -i ripgrep_13.0.0_amd64.deb
+    
+    - name: Scan for fake code patterns
+      id: scan
+      run: |
+        # Create scanner script
+        cat > scan_fake_code.sh << 'EOF'
+        #!/bin/bash
+        
+        FAKE_PATTERNS=(
+          "TODO"
+          "FIXME"
+          "XXX"
+          "HACK"
+          "BUG"
+          "placeholder"
+          "dummy"
+          "mock"
+          "fake"
+          "not implemented"
+          "unimplemented!"
+          "todo!"
+          "unreachable!()"
+          "panic!(\"not implemented"
+          "return Ok\(.*clone\(\)\)"
+          "vec!\[0u8;.*\].*// placeholder"
+          "Tensor::zeros.*// dummy"
+          "Tensor::randn.*// mock"
+          "would.*actual.*implementation"
+          "simplified.*would use"
+          "hardcoded"
+          "stub"
+        )
+        
+        EXCLUSIONS=(
+          "test"
+          "tests"
+          "examples"
+          "benchmark"
+          "MockDataset"
+          "#\[cfg\(test\)\]"
+          "#\[test\]"
+          "compatibility wrapper"
+          "We simulate"
+          ".md"
+          "fake-code-detector"
+          "scan_fake_code.sh"
+        )
+        
+        # Build exclusion pattern
+        EXCLUDE_PATTERN=""
+        for pattern in "${EXCLUSIONS[@]}"; do
+          EXCLUDE_PATTERN="$EXCLUDE_PATTERN -e $pattern"
+        done
+        
+        # Scan for each pattern
+        FOUND_ISSUES=0
+        REPORT_FILE="fake_code_report.txt"
+        echo "FAKE CODE DETECTION REPORT" > $REPORT_FILE
+        echo "=========================" >> $REPORT_FILE
+        echo "" >> $REPORT_FILE
+        
+        for pattern in "${FAKE_PATTERNS[@]}"; do
+          echo "Scanning for: $pattern" >> $REPORT_FILE
+          RESULTS=$(rg -n "$pattern" --type rust . | grep -v $EXCLUDE_PATTERN || true)
+          if [ ! -z "$RESULTS" ]; then
+            echo "$RESULTS" >> $REPORT_FILE
+            echo "" >> $REPORT_FILE
+            FOUND_ISSUES=$((FOUND_ISSUES + $(echo "$RESULTS" | wc -l)))
+          fi
+        done
+        
+        echo "Total issues found: $FOUND_ISSUES" >> $REPORT_FILE
+        
+        if [ $FOUND_ISSUES -gt 0 ]; then
+          echo "❌ FAKE CODE DETECTED!" >> $REPORT_FILE
+          echo "" >> $REPORT_FILE
+          echo "The following patterns indicate incomplete or fake implementations:" >> $REPORT_FILE
+          cat $REPORT_FILE
+          echo "::set-output name=status::failed"
+          echo "::set-output name=count::$FOUND_ISSUES"
+          exit 1
+        else
+          echo "✅ No fake code patterns detected!" >> $REPORT_FILE
+          echo "::set-output name=status::passed"
+          echo "::set-output name=count::0"
+        fi
+        EOF
+        
+        chmod +x scan_fake_code.sh
+        ./scan_fake_code.sh || true
+    
+    - name: Upload scan report
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: fake-code-report
+        path: fake_code_report.txt
+    
+    - name: Comment on PR
+      if: github.event_name == 'pull_request' && failure()
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const report = fs.readFileSync('fake_code_report.txt', 'utf8');
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `## ❌ Fake Code Detected!\n\n<details>\n<summary>Click to see full report</summary>\n\n\`\`\`\n${report}\n\`\`\`\n</details>\n\nPlease replace all placeholder/mock implementations with real code before merging.`
+          });

@@ -1,0 +1,16 @@
+[package]
+name = "sd35_lokr_trainer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { version = "1", features = ["backtrace"] }
+candle-core = { path = "../candle-official/candle-core", features = ["cuda"] }
+candle-nn = { path = "../candle-official/candle-nn" }
+candle-transformers = { path = "../candle-official/candle-transformers" }
+safetensors = "0.4"
+image = { version = "0.25", features = ["png"] }
+tokenizers = "0.19"
+hf-hub = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

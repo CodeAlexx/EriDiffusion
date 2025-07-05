@@ -1,0 +1,29 @@
+[package]
+name = "eridiffusion-inference"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eridiffusion-core = { path = "../core" }
+eridiffusion-models = { path = "../models" }
+candle-core = { version = "0.9", features = ["cuda"] }
+candle-nn = "0.9"
+candle-transformers = "0.9"
+tokio = { version = "1.40", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+lru = "0.12"
+sha2 = "0.10"
+lz4 = "1.28"
+zstd = "0.13"
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "limit", "trace"] }
+uuid = { version = "1.11", features = ["v4"] }
+reqwest = { version = "0.12", features = ["json", "multipart"] }
+base64 = "0.22"
+chrono = "0.4"
+rand = "0.8"
+async-trait = "0.1"
+image = "0.25"

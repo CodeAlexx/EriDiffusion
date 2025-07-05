@@ -1,0 +1,41 @@
+[package]
+name = "eridiffusion-networks"
+version = "0.1.0"
+edition = "2021"
+authors = ["AI-Toolkit Contributors"]
+description = "Network adapters (LoRA, DoRA, etc.) for diffusion models"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+eridiffusion-core = { path = "../core" }
+
+# ML Framework
+candle-core = { version = "0.9", features = ["cuda"] }
+candle-nn = "0.9"
+candle-transformers = "0.9"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+safetensors = "0.4"
+
+# Async
+tokio = { version = "1.40", features = ["full"] }
+async-trait = "0.1"
+
+# Math
+nalgebra = "0.33"
+num-traits = "0.2"
+
+# Utils
+indexmap = "2.2"
+regex = "1.10"
+once_cell = "1.19"
+parking_lot = "0.12"
+rand = "0.8"
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+criterion = "0.5"
+approx = "0.5"

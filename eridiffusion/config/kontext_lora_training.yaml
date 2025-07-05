@@ -1,0 +1,111 @@
+# KonText LoRA Training Configuration
+
+model:
+  type: kontext
+  flux_path: /home/alex/SwarmUI/Models/diffusion/flux1-schnell.safetensors
+  kontext_path: null  # Set to pre-trained KonText path if available
+  
+kontext:
+  control_type: canny  # canny, depth, normal, pose, semantic, scribble, custom
+  control_strength: 1.0
+  control_dropout: 0.1
+  control_hidden_size: 768
+  control_num_layers: 4
+  adapter_hidden_size: 1024
+  adapter_num_layers: 4
+  multi_scale_control: true
+  preprocess_control: true
+
+lora:
+  rank: 32
+  alpha: 32.0
+  dropout: 0.0
+  include_control_encoder: true
+  target_modules:
+    # Flux components
+    - "flux.double_blocks.*.img_attn.qkv"
+    - "flux.double_blocks.*.img_attn.proj"
+    - "flux.double_blocks.*.txt_attn.qkv"
+    - "flux.double_blocks.*.txt_attn.proj"
+    - "flux.single_blocks.*.linear1"
+    - "flux.single_blocks.*.linear2"
+    # Control adapter
+    - "control_adapter.layers.*.cross_attn_q"
+    - "control_adapter.layers.*.cross_attn_kv"
+    - "control_adapter.final_proj"
+    # Control encoder (if include_control_encoder is true)
+    - "context_encoder.blocks.*.conv1"
+    - "context_encoder.blocks.*.conv2"
+    - "context_encoder.conv_out"
+
+training:
+  output_dir: ./output/kontext_lora
+  num_train_epochs: 100
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-4
+  train_flux: false  # Whether to train base Flux model
+  mixed_precision: true
+  gradient_checkpointing: true
+  save_steps: 1000
+  validation_steps: 100
+  logging_steps: 10
+  max_grad_norm: 1.0
+  seed: 42
+  guidance_scale: 3.5
+  
+dataset:
+  type: paired  # Images with control images
+  path: /path/to/training/data
+  # Expected structure:
+  # data/
+  # ├── image_001.jpg
+  # ├── image_001_control.jpg  # or .png
+  # ├── image_001.txt          # caption
+  # ├── image_002.jpg
+  # ├── image_002_control.jpg
+  # └── image_002.txt
+  resolution: 1024
+  center_crop: true
+  random_flip: true
+  caption_dropout: 0.05
+  
+scheduler:
+  type: cosine_annealing
+  num_warmup_steps: 500
+  num_cycles: 1
+  
+optimizer:
+  type: adamw
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  
+loss:
+  type: flow_matching
+  weight: 1.0
+  reduction: mean
+  
+validation:
+  prompts:
+    - prompt: "make the person smile"
+      control_image: /path/to/validation/person_control.jpg
+    - prompt: "turn this into a watercolor painting"
+      control_image: /path/to/validation/landscape_control.jpg
+    - prompt: "add dramatic lighting"
+      control_image: /path/to/validation/portrait_control.jpg
+  num_inference_steps: 28
+  guidance_scale: 3.5
+  control_strength: 1.0
+  
+device: cuda
+resume_from: null
+push_to_hub: false
+
+# Control-specific augmentation
+augmentation:
+  random_flip: true
+  random_brightness: true  # Not applied to edge-based controls
+  random_noise: true
+  noise_probability: 0.3
+  noise_std: 0.02

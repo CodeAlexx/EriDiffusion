@@ -1,0 +1,89 @@
+[package]
+name = "eridiffusion-training"
+version = "0.1.0"
+edition = "2021"
+authors = ["AI-Toolkit Contributors"]
+description = "Training infrastructure for diffusion models"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+eridiffusion-core = { path = "../core" }
+eridiffusion-models = { path = "../models" }
+eridiffusion-networks = { path = "../networks" }
+eridiffusion-data = { path = "../data" }
+
+# ML Framework
+candle-core = { version = "0.9", features = ["cuda"] }
+candle-nn = "0.9"
+candle-transformers = "0.9"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+safetensors = "0.4"
+
+# Async
+tokio = { version = "1.40", features = ["full"] }
+async-trait = "0.1"
+
+# Logging
+tracing = "0.1"
+
+# Training utilities
+indicatif = "0.17"
+chrono = "0.4"
+csv = "1.3"
+
+# Distributed training
+# nccl-sys = { version = "0.1", optional = true }
+
+# Monitoring
+sysinfo = "0.31"
+
+# Utils
+rand = "0.8"
+rayon = "1.10"
+tokenizers = "0.15"
+ctrlc = "3.4"
+half = "2.4"
+image = "0.24"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+env_logger = "0.11"
+tracing-subscriber = "0.3"
+
+[features]
+distributed = []
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[[bin]]
+name = "train_flux"
+path = "src/bin/train_flux.rs"
+
+[[bin]]
+name = "test_flux_forward"
+path = "src/bin/test_flux_forward.rs"
+
+[[bin]]
+name = "test_flux_simple"
+path = "src/bin/test_flux_simple.rs"
+
+[[bin]]
+name = "preprocess_flux"
+path = "src/bin/preprocess_flux.rs"
+
+[[bin]]
+name = "train_flux_24gb"
+path = "src/bin/train_flux_24gb.rs"
+
+[[bin]]
+name = "flux_train"
+path = "src/bin/flux_train.rs"
+
+[[bin]]
+name = "train_sd35"
+path = "src/bin/train_sd35.rs"

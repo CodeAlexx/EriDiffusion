@@ -1,0 +1,90 @@
+# Chroma LoRA Training Configuration
+
+# Model paths
+model:
+  chroma_path: "/home/alex/SwarmUI/Models/chroma/chroma_base.safetensors"
+  t5_path: "/home/alex/SwarmUI/Models/text_encoder/t5-v1_1-xxl"
+  vae_path: "/home/alex/SwarmUI/Models/VAE/sdxl_vae.safetensors"
+
+# LoRA configuration
+lora:
+  rank: 16
+  alpha: 16.0
+  dropout: 0.0
+  # Target modules are automatically determined by ChromaTrainer
+
+# Dataset configuration
+dataset:
+  path: "/home/alex/datasets/chroma_training"
+  resolution: 512
+  center_crop: true
+  random_flip: true
+  cache_latents: true
+  caption_dropout: 0.1
+
+# Training configuration
+training:
+  batch_size: 4
+  num_epochs: 10
+  learning_rate: 1.0e-4
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+  mixed_precision: true  # bf16
+  save_steps: 1000
+  eval_steps: 500
+  logging_steps: 10
+  
+  # Chroma-specific settings
+  enable_ramping: true
+  ramp_target_lr: 1.5e-6
+  ramp_warmup_steps: 1000
+  ramp_type: "linear"
+  
+  # Use RadamScheduleFree optimizer
+  optimizer: "radamschedulefree"
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.999
+  
+  # Optimal noise pairing for better training
+  optimal_noise_pairing: true
+  
+  # Per-block learning rates (pyramid structure)
+  # These override the base learning rate for specific blocks
+  lr_if_contains:
+    "double_blocks$0$": 0.001
+    "double_blocks$1$": 0.00289
+    "double_blocks$2$": 0.00456
+    "double_blocks$3$": 0.006
+    "double_blocks$4$": 0.00722
+    "double_blocks$5$": 0.00822
+    "double_blocks$6$": 0.009
+    "double_blocks$7$": 0.00956
+    "double_blocks$8$": 0.00989
+    "double_blocks$9$": 0.01      # Peak at middle
+    "double_blocks$10$": 0.00989
+    "double_blocks$11$": 0.00956
+    "double_blocks$12$": 0.009
+    "double_blocks$13$": 0.00822
+    "double_blocks$14$": 0.00722
+    "double_blocks$15$": 0.006
+    "double_blocks$16$": 0.00456
+    "double_blocks$17$": 0.00289
+    "double_blocks$18$": 0.0013
+
+# Inference settings
+inference:
+  num_steps: 25
+  guidance_scale: 4.0
+  
+# Output
+output_dir: "./chroma_lora_output"
+
+# Architecture details (for reference)
+# Chroma uses:
+# - 19 double stream blocks (joint image-text processing)
+# - 38 single stream blocks (image-only after concatenation)
+# - Modulation instead of cross-attention
+# - T5-XXL for text encoding
+# - Flow matching objective
+# - 16-channel VAE (SDXL/Flux VAE)

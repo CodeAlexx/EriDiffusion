@@ -1,0 +1,283 @@
+# Model-specific training configurations for eridiffusion
+
+# SD 1.5 Training Configuration
+sd15_lora:
+  model:
+    architecture: sd15
+    path: "runwayml/stable-diffusion-v1-5"
+    device: cuda
+    precision: fp16
+    
+  network:
+    adapter_type: lora
+    rank: 32
+    alpha: 32.0
+    dropout: 0.0
+    target_modules: ["to_q", "to_v", "to_k", "to_out.0"]
+    
+  training:
+    batch_size: 4
+    gradient_accumulation_steps: 2
+    num_epochs: 10
+    learning_rate: 1e-4
+    lr_scheduler: cosine
+    warmup_steps: 500
+    
+  pipeline:
+    loss_type: mse
+    snr_gamma: 5.0
+    noise_offset: 0.1
+    gradient_checkpointing: true
+    
+  data:
+    resolution: 512
+    center_crop: true
+    random_flip: true
+    caption_dropout: 0.1
+
+# SDXL Training Configuration
+sdxl_dreambooth:
+  model:
+    architecture: sdxl
+    path: "stabilityai/stable-diffusion-xl-base-1.0"
+    device: cuda
+    precision: fp16
+    
+  network:
+    adapter_type: lora
+    rank: 64
+    alpha: 64.0
+    target_modules: ["to_q", "to_v", "to_k", "to_out.0", "proj_in", "proj_out"]
+    
+  training:
+    batch_size: 1
+    gradient_accumulation_steps: 4
+    num_epochs: 20
+    learning_rate: 5e-5
+    optimizer: adamw
+    weight_decay: 0.01
+    
+  pipeline:
+    loss_type: mse
+    snr_gamma: 5.0
+    noise_offset: 0.05
+    use_ema: true
+    ema_decay: 0.9999
+    gradient_checkpointing: true
+    prior_preservation: true
+    prior_loss_weight: 1.0
+    
+  data:
+    resolution: 1024
+    instance_prompt: "a photo of sks person"
+    class_prompt: "a photo of person"
+    num_class_images: 200
+
+# SD3 Flow Matching Configuration
+sd3_flow:
+  model:
+    architecture: sd3
+    path: "stabilityai/stable-diffusion-3-medium"
+    device: cuda
+    precision: bf16
+    
+  network:
+    adapter_type: lora
+    rank: 128
+    alpha: 128.0
+    target_modules: ["to_q", "to_v", "to_k", "to_out", "to_q_lora", "to_v_lora"]
+    
+  training:
+    batch_size: 1
+    gradient_accumulation_steps: 8
+    num_epochs: 10
+    learning_rate: 1e-4
+    optimizer: adamw8bit
+    
+  pipeline:
+    loss_type: mse
+    flow_matching: true
+    mean_flow_loss: true
+    gradient_checkpointing: true
+    
+  data:
+    resolution: 1024
+    variable_aspect_ratio: true
+    bucket_resolution: 64
+
+# Flux Training Configuration
+flux_dev:
+  model:
+    architecture: flux
+    variant: dev
+    path: "black-forest-labs/FLUX.1-dev"
+    device: cuda
+    precision: bf16
+    
+  network:
+    adapter_type: lora
+    rank: 256
+    alpha: 256.0
+    target_modules: ["transformer_blocks.*.attn.to_q", "transformer_blocks.*.attn.to_v"]
+    
+  training:
+    batch_size: 1
+    gradient_accumulation_steps: 16
+    num_epochs: 5
+    learning_rate: 1e-5
+    optimizer: prodigy
+    
+  pipeline:
+    loss_type: mse
+    flow_matching: true
+    turbo_training: true
+    gradient_checkpointing: true
+    
+  data:
+    resolution: 1024
+    max_sequence_length: 256
+    packed_latents: true
+
+# PixArt-α Configuration
+pixart_alpha:
+  model:
+    architecture: pixart
+    path: "PixArt-alpha/PixArt-XL-2-1024-MS"
+    device: cuda
+    precision: fp16
+    
+  network:
+    adapter_type: lora
+    rank: 64
+    alpha: 64.0
+    target_modules: ["blocks.*.attn1.to_q", "blocks.*.attn1.to_v"]
+    
+  training:
+    batch_size: 2
+    gradient_accumulation_steps: 4
+    num_epochs: 15
+    learning_rate: 5e-5
+    
+  pipeline:
+    loss_type: mse
+    v_parameterization: true
+    gradient_checkpointing: true
+    micro_conditioning: true
+    
+  data:
+    resolution: 1024
+    variable_aspect_ratio: true
+    aspect_ratio_bucket: true
+    min_resolution: 512
+    max_resolution: 2048
+
+# AuraFlow Configuration
+auraflow:
+  model:
+    architecture: auraflow
+    path: "aura-flow-0.2"
+    device: cuda
+    precision: bf16
+    
+  network:
+    adapter_type: lora
+    rank: 128
+    alpha: 128.0
+    target_modules: ["joint_blocks.*.attn.to_q", "joint_blocks.*.attn.to_v"]
+    
+  training:
+    batch_size: 1
+    gradient_accumulation_steps: 8
+    num_epochs: 10
+    learning_rate: 1e-4
+    
+  pipeline:
+    loss_type: mse
+    flow_matching: true
+    gradient_checkpointing: true
+    joint_attention: true
+    
+  data:
+    resolution: 1024
+    use_mask_training: true
+
+# Advanced Training Features
+advanced_features:
+  # Turbo training for fast inference
+  turbo:
+    enabled: true
+    num_inference_steps: 4
+    distillation_weight: 0.5
+    
+  # Differential output preservation
+  diff_preservation:
+    enabled: true
+    trigger_word: "sks"
+    preservation_weight: 0.1
+    
+  # Guidance-based training
+  guided_training:
+    enabled: true
+    guidance_scale: 7.5
+    unconditional_ratio: 0.1
+    
+  # Multi-resolution training
+  multi_resolution:
+    enabled: true
+    resolutions: [512, 768, 1024]
+    resolution_weights: [0.3, 0.4, 0.3]
+    
+  # Custom loss functions
+  custom_loss:
+    wavelet_loss:
+      enabled: true
+      weight: 0.1
+      levels: 3
+    lpips_loss:
+      enabled: true
+      weight: 0.1
+      vgg_type: "vgg16"
+
+# Hardware-specific optimizations
+hardware_optimization:
+  # A100/H100 optimizations
+  high_end_gpu:
+    use_flash_attention: true
+    use_xformers: false
+    compile_model: true
+    channels_last: true
+    
+  # Consumer GPU optimizations
+  consumer_gpu:
+    gradient_checkpointing: true
+    cpu_offload: true
+    sequential_offload: true
+    vae_slicing: true
+    
+  # Multi-GPU settings
+  multi_gpu:
+    strategy: ddp
+    find_unused_parameters: false
+    gradient_as_bucket_view: true
+    
+# Data processing settings
+data_processing:
+  # Text processing
+  text:
+    tokenizer_max_length: 77  # SD1.5/SDXL
+    t5_max_length: 256       # SD3/Flux
+    caption_dropout: 0.1
+    shuffle_captions: true
+    
+  # Image processing
+  image:
+    interpolation: "bicubic"
+    antialias: true
+    color_jitter: 0.02
+    
+  # Augmentation
+  augmentation:
+    random_crop: true
+    random_flip: true
+    random_rotation: 5
+    mixup_alpha: 0.2

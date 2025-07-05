@@ -1,0 +1,100 @@
+# Rust
+target/
+target2/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+_build/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Model weights and data
+data/
+data*/
+*.safetensors
+*.ckpt
+*.bin
+*.pt
+*.pth
+
+# Datasets
+datasets/
+*.jpg
+*.jpeg
+*.png
+*.webp
+!media/*.jpg
+!media/*.png
+sd_*.jpg
+sd_*.png
+
+# Output files
+output/
+checkpoints/
+*.tar.gz
+*.zip
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+cache/
+*_cache/
+text_embeddings_cache.safetensors
+latent_cache.safetensors
+
+# Logs
+*.log
+logs/
+
+# Local config overrides
+config/local/
+
+# Test files
+test_*
+check_*
+debug_*
+*_test
+*_debug
+
+# Backup directories
+*backup*/
+*-backup-*/
+
+# Large directories we don't need in git
+candle-official/
+candle-repo/
+SimpleTuner/
+sd35-lora-trainer/
+sdxl-lora-trainer/
+flux-autograd/
+train_lokr_candle/
+
+# App visualizations
+app_structure.png
+app_structure.gv
+
+# Tokenizer files (large)
+tokenizers/
+
+# Build artifacts
+gen/.merlin
+debug_yaml
+rms
+CLAUDE.md
