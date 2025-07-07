@@ -212,7 +212,6 @@ impl FluxLoRATrainer {
         cuda::set_device(0)?; // Force device 0 to match CUDA_VISIBLE_DEVICES
         
         // Ensure single device is initialized early
-        println!("\nFluxLoRATrainer::new calling get_single_device at {}:{}", file!(), line!());
         let _ = crate::trainers::cached_device::get_single_device()?;
         
         // Configure memory pool for Flux
@@ -336,7 +335,6 @@ impl FluxLoRATrainer {
     /// Load VAE from CPU to GPU on demand
     fn load_vae_to_gpu(&mut self) -> Result<()> {
         if self.vae.is_none() {
-            println!("Loading VAE to GPU...");
             
             // If we don't have a CPU copy, load it first
             if self.vae_cpu.is_none() {
@@ -370,7 +368,6 @@ impl FluxLoRATrainer {
     /// Load text encoders to GPU
     fn load_text_encoders(&mut self) -> Result<()> {
         if self.text_encoders.is_none() {
-            println!("Loading text encoders...");
             let candle_device = crate::trainers::cached_device::get_single_device()?;
             let mut text_encoders = TextEncoders::new(candle_device.clone());
             
@@ -425,15 +422,12 @@ impl FluxLoRATrainer {
     /// Load Flux model for training
     fn load_flux_model(&mut self) -> Result<()> {
         if self.model.is_none() {
-            println!("Loading Flux model WITHOUT quantization...");
             crate::memory::MemoryManager::log_memory_usage("Before loading Flux")?;
             
             // Create the candle device
             let candle_device = crate::trainers::cached_device::get_single_device()?;
             
-            // BYPASS QUANTIZATION - Load model directly
-            println!("\n=== BYPASSING QUANTIZATION - DIRECT LOAD ===");
-            println!("This will use full precision (22GB) temporarily");
+            // Load model directly
             
             // Create Flux config
             let flux_config = FluxCustomConfig {
@@ -462,8 +456,6 @@ impl FluxLoRATrainer {
             };
             
             // Use memory-efficient loading strategy
-            println!("\n=== Using Memory-Efficient Flux Loading ===");
-            println!("Loading Flux model with FP16 precision for 24GB VRAM");
             
             use crate::trainers::flux_lora_only_loader::create_flux_lora_only;
             
@@ -480,9 +472,6 @@ impl FluxLoRATrainer {
                 )?
             } else if std::env::var("FLUX_LORA_ONLY").is_ok() || true {  // Always use LoRA-only for now
                 // LoRA-only mode: don't load base weights
-                println!("\n=== Using LoRA-Only Mode ===");
-                println!("Base weights will NOT be loaded (saves ~15GB memory)");
-                println!("Only LoRA adapters will be trained");
                 create_flux_lora_only(
                     &self.config.model_path,
                     &lora_config,
@@ -747,7 +736,6 @@ impl FluxLoRATrainer {
             let latent = self.latent_cache.get(&idx)
                 .ok_or_else(|| anyhow::anyhow!("Latent not found in cache for index {}", idx))?
                 .clone();
-            println!("Retrieved cached latent {} with device: {:?}, shape: {:?}", idx, latent.device(), latent.shape());
             
             // Register tensor for debugging
             use crate::trainers::device_debug::register_tensor;
@@ -755,14 +743,12 @@ impl FluxLoRATrainer {
             
             // Debug device details
             if let candle_core::Device::Cuda(cuda_dev) = latent.device() {
-                println!("  Latent {} CUDA device details: {:?}", idx, cuda_dev);
             }
             
             // Force to device 0 if not already there
             let target_device = candle_core::Device::new_cuda(0)?;
             let latent = if !matches!(latent.device(), candle_core::Device::Cuda(_)) || 
                          format!("{:?}", latent.device()) != "Cuda(CudaDevice(DeviceId(0)))" {
-                println!("  WARNING: Latent {} is on wrong device, moving to cuda:0", idx);
                 latent.to_device(&target_device)?
             } else {
                 latent
@@ -805,24 +791,12 @@ impl FluxLoRATrainer {
         }
         
         // Stack into batches
-        println!("Stacking {} latents", latents.len());
-        // Debug each latent device before stacking
-        println!("\nChecking all latent devices before stacking:");
-        for (i, lat) in latents.iter().enumerate() {
-            println!("  Latent {} device: {:?}, shape: {:?}", i, lat.device(), lat.shape());
-            if let candle_core::Device::Cuda(cuda_dev) = lat.device() {
-                println!("    CUDA device details: {:?}", cuda_dev);
-            }
-        }
-        
         // Ensure all latents are on the cached device
         let target_device = crate::trainers::cached_device::get_single_device()?;
-        println!("Using cached device for tensor stacking: {:?}", target_device);
         let latents: Vec<Tensor> = latents.into_iter()
             .enumerate()
             .map(|(i, lat)| -> Result<Tensor> {
                 if format!("{:?}", lat.device()) != format!("{:?}", target_device) {
-                    println!("  Moving latent {} to cached device", i);
                     Ok(lat.to_device(&target_device)?)
                 } else {
                     Ok(lat)
@@ -830,101 +804,52 @@ impl FluxLoRATrainer {
             })
             .collect::<Result<Vec<_>>>()?;
         let latents = Tensor::stack(&latents, 0)?;
-        println!("Latents device after stack: {:?}, shape: {:?}", latents.device(), latents.shape());
-        println!("Stacking {} text embeds", text_embeds_list.len());
         let text_embeds = Tensor::stack(&text_embeds_list, 0)?;  // Use stack instead of cat to preserve dimensions
-        println!("Stacking {} pooled embeds", pooled_embeds_list.len());
         let pooled_embeds = Tensor::stack(&pooled_embeds_list, 0)?;  // Use stack instead of cat
-        println!("Tensor stacking complete");
         
         // Move tensors to the cached device (GPU for training)
         let candle_device = crate::trainers::cached_device::get_single_device()?;
-        println!("Moving tensors to device: {:?}", candle_device);
         let latents = if !latents.device().same_device(&candle_device) {
-            println!("Moving latents from {:?} to {:?}", latents.device(), candle_device);
             latents.to_device(&candle_device)?
         } else {
             latents
         };
         let text_embeds = if !text_embeds.device().same_device(&candle_device) {
-            println!("Moving text_embeds to {:?}", candle_device);
             text_embeds.to_device(&candle_device)?
         } else {
             text_embeds
         };
         let pooled_embeds = if !pooled_embeds.device().same_device(&candle_device) {
-            println!("Moving pooled_embeds to {:?}", candle_device);
             pooled_embeds.to_device(&candle_device)?
         } else {
             pooled_embeds
         };
-        println!("All tensors moved to correct device");
         
         // 2. Sample timesteps (Flux uses shifted sigmoid schedule)
-        println!("Sampling timesteps for batch size {}", batch_size);
-        let timesteps = match self.sample_timesteps(batch_size) {
-            Ok(t) => {
-                println!("Timesteps sampled successfully");
-                t
-            },
-            Err(e) => {
-                println!("ERROR in sample_timesteps: {:?}", e);
-                return Err(e);
-            }
-        };
+        let timesteps = self.sample_timesteps(batch_size)?;
         
         // 3. Add noise (flow matching)
-        println!("\nNoise generation phase");
-        println!("  cuda::current_device: {}", cuda::current_device());
         let candle_device = crate::trainers::cached_device::get_single_device()?;
-        println!("  Using cached device: {:?}", candle_device);
-        println!("  Latents device: {:?}", latents.device());
-        println!("  Creating noise tensor with shape {:?}", latents.shape());
         
         // Use single enforced device for noise generation
         let noise_device = crate::trainers::cached_device::get_single_device()?;
-        println!("  Using single device for noise: {:?}", noise_device);
         
         // Create noise using forced device approach
         // Create noise on CPU then move to cached device
-        let noise = match Tensor::randn(0.0f32, 1.0f32, latents.dims(), &candle_core::Device::Cpu) {
-            Ok(n) => {
-                println!("Noise tensor created on CPU");
-                // Already on correct device from randn_forced
-                let n = n;
-                println!("Noise tensor ready");
-                n
-            },
-            Err(e) => {
-                println!("ERROR creating noise tensor: {:?}", e);
-                return Err(e.into());
-            }
-        };
+        let noise = Tensor::randn(0.0f32, 1.0f32, latents.dims(), &candle_core::Device::Cpu)?;
         // Ensure all tensors are on the same device before flow noise
         let noise = if noise.device().location() != latents.device().location() {
-            println!("Moving noise to match latents device");
             noise.to_device(latents.device())?
         } else {
             noise
         };
         let timesteps = if timesteps.device().location() != latents.device().location() {
-            println!("Moving timesteps to match latents device");
             timesteps.to_device(latents.device())?
         } else {
             timesteps
         };
         
-        println!("About to add flow noise");
-        let (noisy_latents, velocity_target) = match self.add_flow_noise(&latents, &noise, &timesteps) {
-            Ok(result) => {
-                println!("Flow noise added successfully");
-                result
-            },
-            Err(e) => {
-                println!("ERROR in add_flow_noise: {:?}", e);
-                return Err(e);
-            }
-        };
+        let (noisy_latents, velocity_target) = self.add_flow_noise(&latents, &noise, &timesteps)?;
         
         // 5. Forward pass
         println!("Starting forward pass preparation");
@@ -1029,41 +954,10 @@ impl FluxLoRATrainer {
             timesteps.clone()
         };
         
-        // Log all tensor devices before forward
-        println!("\n=== FORWARD PASS INPUT DEVICES ===");
-        println!("img device: {:?}, shape: {:?}", img.device(), img.shape());
-        println!("img_ids device: {:?}, shape: {:?}", img_ids.device(), img_ids.shape());
-        println!("text_embeds device: {:?}, shape: {:?}", text_embeds.device(), text_embeds.shape());
-        println!("txt_ids device: {:?}, shape: {:?}", txt_ids.device(), txt_ids.shape());
-        println!("timesteps_expanded device: {:?}, shape: {:?}", timesteps_expanded.device(), timesteps_expanded.shape());
-        println!("pooled_embeds device: {:?}, shape: {:?}", pooled_embeds.device(), pooled_embeds.shape());
-        if let Some(g) = guidance.as_ref() {
-            println!("guidance device: {:?}, shape: {:?}", g.device(), g.shape());
-        }
-        
-        // Register all tensors for debugging
-        use crate::trainers::device_debug::{register_tensor, print_tensor_registry, check_device_consistency, compare_devices};
-        register_tensor("img", &img, "forward_pass_input");
-        register_tensor("img_ids", &img_ids, "forward_pass_input");
-        register_tensor("text_embeds", &text_embeds, "forward_pass_input");
-        register_tensor("txt_ids", &txt_ids, "forward_pass_input");
-        register_tensor("timesteps_expanded", &timesteps_expanded, "forward_pass_input");
-        register_tensor("pooled_embeds", &pooled_embeds, "forward_pass_input");
-        
-        // Print full registry before forward pass
-        print_tensor_registry();
-        
-        // Check device consistency
-        if !check_device_consistency() {
-            println!("⚠️  WARNING: Device inconsistency detected!");
-        }
-        
-        println!("=================================\n");
         
         // Use the appropriate model (CPU-offloaded, quantized or regular)
         let output_patches = if let Some(cpu_offloaded_model) = &self.cpu_offloaded_model {
             // Use CPU-offloaded model
-            println!("Using CPU-offloaded model");
             match cpu_offloaded_model.forward(
                 &img,
                 &img_ids,
@@ -1356,28 +1250,17 @@ impl FluxLoRATrainer {
     
     /// Load cached data from disk
     fn load_cached_data(&mut self, cache_dir: &Path) -> Result<()> {
-        println!("\n=== LOADING CACHED DATA ===");
-        println!("cuda::current_device at start: {}", cuda::current_device());
-        
         // Use the cached device - should already be initialized
         let working_device = crate::trainers::cached_device::get_single_device()?;
-        println!("Using cached device: {:?}", working_device);
         
         // Force device 0 before any loading
         cuda::set_device(0)?;
-        println!("Set cuda::set_device(0)");
-        println!("cuda::current_device after set: {}", cuda::current_device());
         
         // Load latents
         let latent_path = cache_dir.join("latents.safetensors");
         if latent_path.exists() {
             // Use the single enforced device
             let candle_device = crate::trainers::cached_device::get_single_device()?;
-            println!("Using single enforced device: {:?}", candle_device);
-            
-            // Debug before loading
-            println!("About to load latents with CPU-first approach...");
-            // Use single device enforcer
             // Load to CPU first then move to cached device
             let cpu_latents = candle_core::safetensors::load(&latent_path, &candle_core::Device::Cpu)?;
             let device = crate::trainers::cached_device::get_single_device()?;
@@ -1385,17 +1268,10 @@ impl FluxLoRATrainer {
             for (name, tensor) in cpu_latents {
                 latents.insert(name, tensor.to_device(&device)?);
             }
-            println!("Loaded {} tensors from safetensors with forced device", latents.len());
             
             for (key, tensor) in latents {
-                println!("  Loaded latent {} with device: {:?}, shape: {:?}", key, tensor.device(), tensor.shape());
-                if let candle_core::Device::Cuda(cuda_dev) = tensor.device() {
-                    println!("    CUDA device details: {:?}", cuda_dev);
-                }
-                
                 // Ensure tensor is on the cached device
                 let tensor = if format!("{:?}", tensor.device()) != format!("{:?}", candle_device) {
-                    println!("    Moving tensor to cached device");
                     tensor.to_device(&candle_device)?
                 } else {
                     tensor
@@ -1462,22 +1338,15 @@ impl FluxLoRATrainer {
     fn sample_timesteps(&self, batch_size: usize) -> Result<Tensor> {
         // Flux uses shifted sigmoid schedule for timestep sampling
         // Sample uniform random values
-        println!("\nsample_timesteps entry");
-        println!("  cuda::current_device: {}", cuda::current_device());
         let candle_device = crate::trainers::cached_device::get_single_device()?;
-        println!("  Using cached device: {:?}", candle_device);
-        println!("  Creating random tensor with batch_size={}", batch_size);
         
         // Use single enforced device for timestep generation
         let timestep_device = crate::trainers::cached_device::get_single_device()?;
-        println!("  Using single device for timesteps: {:?}", timestep_device);
         
         // Create using forced device approach
         // Create on CPU then move to cached device
         let u_cpu = Tensor::rand(0.0f32, 1.0f32, &[batch_size], &candle_core::Device::Cpu)?;
         let u = u_cpu.to_device(&timestep_device)?;
-        println!("  Created random tensor on forced device");
-        println!("Random tensor created");
         
         // Apply shifted sigmoid transform as per Flux paper
         // t = sigmoid(shift * (2u - 1))
@@ -1700,31 +1569,12 @@ fn sigmoid(x: Tensor) -> Result<Tensor> {
 pub fn train_flux_lora(config: &Config, process_config: &ProcessConfig) -> Result<()> {
     // Get the cached device - this will be the ONLY device we use
     let working_device = crate::trainers::cached_device::get_single_device()?;
-    println!("\n=== USING CACHED DEVICE: {:?} ===", working_device);
-    
-    // Debug CUDA environment at the very start
-    println!("\n=== CUDA ENVIRONMENT DEBUG ===");
-    if let Ok(visible) = std::env::var("CUDA_VISIBLE_DEVICES") {
-        println!("CUDA_VISIBLE_DEVICES: {}", visible);
-    } else {
-        println!("CUDA_VISIBLE_DEVICES: not set");
-    }
-    
-    // Check available CUDA devices
-    println!("Available CUDA devices (before setting): {:?}", cuda::current_device());
-    println!("Device count estimate: {:?}", cuda::device_count());
     
     // Force device 0
     cuda::set_device(0)?;
-    println!("Set cuda::set_device(0)");
-    println!("Current CUDA device after set: {:?}", cuda::current_device());
     
     // Always use the cached device
     let device = crate::trainers::cached_device::get_single_device()?;
-    println!("Using cached device for all operations");
-    
-    println!("Using device: {:?}", device);
-    println!("=== END CUDA ENVIRONMENT DEBUG ===");
     
     // Create configuration
     // Convert candle device to eridiffusion device
