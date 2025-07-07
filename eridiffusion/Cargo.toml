@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = ["cuda"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "cudarc/driver", "cudarc/nvrtc"]
+cuda-kernels = []  # Separate feature for custom kernels
 
 [dependencies]
 # External dependencies
@@ -23,10 +24,104 @@ once_cell = "1.19"
 rayon = "1.7"
 num-traits = "0.2"
 tokenizers = "0.15"
+clap = { version = "4.0", features = ["derive"] }
+env_logger = "0.10"
+log = "0.4"
+serde_json = "1.0"
+lazy_static = "1.4"
+thiserror = "1.0"
+rand = "0.8"
+bytemuck = "1.14"
+libc = "0.2"
+memmap2 = "0.9"
+
+# Internal crates - pointing to local paths
+eridiffusion-core = { path = "crates/core" }
+# eridiffusion-networks = { path = "crates/networks" }
 
 [[bin]]
 name = "trainer"
-path = "src/main.rs"
+path = "src/bin/trainer.rs"
+
+[[bin]]
+name = "train"
+path = "src/bin/train.rs"
+
+[[bin]]
+name = "sd35_sampler"
+path = "src/bin/sd35_sampler.rs"
+
+[[bin]]
+name = "test_memory"
+path = "src/bin/test_memory.rs"
+
+[[bin]]
+name = "test_dataset"
+path = "src/bin/test_dataset.rs"
+
+[[bin]]
+name = "test_training_flow"
+path = "src/bin/test_training_flow.rs"
+
+[[bin]]
+name = "check_flux_model"
+path = "src/bin/check_flux_model.rs"
+
+[[bin]]
+name = "list_vae_tensors"
+path = "src/bin/list_vae_tensors.rs"
+
+[[bin]]
+name = "analyze_flux_lora"
+path = "src/bin/analyze_flux_lora.rs"
+
+[[bin]]
+name = "list_flux_tensors"
+path = "src/bin/list_flux_tensors.rs"
+
+[[bin]]
+name = "save_flux_lora_example"
+path = "src/bin/save_flux_lora_example.rs"
+
+[[bin]]
+name = "save_flux_lora_simple"
+path = "src/bin/save_flux_lora_simple.rs"
+
+[[bin]]
+name = "save_flux_lora_proper"
+path = "src/bin/save_flux_lora_proper.rs"
+
+[[bin]]
+name = "inspect_flux_tensors"
+path = "src/bin/inspect_flux_tensors.rs"
+
+[[bin]]
+name = "check_flux_tensors"
+path = "src/bin/check_flux_tensors.rs"
+
+[[bin]]
+name = "test_flux_int8"
+path = "src/bin/test_flux_int8.rs"
+
+[[bin]]
+name = "test_efficient_flux_loader"
+path = "src/bin/test_efficient_flux_loader.rs"
+
+[[bin]]
+name = "flux_memory_optimized_train"
+path = "src/bin/flux_memory_optimized_train.rs"
+
+[[bin]]
+name = "test_minimal_flux_loader"
+path = "src/bin/test_minimal_flux_loader.rs"
+
+[[bin]]
+name = "test_flux_loader_fixed"
+path = "src/bin/test_flux_loader_fixed.rs"
+
+[[bin]]
+name = "test_flux_lora_only"
+path = "src/bin/test_flux_lora_only.rs"
 
 # Removed legacy binary that doesn't exist
 
@@ -42,9 +137,9 @@ path = "examples/sd3_candle_demo.rs"
 name = "sd3_pipeline_example"
 path = "examples/sd3_pipeline_example.rs"
 
-[[bin]]
-name = "test_components"
-path = "src/bin/test_components.rs"
+# [[bin]]
+# name = "test_components"
+# path = "src/bin/test_components.rs"
 
 # Inference examples
 [[example]]
@@ -58,6 +153,14 @@ path = "examples/inference/sd15_generate.rs"
 [[example]]
 name = "flux_generate"
 path = "examples/inference/flux_generate.rs"
+
+[[example]]
+name = "test_flux_cuda"
+path = "examples/test_flux_cuda.rs"
+
+[[example]]
+name = "test_cuda_kernels"
+path = "examples/test_cuda_kernels.rs"
 
 [[example]]
 name = "run_all_models"

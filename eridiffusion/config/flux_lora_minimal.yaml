@@ -1,0 +1,55 @@
+job: extension
+config:
+  name: "flux_lora_minimal"
+  process:
+    - type: 'sd_trainer'
+      device: cuda:0
+      trigger_word: ""
+      
+      network:
+        type: "lora"
+        linear: 16           # LoRA rank
+        linear_alpha: 16     # LoRA alpha
+      
+      save:
+        dtype: float16
+        save_every: 500
+        max_step_saves_to_keep: 4
+        
+      datasets:
+        - folder_path: "/path/to/your/images"  # UPDATE THIS
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          shuffle_tokens: false
+          cache_latents_to_disk: true
+          resolution: [1024]
+          
+      train:
+        batch_size: 1
+        steps: 1000
+        gradient_accumulation: 4    # Effective batch size of 4
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        optimizer: "adamw8bit"     # 8-bit optimizer saves memory
+        lr: 1e-4
+        dtype: bf16
+        bypass_guidance_embedding: true  # Required for Flux
+        
+      model:
+        name_or_path: "/home/alex/SwarmUI/Models/diffusion_models/flux.1-lite-8B.safetensors"
+        is_flux: true
+        quantize: false  # We're using LoRA-only mode instead
+        
+      # Sampling configuration (optional)
+      sample:
+        sampler: "flowmatch"
+        sample_every: 100
+        width: 1024
+        height: 1024
+        prompts: 
+          - "a test image"
+        seed: 42
+        guidance_scale: 3.5
+        sample_steps: 20

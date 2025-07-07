@@ -15,6 +15,35 @@ pub mod simple_text_encoder;
 pub mod embedded_tokenizers;
 pub mod proper_text_encoder;
 pub mod real_tokenizers;
+pub mod sampling;
+pub mod flux_lora;
+pub mod flux_data_loader;
+pub mod flux_sampling;
+pub mod flux_lora_cpu;
+pub mod flux_int8_loader;
+pub mod flux_quantized_loader;
+pub mod quanto_var_builder;
+pub mod device_fix;
+pub mod force_device_zero;
+pub mod single_device_enforcer;
+pub mod cached_device;
+pub mod flux_single_pass_loader;
+pub mod flux_lazy_loader;
+pub mod flux_lazy_layers;
+pub mod flux_cpu_offload;
+pub mod flux_incremental_loader;
+pub mod flux_memory_efficient;
+pub mod flux_cpu_offloaded_model;
+pub mod flux_selective_loader;
+pub mod device_debug;
+pub mod flux_init_weights;
+pub mod flux_efficient_loader;
+pub mod flux_layerwise_offload;
+pub mod gradient_checkpointing;
+pub mod optimizer_cpu_offload;
+pub mod flux_lora_only_loader;
+
+// Export function is defined below, no need to re-export
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Config {
@@ -100,7 +129,7 @@ struct ModelConfig {
     t5_path: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct SampleConfig {
     sampler: String,
     sample_every: usize,
@@ -231,9 +260,21 @@ pub fn train_from_config(config_path: PathBuf) -> Result<()> {
         }
         ModelType::Flux => {
             println!("\nStarting Flux training...");
-            return Err(anyhow::anyhow!(
-                "Flux training not yet implemented. Coming soon!"
-            ));
+            match process_config.network.network_type.as_str() {
+                "lora" => {
+                    flux_lora::train_flux_lora(&config, process_config)?;
+                }
+                "lokr" | "lokr_full_rank" => {
+                    println!("Note: LoKr not yet implemented for Flux, using LoRA instead");
+                    flux_lora::train_flux_lora(&config, process_config)?;
+                }
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "Unsupported network type '{}' for Flux", 
+                        process_config.network.network_type
+                    ));
+                }
+            }
         }
         ModelType::SD15 | ModelType::SD21 => {
             return Err(anyhow::anyhow!(
