@@ -1,0 +1,871 @@
+Based on my research, HiDream has a fascinating architecture that could be very relevant for your EriDiffusion project. Here are the key architectural insights:
+HiDream Architecture Overview
+1. Sparse Diffusion Transformer (DiT) with MoE
+HiDream-I1 is built on a new sparse Diffusion Transformer (DiT) structure, which first uses dual-stream DiT architecture to separately process image and text tokens and then employs single-stream DiT architecture to enable multi-modal interaction. HiDream - Draw Things WIKI
+The architecture combines:
+
+Dual-stream MMDiT blocks (16 layers) for multimodal processing
+Single-stream DiT blocks (32 layers) for global consistency
+Mixture of Experts (MoE) in the FFN sub-networks for efficiency
+
+2. Dynamic Routing for Efficiency
+Both dual-stream and single-stream DiT architecture are remoulded with dynamic Mixture-of-Experts (MoE) design that aims to dynamically route data through specialized expert modules based on input characteristics. HiDream - Draw Things WIKI
+This sparse architecture achieves:
+
+Computational efficiency without sacrificing quality
+Dynamic resource allocation based on scene complexity
+Better handling of details like edges, colors, and lighting
+
+3. Multi-Encoder Text Processing
+HiDream's four text encoders (OpenCLIP ViT-bigG, OpenAI CLIP ViT-L, T5-XXL, LLaMA 3.1 8B) enable precise prompting
+Uses four separate text encoders:
+
+OpenCLIP ViT-bigG
+OpenAI CLIP ViT-L
+T5-XXL
+LLaMA 3.1 8B (which introduces some licensing constraints)
+
+4. Flow Matching Foundation
+HiDream-I1 is a large-scale image generative foundation model built upon the principles of flow matching Lipman et al. (2022) and leveraging a new sparse Diffusion Transformer (DiT) architecture. HiDream - Draw Things WIKI
+Key Design Insights for EriDiffusion:
+
+Sparse Architecture Benefits: The MoE approach allows for a 17B parameter model that runs efficiently. This could be implemented in Rust using conditional computation.
+Dual-Stream Design: Separating image and text processing initially, then combining them, could improve both efficiency and quality in your Rust implementation.
+Dynamic Expert Routing: Instead of processing all parameters for every input, the model routes through relevant experts. This is perfect for Rust's pattern matching and efficient branching.
+Modular Text Encoding: Using multiple specialized encoders rather than one large one could make your implementation more flexible and easier to optimize.
+Three Model Variants:
+
+Full (50+ steps, highest quality)
+Dev (28 steps, balanced)
+Fast (16 steps, speed-optimized)
+
+
+
+This architecture is particularly interesting for EriDiffusion because:
+
+The sparse MoE design maps well to Rust's efficient memory management
+The modular structure allows incremental implementation
+The flow matching approach might be simpler to implement than traditional diffusion
+The multi-variant approach lets you target different hardware capabilities
+
+Would you like me to help design a Rust implementation of the sparse DiT with MoE architecture for EriDiffusion?RetryAhow to prune the dev model to 8bEditTo prune the HiDream dev model from 17B to 8B parameters, you'll need to strategically reduce the model size while maintaining quality. Here's a comprehensive approach:HiDream Model Pruning Strategy to 8B ParametersCode // hidream_pruning.rs
+// Strategy for pruning HiDream from 17B to 8B parameters
+
+use candle_core::{Device, DType, Tensor, Result};
+use std::collections::HashMap;
+
+/// HiDream pruning configuration
+#[derive(Debug, Clone)]
+pub struct PruningConfig {
+  Key Pruning Strategies for HiDream 17B → 8B:
+1. Remove LLaMA 3.1 8B Encoder (Saves ~7B params)
+This is the biggest win - the LLaMA encoder alone is 8B parameters. You can replace it with:
+
+Smaller T5 variant (T5-large at 770M)
+Or rely on the other three encoders
+This gets you from 17B to ~10B immediately
+
+2. Architectural Reduction
+
+Reduce MMDiT layers: 16 → 8
+Reduce DiT layers: 32 → 20
+Reduce hidden dimensions: 4096 → 2048
+This saves another ~1.5B parameters
+
+3. MoE Expert Pruning
+Since HiDream uses MoE, you can:
+
+Reduce experts per layer: 8 → 4
+Reduce active experts: 4 → 2
+Convert some MoE layers to dense layers
+Saves ~500M parameters
+
+4. Structured Pruning Approach
+python# Pseudo-code for the pruning process
+1. Analyze expert activation patterns
+2. Identify least-used experts
+3. Merge similar experts
+4. Prune redundant pathways
+5. Knowledge Distillation
+After pruning, use the original 17B model as a teacher to fine-tune the 8B student model.
+Practical Implementation Tips:
+
+Start with Text Encoders: Removing LLaMA is the easiest way to drop 7B params
+Use Importance Scoring: Track which experts/layers contribute most to output quality
+Gradual Pruning: Don't prune all at once - do it iteratively
+Quality Metrics: Monitor FID, CLIP score, and human preference during pruning
+
+The most practical approach is:
+
+Fork the dev model
+Remove LLaMA encoder
+Replace with smaller T5
+Reduce layer count by half
+Fine-tune on high-quality data
+
+This should give you a functional 8B model while maintaining most of the quality, especially if you focus the pruning on redundant components rather than critical paths.RetryAhow to find wich to remove in dev model?EditTo identify which components to remove from the HiDream dev model, you need to analyze the model's behavior and importance scores. Here's a systematic approach:HiDream Model Component Analysis ToolCode // hidream_component_analyzer.rs
+// Tool to analyze which components to remove from HiDream dev model
+
+use candle_core::{Device, DType, Tensor, Result};
+use std::collections::{HashMap, BTreeMap};
+use std::fs::File;
+use std::io::Write;
+
+/// Component Key Analysis Methods to Find What to Remove:
+1. Activation Frequency Analysis
+Track which components are rarely used:
+rust// Components with <10% activation can likely be removed
+if activation_frequency < 0.1 {
+    mark_for_removal("Rarely activated")
+}
+2. Gradient-Based Importance
+Components with small gradients don't affect the output much:
+rust// Small gradients = low impact on loss
+if average_gradient_magnitude < threshold {
+    mark_for_removal("Low gradient impact")
+}
+3. Output Contribution Test
+Zero out components and measure quality drop:
+rust// If removing component doesn't hurt quality
+if quality_drop < 0.05 {
+    mark_for_removal("Minimal output contribution")  
+}
+4. Redundancy Detection
+Find duplicate/similar components:
+rust// High cosine similarity = redundant
+if cosine_similarity(expert_i, expert_j) > 0.9 {
+    remove_one_expert()
+}
+5. Text Encoder Ablation
+Test each encoder's contribution:
+bash# Test without each encoder
+- Without LLaMA: Quality drop = 5%
+- Without T5: Quality drop = 15%  
+- Without CLIP-L: Quality drop = 20%
+- Without CLIP-G: Quality drop = 10%
+
+→ LLaMA is least important, remove first
+Practical Steps to Analyze HiDream:
+
+Run inference on diverse prompts (1000+ samples)
+Log activation patterns for each MoE expert
+Track attention head usage across layers
+Measure text encoder contributions
+Calculate redundancy between experts
+
+Quick Analysis Script:
+python# Pseudo-code for analysis
+for prompt in test_prompts:
+    # Track which experts activate
+    expert_activations = model.get_expert_activations(prompt)
+    
+    # Test without each encoder
+    for encoder in ["llama", "t5", "clip_l", "clip_g"]:
+        quality_without = test_without_encoder(prompt, encoder)
+        encoder_importance[encoder].append(quality_without)
+    
+    # Find redundant experts
+    for layer in model.moe_layers:
+        similarity_matrix = compute_expert_similarity(layer)
+        mark_redundant_experts(similarity_matrix)
+Expected Findings:
+
+LLaMA encoder: Often least critical for image quality
+Later MoE experts: Often redundant with earlier ones
+Some attention heads: Highly correlated, can be merged
+Upper DiT layers: May have less impact than lower ones
+
+The tool I provided will generate a detailed report showing exactly which components to remove to reach your 8B target while minimizing quality loss.RetryClaude can make mistakes. Please double-check responses.Research Opus 4
+------------------------------
+// hidream_component_analyzer.rs
+// Tool to analyze which components to remove from HiDream dev model
+
+use candle_core::{Device, DType, Tensor, Result};
+use std::collections::{HashMap, BTreeMap};
+use std::fs::File;
+use std::io::Write;
+
+/// Component importance analyzer for HiDream
+pub struct HiDreamAnalyzer {
+    device: Device,
+    analysis_results: HashMap<String, ComponentAnalysis>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComponentAnalysis {
+    pub name: String,
+    pub param_count: usize,
+    pub activation_frequency: f32,
+    pub gradient_magnitude: f32,
+    pub output_contribution: f32,
+    pub redundancy_score: f32,
+    pub importance_score: f32,
+}
+
+impl HiDreamAnalyzer {
+    pub fn new(device: Device) -> Self {
+        Self {
+            device,
+            analysis_results: HashMap::new(),
+        }
+    }
+    
+    /// Step 1: Activation Frequency Analysis
+    /// Track how often each component is activated during inference
+    pub fn analyze_activation_patterns(
+        &mut self,
+        model: &HiDreamModel,
+        test_dataset: &[TestSample],
+    ) -> Result<HashMap<String, f32>> {
+        println!("Analyzing activation patterns across {} samples...", test_dataset.len());
+        
+        let mut activation_counts: HashMap<String, usize> = HashMap::new();
+        let mut total_activations: HashMap<String, f32> = HashMap::new();
+        
+        // Hook into model to track activations
+        for sample in test_dataset {
+            let activations = self.forward_with_hooks(model, sample)?;
+            
+            // Track MoE expert activations
+            for (layer_idx, expert_activations) in activations.moe_experts.iter() {
+                for (expert_idx, activation) in expert_activations.iter().enumerate() {
+                    let key = format!("moe_layer_{}_expert_{}", layer_idx, expert_idx);
+                    
+                    // Count if expert was selected (activation > threshold)
+                    if *activation > 0.1 {
+                        *activation_counts.entry(key.clone()).or_insert(0) += 1;
+                    }
+                    
+                    // Track total activation magnitude
+                    *total_activations.entry(key).or_insert(0.0) += activation;
+                }
+            }
+            
+            // Track attention head activations
+            for (layer_idx, head_activations) in activations.attention_heads.iter() {
+                for (head_idx, activation) in head_activations.iter().enumerate() {
+                    let key = format!("attn_layer_{}_head_{}", layer_idx, head_idx);
+                    *total_activations.entry(key).or_insert(0.0) += activation;
+                }
+            }
+        }
+        
+        // Normalize by number of samples
+        let n_samples = test_dataset.len() as f32;
+        let mut activation_frequencies = HashMap::new();
+        
+        for (key, count) in activation_counts {
+            activation_frequencies.insert(key.clone(), count as f32 / n_samples);
+        }
+        
+        Ok(activation_frequencies)
+    }
+    
+    /// Step 2: Gradient-based Importance
+    /// Measure how much each component affects the loss
+    pub fn analyze_gradient_importance(
+        &mut self,
+        model: &HiDreamModel,
+        validation_set: &[TestSample],
+    ) -> Result<HashMap<String, f32>> {
+        println!("Analyzing gradient importance...");
+        
+        let mut gradient_magnitudes: HashMap<String, f32> = HashMap::new();
+        
+        for sample in validation_set.iter().take(100) {  // Subset for efficiency
+            // Forward pass
+            let output = model.forward(&sample.input)?;
+            let loss = self.compute_loss(&output, &sample.target)?;
+            
+            // Backward pass
+            let gradients = loss.backward()?;
+            
+            // Analyze gradients for each component
+            for (name, grad) in gradients {
+                let magnitude = grad.abs()?.mean_all()?.to_scalar::<f32>()?;
+                *gradient_magnitudes.entry(name).or_insert(0.0) += magnitude;
+            }
+        }
+        
+        // Normalize
+        let n_samples = validation_set.len().min(100) as f32;
+        for magnitude in gradient_magnitudes.values_mut() {
+            *magnitude /= n_samples;
+        }
+        
+        Ok(gradient_magnitudes)
+    }
+    
+    /// Step 3: Output Contribution Analysis
+    /// Measure how much each component contributes to final output
+    pub fn analyze_output_contribution(
+        &mut self,
+        model: &HiDreamModel,
+        test_samples: &[TestSample],
+    ) -> Result<HashMap<String, f32>> {
+        println!("Analyzing output contributions...");
+        
+        let mut contributions = HashMap::new();
+        
+        for sample in test_samples.iter().take(50) {
+            // Get baseline output
+            let baseline_output = model.forward(&sample.input)?;
+            
+            // Test each component by zeroing it out
+            for component_name in self.get_component_names(model) {
+                let modified_model = self.zero_out_component(model, &component_name)?;
+                let modified_output = modified_model.forward(&sample.input)?;
+                
+                // Measure difference
+                let diff = (&baseline_output - &modified_output)?
+                    .abs()?
+                    .mean_all()?
+                    .to_scalar::<f32>()?;
+                
+                *contributions.entry(component_name).or_insert(0.0) += diff;
+            }
+        }
+        
+        // Normalize
+        let n_samples = test_samples.len().min(50) as f32;
+        for contrib in contributions.values_mut() {
+            *contrib /= n_samples;
+        }
+        
+        Ok(contributions)
+    }
+    
+    /// Step 4: Redundancy Analysis
+    /// Find components that are similar/redundant
+    pub fn analyze_redundancy(
+        &mut self,
+        model: &HiDreamModel,
+    ) -> Result<HashMap<String, f32>> {
+        println!("Analyzing component redundancy...");
+        
+        let mut redundancy_scores = HashMap::new();
+        
+        // Analyze MoE expert similarity
+        for layer_idx in 0..model.num_moe_layers() {
+            let experts = model.get_moe_experts(layer_idx)?;
+            
+            for i in 0..experts.len() {
+                let expert_i_weights = self.flatten_weights(&experts[i])?;
+                let mut max_similarity = 0.0;
+                
+                for j in 0..experts.len() {
+                    if i != j {
+                        let expert_j_weights = self.flatten_weights(&experts[j])?;
+                        let similarity = self.cosine_similarity(&expert_i_weights, &expert_j_weights)?;
+                        max_similarity = max_similarity.max(similarity);
+                    }
+                }
+                
+                let key = format!("moe_layer_{}_expert_{}", layer_idx, i);
+                redundancy_scores.insert(key, max_similarity);
+            }
+        }
+        
+        // Analyze attention head similarity
+        for layer_idx in 0..model.num_attention_layers() {
+            let heads = model.get_attention_heads(layer_idx)?;
+            
+            for i in 0..heads.len() {
+                let head_i_weights = self.flatten_weights(&heads[i])?;
+                let mut max_similarity = 0.0;
+                
+                for j in 0..heads.len() {
+                    if i != j {
+                        let head_j_weights = self.flatten_weights(&heads[j])?;
+                        let similarity = self.cosine_similarity(&head_i_weights, &head_j_weights)?;
+                        max_similarity = max_similarity.max(similarity);
+                    }
+                }
+                
+                let key = format!("attn_layer_{}_head_{}", layer_idx, i);
+                redundancy_scores.insert(key, max_similarity);
+            }
+        }
+        
+        Ok(redundancy_scores)
+    }
+    
+    /// Step 5: Text Encoder Analysis
+    /// Analyze contribution of each text encoder
+    pub fn analyze_text_encoders(
+        &mut self,
+        model: &HiDreamModel,
+        test_prompts: &[String],
+    ) -> Result<HashMap<String, f32>> {
+        println!("Analyzing text encoder contributions...");
+        
+        let encoders = ["clip_l", "clip_g", "t5_xxl", "llama_3_1"];
+        let mut encoder_importance = HashMap::new();
+        
+        for encoder_name in &encoders {
+            let mut total_contribution = 0.0;
+            
+            for prompt in test_prompts {
+                // Get baseline with all encoders
+                let baseline = model.encode_text(prompt, None)?;
+                
+                // Get output without this encoder
+                let without_encoder = model.encode_text(prompt, Some(encoder_name))?;
+                
+                // Measure difference
+                let diff = (&baseline - &without_encoder)?
+                    .abs()?
+                    .mean_all()?
+                    .to_scalar::<f32>()?;
+                
+                total_contribution += diff;
+            }
+            
+            encoder_importance.insert(
+                encoder_name.to_string(),
+                total_contribution / test_prompts.len() as f32
+            );
+        }
+        
+        Ok(encoder_importance)
+    }
+    
+    /// Combine all analyses to get final removal recommendations
+    pub fn get_removal_recommendations(
+        &mut self,
+        model: &HiDreamModel,
+        target_params: usize,
+    ) -> Result<Vec<RemovalRecommendation>> {
+        println!("\n=== Running comprehensive analysis ===");
+        
+        // Load test data
+        let test_samples = self.load_test_samples(100)?;
+        let test_prompts = self.load_test_prompts(50)?;
+        
+        // Run all analyses
+        let activations = self.analyze_activation_patterns(model, &test_samples)?;
+        let gradients = self.analyze_gradient_importance(model, &test_samples)?;
+        let contributions = self.analyze_output_contribution(model, &test_samples)?;
+        let redundancy = self.analyze_redundancy(model)?;
+        let text_encoders = self.analyze_text_encoders(model, &test_prompts)?;
+        
+        // Combine scores
+        let mut components = Vec::new();
+        
+        // Process each component
+        for component_name in self.get_all_component_names(model) {
+            let activation = activations.get(&component_name).unwrap_or(&0.0);
+            let gradient = gradients.get(&component_name).unwrap_or(&0.0);
+            let contribution = contributions.get(&component_name).unwrap_or(&0.0);
+            let redundancy_score = redundancy.get(&component_name).unwrap_or(&0.0);
+            
+            // Calculate importance score (lower is less important)
+            let importance = (activation * 0.2) + 
+                           (gradient * 0.3) + 
+                           (contribution * 0.3) + 
+                           ((1.0 - redundancy_score) * 0.2);
+            
+            components.push(ComponentAnalysis {
+                name: component_name.clone(),
+                param_count: self.get_component_params(model, &component_name)?,
+                activation_frequency: *activation,
+                gradient_magnitude: *gradient,
+                output_contribution: *contribution,
+                redundancy_score: *redundancy_score,
+                importance_score: importance,
+            });
+        }
+        
+        // Sort by importance (ascending - least important first)
+        components.sort_by(|a, b| a.importance_score.partial_cmp(&b.importance_score).unwrap());
+        
+        // Generate removal recommendations
+        let mut recommendations = Vec::new();
+        let mut removed_params = 0;
+        let current_params = model.total_parameters();
+        let params_to_remove = current_params - target_params;
+        
+        // First, recommend removing LLaMA if it has low importance
+        if let Some(llama_score) = text_encoders.get("llama_3_1") {
+            if *llama_score < 0.3 {  // Threshold for removal
+                recommendations.push(RemovalRecommendation {
+                    component: "llama_3_1_encoder".to_string(),
+                    params_saved: 8_000_000_000,
+                    importance_loss: *llama_score,
+                    reason: "Low contribution relative to parameter count".to_string(),
+                });
+                removed_params += 8_000_000_000;
+            }
+        }
+        
+        // Then recommend other components
+        for component in components {
+            if removed_params >= params_to_remove {
+                break;
+            }
+            
+            if component.importance_score < 0.3 {  // Threshold
+                recommendations.push(RemovalRecommendation {
+                    component: component.name.clone(),
+                    params_saved: component.param_count,
+                    importance_loss: component.importance_score,
+                    reason: self.get_removal_reason(&component),
+                });
+                removed_params += component.param_count;
+            }
+        }
+        
+        // Save detailed report
+        self.save_analysis_report(&components, &recommendations)?;
+        
+        Ok(recommendations)
+    }
+    
+    /// Generate removal reason based on analysis
+    fn get_removal_reason(&self, component: &ComponentAnalysis) -> String {
+        if component.activation_frequency < 0.1 {
+            "Rarely activated during inference".to_string()
+        } else if component.redundancy_score > 0.9 {
+            "High redundancy with other components".to_string()
+        } else if component.output_contribution < 0.05 {
+            "Minimal contribution to output quality".to_string()
+        } else {
+            "Low overall importance score".to_string()
+        }
+    }
+    
+    /// Save detailed analysis report
+    fn save_analysis_report(
+        &self,
+        components: &[ComponentAnalysis],
+        recommendations: &[RemovalRecommendation],
+    ) -> Result<()> {
+        let mut file = File::create("hidream_pruning_analysis.txt")?;
+        
+        writeln!(file, "=== HiDream Model Pruning Analysis Report ===")?;
+        writeln!(file, "\nTop 10 Least Important Components:")?;
+        
+        for (i, component) in components.iter().take(10).enumerate() {
+            writeln!(file, "\n{}. {}", i + 1, component.name)?;
+            writeln!(file, "   Parameters: {:.2}M", component.param_count as f32 / 1_000_000.0)?;
+            writeln!(file, "   Activation frequency: {:.2}%", component.activation_frequency * 100.0)?;
+            writeln!(file, "   Gradient magnitude: {:.4}", component.gradient_magnitude)?;
+            writeln!(file, "   Output contribution: {:.4}", component.output_contribution)?;
+            writeln!(file, "   Redundancy score: {:.2}%", component.redundancy_score * 100.0)?;
+            writeln!(file, "   Overall importance: {:.4}", component.importance_score)?;
+        }
+        
+        writeln!(file, "\n\n=== Removal Recommendations ===")?;
+        let total_params_removed: usize = recommendations.iter().map(|r| r.params_saved).sum();
+        writeln!(file, "Total parameters to remove: {:.2}B", total_params_removed as f32 / 1_000_000_000.0)?;
+        
+        for rec in recommendations {
+            writeln!(file, "\n- Remove: {}", rec.component)?;
+            writeln!(file, "  Saves: {:.2}B parameters", rec.params_saved as f32 / 1_000_000_000.0)?;
+            writeln!(file, "  Importance loss: {:.4}", rec.importance_loss)?;
+            writeln!(file, "  Reason: {}", rec.reason)?;
+        }
+        
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct RemovalRecommendation {
+    pub component: String,
+    pub params_saved: usize,
+    pub importance_loss: f32,
+    pub reason: String,
+}
+
+// Usage example
+pub fn main() -> Result<()> {
+    let device = Device::cuda_if_available(0)?;
+    let mut analyzer = HiDreamAnalyzer::new(device);
+    
+    // Load model
+    let model = load_hidream_dev_model()?;
+    
+    // Get removal recommendations for 8B target
+    let recommendations = analyzer.get_removal_recommendations(&model, 8_000_000_000)?;
+    
+    println!("\n=== Removal Recommendations ===");
+    for rec in &recommendations {
+        println!("{}: Remove {} (saves {:.1}B params)", 
+            rec.reason, 
+            rec.component, 
+            rec.params_saved as f32 / 1e9
+        );
+    }
+    
+    Ok(())
+}
+-------------------------------------------------
+// hidream_pruning.rs
+// Strategy for pruning HiDream from 17B to 8B parameters
+
+use candle_core::{Device, DType, Tensor, Result};
+use std::collections::HashMap;
+
+/// HiDream pruning configuration
+#[derive(Debug, Clone)]
+pub struct PruningConfig {
+    pub target_params: usize,  // 8B
+    pub original_params: usize,  // 17B
+    pub pruning_ratio: f32,  // ~0.47 (8/17)
+    pub preserve_critical_layers: bool,
+    pub moe_pruning_strategy: MoEPruningStrategy,
+}
+
+#[derive(Debug, Clone)]
+pub enum MoEPruningStrategy {
+    /// Reduce number of experts per layer
+    ReduceExperts { from: usize, to: usize },
+    /// Reduce expert dimensions
+    ReduceExpertDim { reduction_factor: f32 },
+    /// Convert some MoE layers to dense
+    ConvertToDense { layers: Vec<usize> },
+    /// Hybrid approach
+    Hybrid,
+}
+
+/// Main pruning strategies for HiDream
+pub struct HiDreamPruner {
+    config: PruningConfig,
+}
+
+impl HiDreamPruner {
+    pub fn new(config: PruningConfig) -> Self {
+        Self { config }
+    }
+    
+    /// Strategy 1: Architectural Pruning
+    /// Reduce the model architecture itself
+    pub fn architectural_pruning(&self) -> ModelArchitecture {
+        ModelArchitecture {
+            // Reduce MMDiT layers from 16 to 8
+            mmdiff_layers: 8,
+            
+            // Reduce DiT layers from 32 to 16
+            dit_layers: 16,
+            
+            // Reduce hidden dimensions
+            hidden_dim: 2048,  // From 4096
+            
+            // Reduce attention heads
+            num_heads: 16,  // From 32
+            
+            // Reduce MoE experts
+            num_experts: 4,  // From 8
+            active_experts: 2,  // From 4
+        }
+    }
+    
+    /// Strategy 2: Text Encoder Pruning
+    /// Remove or reduce text encoders
+    pub fn text_encoder_pruning(&self) -> TextEncoderConfig {
+        TextEncoderConfig {
+            // Remove LLaMA 3.1 8B (saves ~7B params)
+            use_llama: false,
+            
+            // Use smaller T5 variant
+            t5_variant: "t5-large".to_string(),  // 770M instead of XXL
+            
+            // Keep CLIP encoders (they're small)
+            use_clip_l: true,
+            use_clip_g: true,
+            
+            // Optional: Quantize text encoders to int8
+            quantize_text_encoders: true,
+        }
+    }
+    
+    /// Strategy 3: Layer-wise Magnitude Pruning
+    /// Prune weights based on magnitude
+    pub fn magnitude_pruning(
+        &self,
+        weights: &Tensor,
+        pruning_ratio: f32,
+    ) -> Result<Tensor> {
+        // Get absolute values
+        let abs_weights = weights.abs()?;
+        
+        // Flatten to 1D for percentile calculation
+        let flat_weights = abs_weights.flatten_all()?;
+        
+        // Calculate threshold (keep top 1-pruning_ratio weights)
+        let threshold = self.calculate_percentile(&flat_weights, pruning_ratio)?;
+        
+        // Create mask for weights above threshold
+        let mask = abs_weights.ge(threshold)?;
+        
+        // Apply mask
+        weights.mul(&mask.to_dtype(weights.dtype())?)
+    }
+    
+    /// Strategy 4: Structured Pruning for MoE
+    pub fn prune_moe_layer(&self, layer: &MoELayer) -> Result<MoELayer> {
+        match &self.config.moe_pruning_strategy {
+            MoEPruningStrategy::ReduceExperts { from, to } => {
+                // Keep only the most important experts
+                let expert_importance = self.calculate_expert_importance(layer)?;
+                let top_experts = self.get_top_k_indices(&expert_importance, *to)?;
+                
+                Ok(MoELayer {
+                    experts: layer.experts.iter()
+                        .enumerate()
+                        .filter(|(i, _)| top_experts.contains(i))
+                        .map(|(_, e)| e.clone())
+                        .collect(),
+                    router: self.prune_router(&layer.router, &top_experts)?,
+                })
+            }
+            
+            MoEPruningStrategy::ReduceExpertDim { reduction_factor } => {
+                // Reduce dimensions of each expert
+                Ok(MoELayer {
+                    experts: layer.experts.iter()
+                        .map(|e| self.reduce_expert_dims(e, *reduction_factor))
+                        .collect::<Result<Vec<_>>>()?,
+                    router: layer.router.clone(),
+                })
+            }
+            
+            MoEPruningStrategy::ConvertToDense { layers } => {
+                // Convert MoE to dense by averaging top-k experts
+                let avg_expert = self.average_top_experts(layer, 2)?;
+                Ok(MoELayer {
+                    experts: vec![avg_expert],
+                    router: self.create_passthrough_router()?,
+                })
+            }
+            
+            MoEPruningStrategy::Hybrid => {
+                // Combine strategies
+                self.hybrid_moe_pruning(layer)
+            }
+        }
+    }
+    
+    /// Strategy 5: Knowledge Distillation Setup
+    pub fn setup_distillation(&self) -> DistillationConfig {
+        DistillationConfig {
+            teacher_model: "hidream-i1-dev",
+            student_model: "hidream-i1-8b",
+            
+            // Distillation hyperparameters
+            temperature: 3.0,
+            alpha: 0.7,  // Weight for distillation loss
+            
+            // Layer mapping for feature distillation
+            layer_mapping: vec![
+                (4, 2),   // Teacher layer 4 -> Student layer 2
+                (8, 4),   // Teacher layer 8 -> Student layer 4
+                (12, 6),  // etc.
+                (16, 8),
+            ],
+            
+            // Output distillation
+            distill_outputs: true,
+            distill_features: true,
+            distill_attention: true,
+        }
+    }
+    
+    /// Complete pruning pipeline
+    pub fn prune_model(&self, model: &HiDreamModel) -> Result<HiDreamModel8B> {
+        println!("Starting HiDream pruning from 17B to 8B parameters...");
+        
+        // Step 1: Remove LLaMA encoder (saves ~7B)
+        let model_no_llama = self.remove_llama_encoder(model)?;
+        println!("Removed LLaMA encoder, current size: ~10B");
+        
+        // Step 2: Reduce architecture
+        let reduced_arch = self.architectural_pruning();
+        let model_reduced = self.apply_architecture_changes(&model_no_llama, &reduced_arch)?;
+        println!("Applied architectural changes, current size: ~9B");
+        
+        // Step 3: Prune MoE layers
+        let model_moe_pruned = self.prune_all_moe_layers(&model_reduced)?;
+        println!("Pruned MoE layers, current size: ~8.5B");
+        
+        // Step 4: Fine magnitude pruning to reach 8B
+        let model_final = self.final_magnitude_pruning(&model_moe_pruned, 8_000_000_000)?;
+        println!("Final pruning complete, size: 8B");
+        
+        Ok(model_final)
+    }
+    
+    // Helper methods
+    fn calculate_percentile(&self, tensor: &Tensor, percentile: f32) -> Result<f32> {
+        // Implementation for calculating percentile threshold
+        unimplemented!()
+    }
+    
+    fn calculate_expert_importance(&self, layer: &MoELayer) -> Result<Tensor> {
+        // Calculate importance scores for each expert
+        // Based on activation frequency and weight magnitude
+        unimplemented!()
+    }
+    
+    fn get_top_k_indices(&self, scores: &Tensor, k: usize) -> Result<Vec<usize>> {
+        // Get indices of top-k scores
+        unimplemented!()
+    }
+}
+
+/// Recommended pruning approach for HiDream
+pub fn recommended_pruning_pipeline() -> PruningPipeline {
+    PruningPipeline {
+        steps: vec![
+            // 1. Remove LLaMA (17B -> 10B)
+            PruningStep::RemoveTextEncoder { 
+                encoder: "llama-3.1-8b",
+                estimated_reduction: 7_000_000_000,
+            },
+            
+            // 2. Reduce layers (10B -> 8.5B)
+            PruningStep::ReduceLayers {
+                mmdiff: (16, 8),
+                dit: (32, 20),
+                estimated_reduction: 1_500_000_000,
+            },
+            
+            // 3. Reduce MoE experts (8.5B -> 8B)
+            PruningStep::PruneMoE {
+                strategy: MoEPruningStrategy::Hybrid,
+                estimated_reduction: 500_000_000,
+            },
+            
+            // 4. Knowledge distillation
+            PruningStep::Distillation {
+                epochs: 10,
+                dataset: "high-quality-subset",
+            },
+        ],
+    }
+}
+
+// Usage example
+pub fn main() -> Result<()> {
+    let config = PruningConfig {
+        target_params: 8_000_000_000,
+        original_params: 17_000_000_000,
+        pruning_ratio: 0.47,
+        preserve_critical_layers: true,
+        moe_pruning_strategy: MoEPruningStrategy::Hybrid,
+    };
+    
+    let pruner = HiDreamPruner::new(config);
+    
+    // Load original model
+    let model = load_hidream_model("hidream-i1-dev")?;
+    
+    // Prune to 8B
+    let pruned_model = pruner.prune_model(&model)?;
+    
+    // Save pruned model
+    save_model(&pruned_model, "hidream-i1-8b")?;
+    
+    Ok(())
+}

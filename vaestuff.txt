@@ -1,0 +1,173 @@
+Excellent! The implementation is working as designed with the 3-phase memory management approach. The tensor naming issue was already handled correctly (using w1/w2), so that's good.
+Now you just need to fix the VAE shape mismatch. Here's what's likely happening and how to fix it:
+VAE Shape Mismatch Fix
+The VAE shape issue is probably due to Flux using a different VAE architecture than expected. Here's a diagnostic and fix:
+rust//! VAE shape diagnostic and fix
+
+use candle_core::{Device, DType, Tensor, Shape};
+use anyhow::Result;
+
+/// Diagnose VAE tensor shapes
+pub fn diagnose_vae_shapes(vae_path: &str) -> Result<()> {
+    use safetensors::SafeTensors;
+    use std::fs::File;
+    use std::io::Read;
+    
+    let mut file = File::open(vae_path)?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)?;
+    
+    let tensors = SafeTensors::deserialize(&buffer)?;
+    
+    println!("=== VAE Tensor Shapes ===");
+    
+    let mut keys: Vec<String> = tensors.names().into_iter().collect();
+    keys.sort();
+    
+    // Group by encoder/decoder
+    for key in keys.iter() {
+        if key.contains("encoder") || key.contains("decoder") {
+            let shape = tensors.tensor(key)?.shape();
+            println!("{}: {:?}", key, shape);
+        }
+    }
+    
+    // Look for specific layers that might mismatch
+    println!("\n=== Key Layer Shapes ===");
+    let important_layers = [
+        "encoder.conv_in",
+        "encoder.conv_out", 
+        "decoder.conv_in",
+        "decoder.conv_out",
+        "quant_conv",
+        "post_quant_conv",
+    ];
+    
+    for layer_prefix in important_layers {
+        for key in keys.iter() {
+            if key.contains(layer_prefix) {
+                let shape = tensors.tensor(key)?.shape();
+                println!("{}: {:?}", key, shape);
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+/// Flux VAE configuration
+#[derive(Debug, Clone)]
+pub struct FluxVAEConfig {
+    pub in_channels: usize,
+    pub out_channels: usize,
+    pub latent_channels: usize,
+    pub block_out_channels: Vec<usize>,
+    pub layers_per_block: usize,
+    pub scaling_factor: f32,
+}
+
+impl Default for FluxVAEConfig {
+    fn default() -> Self {
+        // Flux uses a specific VAE configuration
+        Self {
+            in_channels: 3,
+            out_channels: 3,
+            latent_channels: 16,  // Flux uses 16 latent channels (not 4 like SD)
+            block_out_channels: vec![128, 256, 512, 512],
+            layers_per_block: 2,
+            scaling_factor: 0.3611,  // Flux-specific scaling
+        }
+    }
+}
+
+/// Check if tensor shapes match expected
+pub fn validate_vae_tensor_shape(
+    tensor_name: &str,
+    actual_shape: &[usize],
+    expected_shape: &[usize],
+) -> Result<()> {
+    if actual_shape != expected_shape {
+        anyhow::bail!(
+            "VAE tensor shape mismatch for {}:\n  Expected: {:?}\n  Actual: {:?}",
+            tensor_name, expected_shape, actual_shape
+        );
+    }
+    Ok(())
+}
+
+/// Adapter to handle shape mismatches
+pub struct VAEShapeAdapter {
+    expected_latent_channels: usize,
+    actual_latent_channels: usize,
+}
+
+impl VAEShapeAdapter {
+    pub fn new(expected: usize, actual: usize) -> Self {
+        Self {
+            expected_latent_channels: expected,
+            actual_latent_channels: actual,
+        }
+    }
+    
+    pub fn adapt_encoder_output(&self, x: &Tensor) -> Result<Tensor> {
+        if self.expected_latent_channels == self.actual_latent_channels {
+            return Ok(x.clone());
+        }
+        
+        // If shape mismatch, we might need to add/remove channels
+        let shape = x.shape();
+        if shape.dims()[1] != self.actual_latent_channels {
+            anyhow::bail!(
+                "Unexpected encoder output channels: {} (expected {})",
+                shape.dims()[1], self.actual_latent_channels
+            );
+        }
+        
+        // Adapt to expected channels (this is a simplified version)
+        // In practice, you might need a learned projection
+        if self.actual_latent_channels > self.expected_latent_channels {
+            // Take first N channels
+            x.narrow(1, 0, self.expected_latent_channels)
+        } else {
+            // Pad with zeros
+            let padding = self.expected_latent_channels - self.actual_latent_channels;
+            let zeros = Tensor::zeros(
+                (shape.dims()[0], padding, shape.dims()[2], shape.dims()[3]),
+                x.dtype(),
+                x.device(),
+            )?;
+            Tensor::cat(&[x, &zeros], 1)
+        }
+    }
+}
+Quick Fix for Common VAE Issues:
+rust// In your VAE loading code, add shape validation:
+
+impl FluxVAE {
+    pub fn load_with_validation(
+        vae_path: &str,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        // First diagnose the VAE
+        diagnose_vae_shapes(vae_path)?;
+        
+        // Load with shape adaptation if needed
+        let config = FluxVAEConfig::default();
+        
+        // ... rest of loading code
+        
+        // Validate critical shapes after loading
+        // This will help identify exactly where the mismatch is
+        
+        Ok(vae)
+    }
+}
+Most Common Flux VAE Issues:
+
+Latent Channels: Flux uses 16 latent channels instead of 4 (like SD)
+Scaling Factor: Different scaling factor (0.3611 vs 0.18215)
+Architecture: Different block structure
+
+The shape mismatch is likely in the latent space dimensions. Run the diagnostic first to see exactly what shapes the VAE has, then we can adapt the code accordingly.
+Once the VAE issue is fixed, your 3-phase training approach should work perfectly on 24GB VRAM!RetryClaude can make mistakes. Please double-check responses.

@@ -1,0 +1,3728 @@
+// version 2!
+
+// Cargo.toml dependencies:
+// [dependencies]
+// cuda-sys = "0.3"
+// libc = "0.2"
+// thiserror = "1.0"
+// serde = { version = "1.0", features = ["derive"] }
+// serde_json = "1.0"
+// log = "0.4"
+// once_cell = "1.19"
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+use std::ptr;
+use std::ffi::c_void;
+
+#[derive(thiserror::Error, Debug)]
+pub enum MemoryError {
+    #[error("CUDA error: {0}")]
+    CudaError(String),
+    #[error("Invalid device ID: {0}")]
+    InvalidDevice(i32),
+    #[error("Allocation failed: {0} bytes")]
+    AllocationFailed(usize),
+    #[error("Memory pool error: {0}")]
+    PoolError(String),
+    #[error("Memory not found")]
+    MemoryNotFound,
+}
+
+pub type Result<T> = std::result::Result<T, MemoryError>;
+
+/// Quantization mode for reduced precision
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub enum QuantizationMode {
+    None,
+    INT8,
+    INT4,
+    NF4,     // NormalFloat4 for QLoRA
+    GPTQ,    // GPTQ quantization
+    AWQ,     // Activation-aware Weight Quantization
+    FP8_E4M3, // FP8 with 4-bit exponent, 3-bit mantissa
+    FP8_E5M2, // FP8 with 5-bit exponent, 2-bit mantissa
+}
+
+impl QuantizationMode {
+    /// Get bytes per element for this quantization mode
+    pub fn bytes_per_element(&self) -> f32 {
+        match self {
+            QuantizationMode::None => 4.0,      // FP32
+            QuantizationMode::INT8 => 1.0,      
+            QuantizationMode::INT4 => 0.5,      
+            QuantizationMode::NF4 => 0.5,       
+            QuantizationMode::GPTQ => 0.5,      // 4-bit typically
+            QuantizationMode::AWQ => 0.5,       // 4-bit typically
+            QuantizationMode::FP8_E4M3 => 1.0,  
+            QuantizationMode::FP8_E5M2 => 1.0,  
+        }
+    }
+    
+    /// Check if mode requires special alignment
+    pub fn alignment_requirement(&self) -> usize {
+        match self {
+            QuantizationMode::INT4 | QuantizationMode::NF4 => 8,  // Pack 8 4-bit values
+            QuantizationMode::GPTQ | QuantizationMode::AWQ => 32, // Warp-aligned
+            _ => 1,
+        }
+    }
+}
+
+/// Memory format for optimal performance
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub enum MemoryFormat {
+    Contiguous,
+    ChannelsLast,
+    ChannelsLast3d,
+    Preserve,
+}
+
+/// Precision mode for mixed precision training
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub enum PrecisionMode {
+    Float32,
+    Float16,
+    BFloat16,
+    Mixed,
+    Dynamic,
+}
+
+/// Attention mechanism optimization strategy
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub enum AttentionStrategy {
+    Standard,
+    FlashAttention,
+    FlashAttention2,
+    MemoryEfficient,
+    Chunked,
+    GradientCheckpointing,
+    MMDiTOptimized,       // For SD3.5 MMDiT
+    MultiModalAttention,  // For text-image cross attention
+    SpatioTemporal,       // For WAN 2.1 video generation
+    CausalTemporal,       // For autoregressive video generation
+}
+
+/// Diffusion-specific memory configuration
+#[derive(Debug, Clone)]
+pub struct DiffusionConfig {
+    pub precision_mode: PrecisionMode,
+    pub attention_strategy: AttentionStrategy,
+    pub enable_gradient_checkpointing: bool,
+    pub checkpoint_ratio: f32,
+    pub enable_cpu_offload: bool,
+    pub enable_model_parallel: bool,
+    pub enable_activation_offload: bool,
+    pub max_sequence_length: usize,
+    pub batch_size: usize,
+    pub enable_flash_attention: bool,
+    pub enable_xformers: bool,
+    pub enable_sdp_attention: bool,
+    pub memory_efficient_attention: bool,
+    pub model_type: ModelType,  // Added for model-specific optimizations
+    pub num_attention_heads: usize,  // For MMDiT
+    pub hidden_dim: usize,  // Model hidden dimension
+    pub num_layers: usize,  // Transformer layers
+    pub patch_size: usize,  // For MMDiT patch-based processing
+    // Video-specific parameters for WAN 2.1
+    pub temporal_compression: usize,  // Temporal downsampling factor
+    pub num_frames: usize,  // Number of frames to generate
+    pub frame_size: (usize, usize),  // (height, width) of each frame
+    pub enable_temporal_attention: bool,  // For video models
+    pub enable_3d_conv: bool,  // For 3D convolutions in video
+    pub video_chunk_size: usize,  // Process video in chunks
+}
+
+/// Model type for specific optimizations
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub enum ModelType {
+    FluxDev,
+    FluxSchnell,
+    SD3Medium,
+    SD35Large,
+    SD35Turbo,
+    WANVACE21,
+    WANVACE21Cascade,
+    CustomDiffusion,
+}
+
+/// Memory allocation statistics
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryStats {
+    pub allocated_bytes: usize,
+    pub reserved_bytes: usize,
+    pub cached_bytes: usize,
+    pub peak_allocated: usize,
+    pub peak_reserved: usize,
+    pub allocation_count: u64,
+    pub deallocation_count: u64,
+    pub cache_hit_count: u64,
+    pub cache_miss_count: u64,
+    pub fragmentation_ratio: f64,
+}
+
+/// Memory pool configuration
+#[derive(Debug, Clone)]
+pub struct MemoryPoolConfig {
+    pub initial_size: usize,
+    pub max_size: usize,
+    pub block_size: usize,
+    pub growth_factor: f64,
+    pub garbage_collection_threshold: f64,
+    pub enable_defragmentation: bool,
+    pub enable_mixed_precision: bool,
+    pub attention_memory_efficient: bool,
+    pub gradient_checkpointing: bool,
+    pub prefetch_factor: f64,
+    pub memory_format: MemoryFormat,
+}
+
+impl Default for MemoryPoolConfig {
+    fn default() -> Self {
+        Self {
+            initial_size: 1024 * 1024 * 128, // 128MB
+            max_size: usize::MAX,
+            block_size: 1024 * 1024, // 1MB
+            growth_factor: 1.5,
+            garbage_collection_threshold: 0.8,
+            enable_defragmentation: true,
+            enable_mixed_precision: true,
+            attention_memory_efficient: true,
+            gradient_checkpointing: false,
+            prefetch_factor: 1.2,
+            memory_format: MemoryFormat::ChannelsLast,
+        }
+    }
+}
+
+/// Memory block metadata
+#[derive(Debug, Clone)]
+struct MemoryBlock {
+    ptr: *mut c_void,
+    size: usize,
+    allocated_time: Instant,
+    last_accessed: Instant,
+    ref_count: u32,
+    is_cached: bool,
+    device_id: i32,
+    precision: PrecisionMode,
+    memory_format: MemoryFormat,
+    is_gradient: bool,
+    is_activation: bool,
+    checkpoint_eligible: bool,
+    attention_block: bool,
+}
+
+unsafe impl Send for MemoryBlock {}
+unsafe impl Sync for MemoryBlock {}
+
+/// CUDA memory allocator wrapper
+struct CudaAllocator {
+    device_id: i32,
+}
+
+impl CudaAllocator {
+    fn new(device_id: i32) -> Result<Self> {
+        // Verify device exists
+        let mut device_count = 0;
+        unsafe {
+            let result = cuda_sys::cudaGetDeviceCount(&mut device_count);
+            if result != 0 || device_id >= device_count {
+                return Err(MemoryError::InvalidDevice(device_id));
+            }
+        }
+        
+        Ok(Self { device_id })
+    }
+
+    fn allocate(&self, size: usize) -> Result<*mut c_void> {
+        let mut ptr: *mut c_void = ptr::null_mut();
+        
+        unsafe {
+            let result = cuda_sys::cudaSetDevice(self.device_id);
+            if result != 0 {
+                return Err(MemoryError::CudaError(format!("Failed to set device {}", self.device_id)));
+            }
+            
+            let result = cuda_sys::cudaMalloc(&mut ptr, size);
+            if result != 0 || ptr.is_null() {
+                return Err(MemoryError::AllocationFailed(size));
+            }
+        }
+        
+        Ok(ptr)
+    }
+
+    fn deallocate(&self, ptr: *mut c_void) -> Result<()> {
+        if ptr.is_null() {
+            return Ok(());
+        }
+        
+        unsafe {
+            let result = cuda_sys::cudaSetDevice(self.device_id);
+            if result != 0 {
+                return Err(MemoryError::CudaError(format!("Failed to set device {}", self.device_id)));
+            }
+            
+            let result = cuda_sys::cudaFree(ptr);
+            if result != 0 {
+                return Err(MemoryError::CudaError("Failed to free memory".to_string()));
+            }
+        }
+        
+        Ok(())
+    }
+
+    fn get_memory_info(&self) -> Result<(usize, usize)> {
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        
+        unsafe {
+            let result = cuda_sys::cudaSetDevice(self.device_id);
+            if result != 0 {
+                return Err(MemoryError::CudaError(format!("Failed to set device {}", self.device_id)));
+            }
+            
+            let result = cuda_sys::cudaMemGetInfo(&mut free, &mut total);
+            if result != 0 {
+                return Err(MemoryError::CudaError("Failed to get memory info".to_string()));
+            }
+        }
+        
+        Ok((free, total))
+    }
+}
+
+/// MMDiT memory block for SD3.5
+pub struct MMDiTMemoryBlock {
+    pub patch_embed_ptr: *mut c_void,
+    pub pos_embed_ptr: *mut c_void,
+    pub q_ptr: *mut c_void,
+    pub k_ptr: *mut c_void,
+    pub v_ptr: *mut c_void,
+    pub adaln_ptr: *mut c_void,
+    pub resolution: (usize, usize),
+    pub seq_len: usize,
+    pub batch_size: usize,
+}
+
+/// WAN 2.1 video memory block
+pub struct WAN21VideoMemoryBlock {
+    pub video_latent_ptr: *mut c_void,      // 5D tensor: (B, T, C, H, W)
+    pub temporal_embed_ptr: *mut c_void,     // Temporal position embeddings
+    pub spatial_attn_ptr: *mut c_void,       // Spatial attention cache
+    pub temporal_attn_ptr: *mut c_void,      // Temporal attention cache
+    pub conv3d_workspace_ptr: *mut c_void,   // Workspace for 3D convolutions
+    pub motion_vector_ptr: *mut c_void,      // Motion vectors for temporal coherence
+    pub text_embed_ptr: *mut c_void,         // Text conditioning
+    pub frame_buffer_ptr: *mut c_void,       // Frame buffer for cascaded generation
+    pub batch_size: usize,
+    pub num_frames: usize,
+    pub height: usize,
+    pub width: usize,
+    pub channels: usize,
+}
+
+/// Multi-GPU memory management
+pub struct MultiGPUManager {
+    devices: Vec<i32>,
+    pools: Arc<RwLock<HashMap<i32, Arc<Mutex<MemoryPool>>>>>,
+    distribution_strategy: Mutex<DistributionStrategy>,
+    p2p_enabled: AtomicBool,
+    device_memory_usage: RwLock<HashMap<i32, DeviceMemoryInfo>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum DistributionStrategy {
+    RoundRobin,
+    LeastUsed,
+    Balanced,
+    Manual(HashMap<String, i32>), // component -> device mapping
+    DataParallel,
+    ModelParallel(ModelParallelConfig),
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelParallelConfig {
+    pub layer_distribution: HashMap<usize, i32>, // layer_idx -> device_id
+    pub pipeline_stages: Vec<i32>, // device order for pipeline parallelism
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceMemoryInfo {
+    pub device_id: i32,
+    pub total_memory: usize,
+    pub allocated_memory: usize,
+    pub reserved_memory: usize,
+    pub free_memory: usize,
+    pub compute_capability: (i32, i32),
+    pub name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct P2PTransferRequest {
+    pub src_device: i32,
+    pub dst_device: i32,
+    pub src_ptr: *mut c_void,
+    pub size: usize,
+    pub async_stream: Option<*mut c_void>,
+}
+
+impl MultiGPUManager {
+    pub fn new(device_ids: Vec<i32>) -> Result<Self> {
+        if device_ids.is_empty() {
+            return Err(MemoryError::PoolError("No devices specified".to_string()));
+        }
+        
+        // Validate all devices exist
+        let mut device_count = 0;
+        unsafe {
+            let result = cuda_sys::cudaGetDeviceCount(&mut device_count);
+            if result != 0 {
+                return Err(MemoryError::CudaError("Failed to get device count".to_string()));
+            }
+        }
+        
+        for &device_id in &device_ids {
+            if device_id >= device_count {
+                return Err(MemoryError::InvalidDevice(device_id));
+            }
+        }
+        
+        let pools = Arc::new(RwLock::new(HashMap::new()));
+        let mut device_memory_usage = HashMap::new();
+        
+        // Initialize device info
+        for &device_id in &device_ids {
+            let info = Self::get_device_info(device_id)?;
+            device_memory_usage.insert(device_id, info);
+        }
+        
+        // Check P2P support
+        let p2p_enabled = Self::check_p2p_support(&device_ids);
+        
+        Ok(Self {
+            devices: device_ids,
+            pools: pools.clone(),
+            distribution_strategy: Mutex::new(DistributionStrategy::Balanced),
+            p2p_enabled: AtomicBool::new(p2p_enabled),
+            device_memory_usage: RwLock::new(device_memory_usage),
+        })
+    }
+    
+    fn get_device_info(device_id: i32) -> Result<DeviceMemoryInfo> {
+        unsafe {
+            cuda_sys::cudaSetDevice(device_id);
+            
+            let mut free: usize = 0;
+            let mut total: usize = 0;
+            cuda_sys::cudaMemGetInfo(&mut free, &mut total);
+            
+            let mut prop = std::mem::zeroed::<cuda_sys::cudaDeviceProp>();
+            cuda_sys::cudaGetDeviceProperties(&mut prop, device_id);
+            
+            let name = std::ffi::CStr::from_ptr(prop.name.as_ptr())
+                .to_string_lossy()
+                .into_owned();
+            
+            Ok(DeviceMemoryInfo {
+                device_id,
+                total_memory: total,
+                allocated_memory: 0,
+                reserved_memory: 0,
+                free_memory: free,
+                compute_capability: (prop.major, prop.minor),
+                name,
+            })
+        }
+    }
+    
+    fn check_p2p_support(devices: &[i32]) -> bool {
+        if devices.len() < 2 {
+            return false;
+        }
+        
+        unsafe {
+            for i in 0..devices.len() {
+                for j in i+1..devices.len() {
+                    let mut can_access = 0;
+                    cuda_sys::cudaDeviceCanAccessPeer(&mut can_access, devices[i], devices[j]);
+                    if can_access == 0 {
+                        return false;
+                    }
+                }
+            }
+        }
+        
+        true
+    }
+    
+    pub fn enable_p2p(&self) -> Result<()> {
+        if !self.p2p_enabled.load(Ordering::Relaxed) {
+            return Err(MemoryError::PoolError("P2P not supported between devices".to_string()));
+        }
+        
+        unsafe {
+            for i in 0..self.devices.len() {
+                cuda_sys::cudaSetDevice(self.devices[i]);
+                for j in 0..self.devices.len() {
+                    if i != j {
+                        let result = cuda_sys::cudaDeviceEnablePeerAccess(self.devices[j], 0);
+                        if result != 0 && result != 704 { // 704 = already enabled
+                            log::warn!("Failed to enable P2P access from {} to {}", self.devices[i], self.devices[j]);
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    pub fn set_distribution_strategy(&self, strategy: DistributionStrategy) -> Result<()> {
+        *self.distribution_strategy.lock().unwrap() = strategy;
+        Ok(())
+    }
+    
+    pub fn get_optimal_device(&self) -> Result<i32> {
+        let strategy = self.distribution_strategy.lock().unwrap();
+        
+        match &*strategy {
+            DistributionStrategy::RoundRobin => {
+                // Simple round-robin
+                static COUNTER: AtomicUsize = AtomicUsize::new(0);
+                let idx = COUNTER.fetch_add(1, Ordering::Relaxed) % self.devices.len();
+                Ok(self.devices[idx])
+            }
+            DistributionStrategy::LeastUsed => {
+                // Find device with most free memory
+                let usage = self.device_memory_usage.read().unwrap();
+                let device = usage.iter()
+                    .max_by_key(|(_, info)| info.free_memory)
+                    .map(|(id, _)| *id)
+                    .ok_or_else(|| MemoryError::PoolError("No devices available".to_string()))?;
+                Ok(device)
+            }
+            DistributionStrategy::Balanced => {
+                // Balance based on memory pressure
+                let usage = self.device_memory_usage.read().unwrap();
+                let device = usage.iter()
+                    .min_by_key(|(_, info)| {
+                        if info.total_memory > 0 {
+                            (info.allocated_memory * 100) / info.total_memory
+                        } else {
+                            100
+                        }
+                    })
+                    .map(|(id, _)| *id)
+                    .ok_or_else(|| MemoryError::PoolError("No devices available".to_string()))?;
+                Ok(device)
+            }
+            _ => Ok(self.devices[0]), // Default to first device
+        }
+    }
+    
+    pub fn allocate_balanced(&self, size: usize) -> Result<(i32, *mut c_void)> {
+        let device_id = self.get_optimal_device()?;
+        
+        // Get or create pool for device
+        let pool = {
+            let pools = self.pools.read().unwrap();
+            if let Some(pool) = pools.get(&device_id) {
+                pool.clone()
+            } else {
+                drop(pools);
+                let pool = Arc::new(Mutex::new(MemoryPool::new(device_id, MemoryPoolConfig::default())?));
+                self.pools.write().unwrap().insert(device_id, pool.clone());
+                pool
+            }
+        };
+        
+        let ptr = pool.lock().unwrap().allocate(size)?;
+        
+        // Update device usage
+        {
+            let mut usage = self.device_memory_usage.write().unwrap();
+            if let Some(info) = usage.get_mut(&device_id) {
+                info.allocated_memory += size;
+                info.free_memory = info.free_memory.saturating_sub(size);
+            }
+        }
+        
+        Ok((device_id, ptr))
+    }
+    
+    pub fn p2p_transfer(&self, request: P2PTransferRequest) -> Result<()> {
+        if !self.p2p_enabled.load(Ordering::Relaxed) {
+            return Err(MemoryError::PoolError("P2P not enabled".to_string()));
+        }
+        
+        unsafe {
+            // Set current device to destination
+            cuda_sys::cudaSetDevice(request.dst_device);
+            
+            // Allocate on destination
+            let mut dst_ptr: *mut c_void = std::ptr::null_mut();
+            let result = cuda_sys::cudaMalloc(&mut dst_ptr, request.size);
+            if result != 0 {
+                return Err(MemoryError::AllocationFailed(request.size));
+            }
+            
+            // Copy from source to destination
+            let copy_result = if let Some(stream) = request.async_stream {
+                cuda_sys::cudaMemcpyPeerAsync(
+                    dst_ptr,
+                    request.dst_device,
+                    request.src_ptr,
+                    request.src_device,
+                    request.size,
+                    stream
+                )
+            } else {
+                cuda_sys::cudaMemcpyPeer(
+                    dst_ptr,
+                    request.dst_device,
+                    request.src_ptr,
+                    request.src_device,
+                    request.size
+                )
+            };
+            
+            if copy_result != 0 {
+                cuda_sys::cudaFree(dst_ptr);
+                return Err(MemoryError::CudaError("P2P transfer failed".to_string()));
+            }
+            
+            // Free source memory if needed
+            cuda_sys::cudaSetDevice(request.src_device);
+            cuda_sys::cudaFree(request.src_ptr);
+        }
+        
+        Ok(())
+    }
+    
+    pub fn distribute_model(&self, model_type: ModelType, strategy: DistributionStrategy) -> Result<ModelDistribution> {
+        self.set_distribution_strategy(strategy.clone())?;
+        
+        match strategy {
+            DistributionStrategy::DataParallel => {
+                self.setup_data_parallel(model_type)
+            }
+            DistributionStrategy::ModelParallel(config) => {
+                self.setup_model_parallel(model_type, config)
+            }
+            _ => Err(MemoryError::PoolError("Invalid distribution strategy for model".to_string()))
+        }
+    }
+    
+    fn setup_data_parallel(&self, model_type: ModelType) -> Result<ModelDistribution> {
+        let mut replicas = Vec::new();
+        
+        // Create model replica on each device
+        for &device_id in &self.devices {
+            let pool = self.get_or_create_pool_for_device(device_id)?;
+            
+            // Configure pool for model type
+            match model_type {
+                ModelType::FluxDev => {
+                    pool.lock().unwrap().optimize_for_flux_dev()?;
+                }
+                ModelType::SD35Large => {
+                    pool.lock().unwrap().optimize_for_sd35()?;
+                }
+                ModelType::WAN21Video => {
+                    pool.lock().unwrap().optimize_for_wan21()?;
+                }
+                _ => {}
+            }
+            
+            replicas.push(device_id);
+        }
+        
+        Ok(ModelDistribution {
+            model_type,
+            device_assignments: replicas.iter().enumerate()
+                .map(|(i, &d)| (format!("replica_{}", i), d))
+                .collect(),
+            strategy: DistributionStrategy::DataParallel,
+        })
+    }
+    
+    fn setup_model_parallel(&self, model_type: ModelType, config: ModelParallelConfig) -> Result<ModelDistribution> {
+        let mut assignments = HashMap::new();
+        
+        // Assign layers to devices based on config
+        for (layer_idx, &device_id) in &config.layer_distribution {
+            if !self.devices.contains(&device_id) {
+                return Err(MemoryError::InvalidDevice(device_id));
+            }
+            
+            let pool = self.get_or_create_pool_for_device(device_id)?;
+            assignments.insert(format!("layer_{}", layer_idx), device_id);
+        }
+        
+        Ok(ModelDistribution {
+            model_type,
+            device_assignments: assignments,
+            strategy: DistributionStrategy::ModelParallel(config),
+        })
+    }
+    
+    fn get_or_create_pool_for_device(&self, device_id: i32) -> Result<Arc<Mutex<MemoryPool>>> {
+        let pools = self.pools.read().unwrap();
+        if let Some(pool) = pools.get(&device_id) {
+            return Ok(pool.clone());
+        }
+        
+        drop(pools);
+        let pool = Arc::new(Mutex::new(MemoryPool::new(device_id, MemoryPoolConfig::default())?));
+        self.pools.write().unwrap().insert(device_id, pool.clone());
+        Ok(pool)
+    }
+    
+    pub fn synchronize_all_devices(&self) -> Result<()> {
+        for &device_id in &self.devices {
+            unsafe {
+                cuda_sys::cudaSetDevice(device_id);
+                let result = cuda_sys::cudaDeviceSynchronize();
+                if result != 0 {
+                    return Err(MemoryError::CudaError(format!("Failed to sync device {}", device_id)));
+                }
+            }
+        }
+        Ok(())
+    }
+    
+    pub fn get_total_memory(&self) -> usize {
+        self.device_memory_usage.read().unwrap()
+            .values()
+            .map(|info| info.total_memory)
+            .sum()
+    }
+    
+    pub fn get_total_free_memory(&self) -> usize {
+        self.device_memory_usage.read().unwrap()
+            .values()
+            .map(|info| info.free_memory)
+            .sum()
+    }
+    
+    pub fn update_memory_info(&self) -> Result<()> {
+        let mut usage = self.device_memory_usage.write().unwrap();
+        
+        for &device_id in &self.devices {
+            let info = Self::get_device_info(device_id)?;
+            usage.insert(device_id, info);
+        }
+        
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelDistribution {
+    pub model_type: ModelType,
+    pub device_assignments: HashMap<String, i32>,
+    pub strategy: DistributionStrategy,
+}
+
+use std::sync::atomic::AtomicUsize;
+
+/// Safe multi-GPU tensor wrapper
+pub struct MultiGPUTensor {
+    tensors: HashMap<i32, SafeGPUTensor>, // device_id -> tensor
+    primary_device: i32,
+    shape: Vec<usize>,
+    dtype: PrecisionMode,
+    distribution: TensorDistribution,
+}
+
+#[derive(Debug, Clone)]
+pub enum TensorDistribution {
+    Replicated,              // Same data on all devices
+    Sharded(ShardingStrategy), // Data split across devices
+    Scattered,               // Different parts on different devices
+}
+
+#[derive(Debug, Clone)]
+pub enum ShardingStrategy {
+    Batch,      // Shard along batch dimension
+    Channel,    // Shard along channel dimension
+    Spatial,    // Shard along spatial dimensions
+    Custom(usize), // Shard along specified dimension
+}
+
+impl MultiGPUTensor {
+    pub fn new_replicated(shape: Vec<usize>, dtype: PrecisionMode, devices: &[i32]) -> Result<Self> {
+        let mut tensors = HashMap::new();
+        
+        for &device_id in devices {
+            cuda::set_device(device_id)?;
+            let tensor = SafeGPUTensor::new(shape.clone(), dtype)?;
+            tensors.insert(device_id, tensor);
+        }
+        
+        Ok(Self {
+            tensors,
+            primary_device: devices[0],
+            shape,
+            dtype,
+            distribution: TensorDistribution::Replicated,
+        })
+    }
+    
+    pub fn new_sharded(shape: Vec<usize>, dtype: PrecisionMode, devices: &[i32], strategy: ShardingStrategy) -> Result<Self> {
+        let mut tensors = HashMap::new();
+        let shard_dim = match &strategy {
+            ShardingStrategy::Batch => 0,
+            ShardingStrategy::Channel => 1,
+            ShardingStrategy::Spatial => 2,
+            ShardingStrategy::Custom(dim) => *dim,
+        };
+        
+        if shard_dim >= shape.len() {
+            return Err(MemoryError::PoolError("Invalid shard dimension".to_string()));
+        }
+        
+        let total_size = shape[shard_dim];
+        let base_shard_size = total_size / devices.len();
+        let remainder = total_size % devices.len();
+        
+        let mut offset = 0;
+        for (i, &device_id in devices.iter().enumerate() {
+            let shard_size = base_shard_size + if i < remainder { 1 } else { 0 };
+            
+            let mut shard_shape = shape.clone();
+            shard_shape[shard_dim] = shard_size;
+            
+            cuda::set_device(device_id)?;
+            let tensor = SafeGPUTensor::new(shard_shape, dtype)?;
+            tensors.insert(device_id, tensor);
+            
+            offset += shard_size;
+        }
+        
+        Ok(Self {
+            tensors,
+            primary_device: devices[0],
+            shape,
+            dtype,
+            distribution: TensorDistribution::Sharded(strategy),
+        })
+    }
+    
+    pub fn broadcast_from_primary(&mut self) -> Result<()> {
+        if !matches!(self.distribution, TensorDistribution::Replicated) {
+            return Err(MemoryError::PoolError("Can only broadcast replicated tensors".to_string()));
+        }
+        
+        let primary_tensor = self.tensors.get(&self.primary_device)
+            .ok_or_else(|| MemoryError::PoolError("Primary tensor not found".to_string()))?;
+        
+        let primary_ptr = primary_tensor.as_ptr();
+        let size = primary_tensor.nbytes();
+        
+        for (&device_id, tensor) in self.tensors.iter_mut() {
+            if device_id != self.primary_device {
+                unsafe {
+                    let result = cuda_sys::cudaMemcpyPeer(
+                        tensor.as_mut_ptr(),
+                        device_id,
+                        primary_ptr as *mut c_void,
+                        self.primary_device,
+                        size
+                    );
+                    if result != 0 {
+                        return Err(MemoryError::CudaError("Broadcast failed".to_string()));
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    pub fn gather_to_primary(&mut self) -> Result<SafeGPUTensor> {
+        match &self.distribution {
+            TensorDistribution::Replicated => {
+                // Just return a copy of the primary tensor
+                let primary = self.tensors.get(&self.primary_device)
+                    .ok_or_else(|| MemoryError::PoolError("Primary tensor not found".to_string()))?;
+                SafeGPUTensor::new(primary.shape().to_vec(), primary.dtype())
+            }
+            TensorDistribution::Sharded(strategy) => {
+                // Gather shards to primary device
+                cuda::set_device(self.primary_device)?;
+                let mut gathered = SafeGPUTensor::new(self.shape.clone(), self.dtype)?;
+                
+                // Copy each shard to the appropriate position
+                let shard_dim = match strategy {
+                    ShardingStrategy::Batch => 0,
+                    ShardingStrategy::Channel => 1,
+                    ShardingStrategy::Spatial => 2,
+                    ShardingStrategy::Custom(dim) => *dim,
+                };
+                
+                let mut offset = 0;
+                for (device_id, tensor) in &self.tensors {
+                    let shard_size = tensor.shape()[shard_dim];
+                    
+                    // Calculate copy parameters
+                    let element_size = match self.dtype {
+                        PrecisionMode::Float32 => 4,
+                        PrecisionMode::Float16 | PrecisionMode::BFloat16 => 2,
+                        _ => 2,
+                    };
+                    
+                    let elements_before = self.shape[..shard_dim].iter().product::<usize>();
+                    let elements_in_shard = shard_size;
+                    let elements_after = self.shape[shard_dim+1..].iter().product::<usize>();
+                    let shard_bytes = elements_before * elements_in_shard * elements_after * element_size;
+                    
+                    unsafe {
+                        let dst_offset = offset * elements_before * elements_after * element_size;
+                        let dst_ptr = (gathered.as_mut_ptr() as *mut u8).add(dst_offset) as *mut c_void;
+                        
+                        let result = cuda_sys::cudaMemcpyPeer(
+                            dst_ptr,
+                            self.primary_device,
+                            tensor.as_ptr() as *mut c_void,
+                            *device_id,
+                            shard_bytes
+                        );
+                        if result != 0 {
+                            return Err(MemoryError::CudaError("Gather failed".to_string()));
+                        }
+                    }
+                    
+                    offset += shard_size;
+                }
+                
+                Ok(gathered)
+            }
+            TensorDistribution::Scattered => {
+                Err(MemoryError::PoolError("Cannot gather scattered tensors".to_string()))
+            }
+        }
+    }
+}
+
+/// Memory pool for efficient allocation and caching
+pub struct MemoryPool {
+    device_id: i32,
+    config: MemoryPoolConfig,
+    diffusion_config: Option<DiffusionConfig>,
+    allocator: CudaAllocator,
+    allocated_blocks: RwLock<HashMap<*mut c_void, MemoryBlock>>,
+    cached_blocks: RwLock<Vec<MemoryBlock>>,
+    gradient_blocks: RwLock<HashMap<*mut c_void, MemoryBlock>>,
+    activation_blocks: RwLock<HashMap<*mut c_void, MemoryBlock>>,
+    checkpoint_blocks: RwLock<Vec<MemoryBlock>>,
+    attention_cache: RwLock<HashMap<(usize, usize), *mut c_void>>,
+    stats: RwLock<MemoryStats>,
+    streams: RwLock<Vec<*mut c_void>>,
+}
+
+unsafe impl Send for MemoryPool {}
+unsafe impl Sync for MemoryPool {}
+
+impl MemoryPool {
+    pub fn new(device_id: i32, config: MemoryPoolConfig) -> Result<Self> {
+        let allocator = CudaAllocator::new(device_id)?;
+        
+        Ok(Self {
+            device_id,
+            config,
+            diffusion_config: None,
+            allocator,
+            allocated_blocks: RwLock::new(HashMap::new()),
+            cached_blocks: RwLock::new(Vec::new()),
+            gradient_blocks: RwLock::new(HashMap::new()),
+            activation_blocks: RwLock::new(HashMap::new()),
+            checkpoint_blocks: RwLock::new(Vec::new()),
+            attention_cache: RwLock::new(HashMap::new()),
+            stats: RwLock::new(MemoryStats {
+                allocated_bytes: 0,
+                reserved_bytes: 0,
+                cached_bytes: 0,
+                peak_allocated: 0,
+                peak_reserved: 0,
+                allocation_count: 0,
+                deallocation_count: 0,
+                cache_hit_count: 0,
+                cache_miss_count: 0,
+                fragmentation_ratio: 0.0,
+            }),
+            streams: RwLock::new(Vec::new()),
+        })
+    }
+
+    pub fn configure_for_diffusion(&mut self, diffusion_config: DiffusionConfig) -> Result<()> {
+        self.diffusion_config = Some(diffusion_config.clone());
+        
+        // Pre-allocate CUDA streams for async operations
+        let mut streams = self.streams.write().unwrap();
+        let stream_count = match diffusion_config.model_type {
+            ModelType::SD35Large | ModelType::SD35Turbo => 8,  // More streams for SD3.5
+            _ => 4,
+        };
+        
+        for _ in 0..stream_count {
+            let mut stream: *mut c_void = std::ptr::null_mut();
+            unsafe {
+                let result = cuda_sys::cudaStreamCreate(&mut stream);
+                if result == 0 {
+                    streams.push(stream);
+                }
+            }
+        }
+        
+        // Pre-warm attention cache based on model type
+        match diffusion_config.model_type {
+            ModelType::SD35Large | ModelType::SD35Turbo => {
+                self.prewarm_mmdit_cache(
+                    diffusion_config.max_sequence_length,
+                    diffusion_config.batch_size,
+                    diffusion_config.num_attention_heads,
+                    diffusion_config.hidden_dim,
+                )?;
+            }
+            ModelType::WAN21Video | ModelType::WAN21VideoLarge => {
+                self.prewarm_wan21_video_cache(
+                    diffusion_config.num_frames,
+                    diffusion_config.frame_size,
+                    diffusion_config.batch_size,
+                    diffusion_config.hidden_dim,
+                )?;
+            }
+            _ => {
+                if diffusion_config.enable_flash_attention {
+                    self.prewarm_attention_cache(
+                        diffusion_config.max_sequence_length,
+                        diffusion_config.batch_size
+                    )?;
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    fn prewarm_wan21_video_cache(&self, num_frames: usize, frame_size: (usize, usize), batch_size: usize, hidden_dim: usize) -> Result<()> {
+        let mut cache = self.attention_cache.write().unwrap();
+        
+        // Common video configurations
+        let frame_configs = [
+            (16, (512, 512)),   // 16 frames at 512x512
+            (24, (512, 512)),   // 24 frames at 512x512
+            (32, (512, 512)),   // 32 frames at 512x512
+            (16, (768, 768)),   // 16 frames at 768x768
+            (8, (1024, 1024)),  // 8 frames at 1024x1024 (memory intensive)
+        ];
+        
+        let patch_size = self.diffusion_config.as_ref().map(|c| c.patch_size).unwrap_or(8);
+        
+        for (frames, (h, w)) in frame_configs {
+            if frames <= num_frames && h <= frame_size.0 && w <= frame_size.1 {
+                // Ensure dimensions are valid
+                if h % patch_size != 0 || w % patch_size != 0 {
+                    continue;
+                }
+                
+                // Calculate spatial sequence length
+                let spatial_seq_len = (h / patch_size) * (w / patch_size);
+                let temporal_seq_len = frames;
+                
+                // Cache key based on total spatiotemporal sequence
+                let key = (spatial_seq_len * temporal_seq_len, batch_size);
+                
+                // Allocate for spatiotemporal attention
+                let size = batch_size * frames * spatial_seq_len * hidden_dim * 2; // FP16
+                
+                match self.allocator.allocate(size) {
+                    Ok(ptr) => {
+                        cache.insert(key, ptr);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    pub fn allocate_wan21_video_block(&self, num_frames: usize, height: usize, width: usize, batch_size: usize, config: &DiffusionConfig) -> Result<WAN21VideoMemoryBlock> {
+        // Validate inputs
+        if num_frames == 0 || height == 0 || width == 0 || batch_size == 0 {
+            return Err(MemoryError::PoolError("Invalid dimensions: all must be non-zero".to_string()));
+        }
+        
+        let patch_size = config.patch_size;
+        if height % patch_size != 0 || width % patch_size != 0 {
+            return Err(MemoryError::PoolError(format!(
+                "Resolution {}x{} not divisible by patch size {}", 
+                height, width, patch_size
+            )));
+        }
+        
+        let channels = 16; // WAN 2.1 latent channels
+        let temporal_compression = config.temporal_compression.max(1);
+        let compressed_frames = (num_frames + temporal_compression - 1) / temporal_compression; // Round up
+        
+        // Calculate latent dimensions
+        let latent_height = height / patch_size;
+        let latent_width = width / patch_size;
+        
+        // Allocate 5D video latent tensor (B, T, C, H, W)
+        let video_latent_size = batch_size * compressed_frames * channels * latent_height * latent_width * 2; // FP16
+        let video_latent_ptr = self.allocate_with_format(
+            video_latent_size,
+            MemoryFormat::ChannelsLast3d,
+            PrecisionMode::Float16
+        )?;
+        
+        // Allocate temporal embeddings
+        let temporal_embed_size = compressed_frames * config.hidden_dim * 2; // FP16
+        let temporal_embed_ptr = self.allocate_with_format(
+            temporal_embed_size,
+            MemoryFormat::Contiguous,
+            PrecisionMode::Float16
+        )?;
+        
+        // Allocate spatial attention cache
+        let spatial_seq_len = latent_height * latent_width;
+        let spatial_attn_size = batch_size * compressed_frames * spatial_seq_len * config.hidden_dim * 2;
+        let spatial_attn_ptr = self.allocate_for_attention(
+            spatial_seq_len,
+            batch_size * compressed_frames,
+            config.hidden_dim
+        )?;
+        
+        // Allocate temporal attention cache
+        let temporal_attn_size = batch_size * spatial_seq_len * compressed_frames * config.hidden_dim * 2;
+        let temporal_attn_ptr = self.allocate_with_format(
+            temporal_attn_size,
+            MemoryFormat::Contiguous,
+            PrecisionMode::Float16
+        )?;
+        
+        // Allocate 3D convolution workspace
+        let conv3d_workspace_size = batch_size * compressed_frames * channels * latent_height * latent_width * 4 * 2; // 4x for workspace, FP16
+        let conv3d_workspace_ptr = self.allocate_with_format(
+            conv3d_workspace_size,
+            MemoryFormat::ChannelsLast3d,
+            PrecisionMode::Float16
+        )?;
+        
+        // Allocate motion vectors for temporal coherence
+        let motion_vector_size = if compressed_frames > 1 {
+            batch_size * (compressed_frames - 1) * 2 * latent_height * latent_width * 4 // 2 components (x,y), FP32
+        } else {
+            0 // No motion vectors for single frame
+        };
+        
+        let motion_vector_ptr = if motion_vector_size > 0 {
+            self.allocate_with_format(
+                motion_vector_size,
+                MemoryFormat::Contiguous,
+                PrecisionMode::Float32
+            )?
+        } else {
+            std::ptr::null_mut()
+        };
+        
+        // Allocate text embeddings (T5 XXL for WAN 2.1)
+        let text_embed_size = batch_size * 256 * 4096 * 2; // 256 tokens, 4096 dim, FP16
+        let text_embed_ptr = self.allocate_with_format(
+            text_embed_size,
+            MemoryFormat::Contiguous,
+            PrecisionMode::Float16
+        )?;
+        
+        // Allocate frame buffer for cascaded/iterative generation
+        let frame_buffer_size = batch_size * num_frames * 3 * height * width * 2; // RGB, full resolution, FP16
+        let frame_buffer_ptr = if config.enable_cpu_offload && frame_buffer_size > 1024 * 1024 * 512 { // > 512MB
+            // Allocate on CPU for large frame buffers
+            let ptr = unsafe { libc::malloc(frame_buffer_size) };
+            if ptr.is_null() {
+                // Clean up already allocated pointers before returning error
+                self.deallocate(video_latent_ptr)?;
+                self.deallocate(temporal_embed_ptr)?;
+                self.deallocate(spatial_attn_ptr)?;
+                self.deallocate(temporal_attn_ptr)?;
+                self.deallocate(conv3d_workspace_ptr)?;
+                if !motion_vector_ptr.is_null() {
+                    self.deallocate(motion_vector_ptr)?;
+                }
+                self.deallocate(text_embed_ptr)?;
+                return Err(MemoryError::AllocationFailed(frame_buffer_size));
+            }
+            ptr
+        } else {
+            self.allocate_with_format(
+                frame_buffer_size,
+                MemoryFormat::ChannelsLast3d,
+                PrecisionMode::Float16
+            )?
+        };
+        
+        Ok(WAN21VideoMemoryBlock {
+            video_latent_ptr,
+            temporal_embed_ptr,
+            spatial_attn_ptr,
+            temporal_attn_ptr,
+            conv3d_workspace_ptr,
+            motion_vector_ptr,
+            text_embed_ptr,
+            frame_buffer_ptr,
+            batch_size,
+            num_frames: compressed_frames,
+            height: latent_height,
+            width: latent_width,
+            channels,
+        })
+    }
+
+    pub fn optimize_for_wan21(&mut self) -> Result<()> {
+        // WAN 2.1 video generation optimizations
+        let wan21_config = DiffusionConfig {
+            precision_mode: PrecisionMode::Mixed,
+            attention_strategy: AttentionStrategy::SpatioTemporal,
+            enable_gradient_checkpointing: true,
+            checkpoint_ratio: 0.5, // Aggressive checkpointing for video
+            enable_cpu_offload: true,
+            enable_model_parallel: false,
+            enable_activation_offload: true,
+            max_sequence_length: 256 * 64 * 64, // Max spatiotemporal sequence
+            batch_size: 1,
+            enable_flash_attention: true,
+            enable_xformers: true,
+            enable_sdp_attention: true,
+            memory_efficient_attention: true,
+            model_type: ModelType::WAN21Video,
+            num_attention_heads: 32,
+            hidden_dim: 1280,
+            num_layers: 32,
+            patch_size: 8,
+            temporal_compression: 4,
+            num_frames: 32,
+            frame_size: (512, 512),
+            enable_temporal_attention: true,
+            enable_3d_conv: true,
+            video_chunk_size: 8,
+        };
+
+        self.configure_for_diffusion(wan21_config)?;
+        
+        // Pre-allocate common WAN 2.1 tensor sizes
+        self.prewarm_wan21_cache()?;
+        
+        Ok(())
+    }
+
+    fn prewarm_wan21_cache(&self) -> Result<()> {
+        let config = self.diffusion_config.as_ref().ok_or_else(|| 
+            MemoryError::PoolError("No diffusion config set".to_string())
+        )?;
+        
+        // Pre-allocate for common video generation scenarios
+        let scenarios = [
+            (16, 512, 512),  // 16 frames at 512x512
+            (24, 512, 512),  // 24 frames at 512x512
+            (32, 512, 512),  // 32 frames at 512x512
+            (16, 768, 768),  // 16 frames at 768x768
+        ];
+        
+        for (frames, height, width) in scenarios {
+            // Skip if dimensions aren't valid
+            if height % config.patch_size != 0 || width % config.patch_size != 0 {
+                continue;
+            }
+            
+            match self.allocate_wan21_video_block(frames, height, width, 1, config) {
+                Ok(block) => {
+                    // Cache the allocations
+                    let mut cached = self.cached_blocks.write().unwrap();
+                    
+                    // Convert WAN 2.1 block pointers to cached memory blocks
+                    let ptrs = vec![
+                        (block.video_latent_ptr, block.batch_size * block.num_frames * block.channels * block.height * block.width * 2),
+                        (block.temporal_embed_ptr, block.num_frames * config.hidden_dim * 2),
+                        (block.spatial_attn_ptr, block.batch_size * block.num_frames * block.height * block.width * config.hidden_dim * 2),
+                        (block.temporal_attn_ptr, block.batch_size * block.height * block.width * block.num_frames * config.hidden_dim * 2),
+                        (block.conv3d_workspace_ptr, block.batch_size * block.num_frames * block.channels * block.height * block.width * 4 * 2),
+                    ];
+                    
+                    // Add non-null pointers to cache
+                    for (ptr, size) in ptrs {
+                        if !ptr.is_null() {
+                            let mem_block = MemoryBlock {
+                                ptr,
+                                size,
+                                allocated_time: Instant::now(),
+                                last_accessed: Instant::now(),
+                                ref_count: 0,
+                                is_cached: true,
+                                device_id: self.device_id,
+                                precision: PrecisionMode::Float16,
+                                memory_format: MemoryFormat::ChannelsLast3d,
+                                is_gradient: false,
+                                is_activation: true,
+                                checkpoint_eligible: true,
+                                attention_block: false,
+                            };
+                            cached.push(mem_block);
+                        }
+                    }
+                    
+                    // Handle motion vector pointer separately (FP32)
+                    if !block.motion_vector_ptr.is_null() {
+                        let motion_size = block.batch_size * (block.num_frames.saturating_sub(1)) * 2 * block.height * block.width * 4;
+                        let mem_block = MemoryBlock {
+                            ptr: block.motion_vector_ptr,
+                            size: motion_size,
+                            allocated_time: Instant::now(),
+                            last_accessed: Instant::now(),
+                            ref_count: 0,
+                            is_cached: true,
+                            device_id: self.device_id,
+                            precision: PrecisionMode::Float32,
+                            memory_format: MemoryFormat::Contiguous,
+                            is_gradient: false,
+                            is_activation: false,
+                            checkpoint_eligible: false,
+                            attention_block: false,
+                        };
+                        cached.push(mem_block);
+                    }
+                    
+                    // Text embeddings
+                    if !block.text_embed_ptr.is_null() {
+                        let text_size = block.batch_size * 256 * 4096 * 2;
+                        let mem_block = MemoryBlock {
+                            ptr: block.text_embed_ptr,
+                            size: text_size,
+                            allocated_time: Instant::now(),
+                            last_accessed: Instant::now(),
+                            ref_count: 0,
+                            is_cached: true,
+                            device_id: self.device_id,
+                            precision: PrecisionMode::Float16,
+                            memory_format: MemoryFormat::Contiguous,
+                            is_gradient: false,
+                            is_activation: false,
+                            checkpoint_eligible: false,
+                            attention_block: false,
+                        };
+                        cached.push(mem_block);
+                    }
+                    
+                    // Note: frame_buffer_ptr might be CPU memory, so we don't cache it here
+                }
+                Err(_) => break,
+            }
+        }
+        
+        Ok(())
+    }
+
+    pub fn allocate_wan21_temporal_chunk(&self, chunk_frames: usize, height: usize, width: usize, config: &DiffusionConfig) -> Result<*mut c_void> {
+        // Validate inputs
+        if chunk_frames == 0 || height == 0 || width == 0 {
+            return Err(MemoryError::PoolError("Invalid dimensions for temporal chunk".to_string()));
+        }
+        
+        let patch_size = config.patch_size;
+        if height % patch_size != 0 || width % patch_size != 0 {
+            return Err(MemoryError::PoolError(format!(
+                "Resolution {}x{} not divisible by patch size {}", 
+                height, width, patch_size
+            )));
+        }
+        
+        // Allocate memory for processing video in temporal chunks
+        let channels = 16;
+        let latent_height = height / patch_size;
+        let latent_width = width / patch_size;
+        let chunk_size = chunk_frames * channels * latent_height * latent_width * 2; // FP16
+        
+        self.allocate_with_format(
+            chunk_size,
+            MemoryFormat::ChannelsLast3d,
+            PrecisionMode::Float16
+        )
+    }
+
+    fn prewarm_attention_cache(&self, max_seq_len: usize, batch_size: usize) -> Result<()> {
+        let mut cache = self.attention_cache.write().unwrap();
+        
+        // Common sequence lengths for diffusion models
+        let common_seq_lens = [64, 256, 1024, 4096, max_seq_len];
+        
+        for &seq_len in &common_seq_lens {
+            if seq_len <= max_seq_len {
+                let key = (seq_len, batch_size);
+                let size = seq_len * batch_size * 16 * std::mem::size_of::<f16>();
+                
+                match self.allocator.allocate(size) {
+                    Ok(ptr) => {
+                        cache.insert(key, ptr);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    pub fn allocate(&self, size: usize) -> Result<*mut c_void> {
+        self.allocate_basic(size)
+    }
+
+    fn allocate_basic(&self, size: usize) -> Result<*mut c_void> {
+        // Try to find a suitable cached block first
+        if let Some(block) = self.find_cached_block(size) {
+            self.update_stats_cache_hit(size);
+            return Ok(block.ptr);
+        }
+
+        // Allocate new block
+        let ptr = self.allocator.allocate(size)?;
+        let block = MemoryBlock {
+            ptr,
+            size,
+            allocated_time: Instant::now(),
+            last_accessed: Instant::now(),
+            ref_count: 1,
+            is_cached: false,
+            device_id: self.device_id,
+            precision: PrecisionMode::Float32,
+            memory_format: MemoryFormat::Contiguous,
+            is_gradient: false,
+            is_activation: false,
+            checkpoint_eligible: false,
+            attention_block: false,
+        };
+
+        {
+            let mut allocated = self.allocated_blocks.write().unwrap();
+            allocated.insert(ptr, block);
+        }
+
+        self.update_stats_allocation(size);
+        
+        // Check if we need garbage collection
+        self.maybe_garbage_collect()?;
+        
+        Ok(ptr)
+    }
+
+    pub fn allocate_for_attention(&self, seq_len: usize, batch_size: usize, head_dim: usize) -> Result<*mut c_void> {
+        let key = (seq_len, batch_size);
+        
+        // Check attention cache first
+        {
+            let cache = self.attention_cache.read().unwrap();
+            if let Some(&ptr) = cache.get(&key) {
+                self.update_stats_cache_hit(seq_len * batch_size * head_dim * 2);
+                return Ok(ptr);
+            }
+        }
+        
+        // Allocate optimized memory for attention
+        let size = seq_len * batch_size * head_dim * 2; // FP16 for memory efficiency
+        let ptr = self.allocator.allocate(size)?;
+        
+        let block = MemoryBlock {
+            ptr,
+            size,
+            allocated_time: Instant::now(),
+            last_accessed: Instant::now(),
+            ref_count: 1,
+            is_cached: false,
+            device_id: self.device_id,
+            precision: PrecisionMode::Float16,
+            memory_format: MemoryFormat::ChannelsLast,
+            is_gradient: false,
+            is_activation: true,
+            checkpoint_eligible: false,
+            attention_block: true,
+        };
+
+        {
+            let mut allocated = self.allocated_blocks.write().unwrap();
+            allocated.insert(ptr, block);
+        }
+
+        self.update_stats_allocation(size);
+        
+        // Cache for future use if it's a common size
+        if seq_len <= 4096 {
+            let mut cache = self.attention_cache.write().unwrap();
+            cache.insert(key, ptr);
+        }
+        
+        Ok(ptr)
+    }
+
+    pub fn allocate_gradient(&self, size: usize, precision: PrecisionMode) -> Result<*mut c_void> {
+        // Use half precision for gradients to save memory
+        let actual_size = match precision {
+            PrecisionMode::Float16 | PrecisionMode::BFloat16 => size / 2,
+            PrecisionMode::Mixed => size / 2,
+            _ => size,
+        };
+        
+        let ptr = self.allocator.allocate(actual_size)?;
+        
+        let block = MemoryBlock {
+            ptr,
+            size: actual_size,
+            allocated_time: Instant::now(),
+            last_accessed: Instant::now(),
+            ref_count: 1,
+            is_cached: false,
+            device_id: self.device_id,
+            precision,
+            memory_format: MemoryFormat::Contiguous,
+            is_gradient: true,
+            is_activation: false,
+            checkpoint_eligible: true,
+            attention_block: false,
+        };
+
+        {
+            let mut gradients = self.gradient_blocks.write().unwrap();
+            gradients.insert(ptr, block.clone());
+        }
+
+        self.update_stats_allocation(actual_size);
+        Ok(ptr)
+    }
+
+    pub fn allocate_activation(&self, size: usize, can_checkpoint: bool) -> Result<*mut c_void> {
+        if can_checkpoint && self.config.gradient_checkpointing {
+            return self.allocate_checkpointed_activation(size);
+        }
+
+        let ptr = self.allocator.allocate(size)?;
+        
+        let block = MemoryBlock {
+            ptr,
+            size,
+            allocated_time: Instant::now(),
+            last_accessed: Instant::now(),
+            ref_count: 1,
+            is_cached: false,
+            device_id: self.device_id,
+            precision: PrecisionMode::Float16,
+            memory_format: self.config.memory_format,
+            is_gradient: false,
+            is_activation: true,
+            checkpoint_eligible: can_checkpoint,
+            attention_block: false,
+        };
+
+        {
+            let mut activations = self.activation_blocks.write().unwrap();
+            activations.insert(ptr, block.clone());
+        }
+
+        self.update_stats_allocation(size);
+        Ok(ptr)
+    }
+
+    fn allocate_checkpointed_activation(&self, size: usize) -> Result<*mut c_void> {
+        // Allocate on CPU for checkpointing
+        let cpu_ptr = unsafe {
+            libc::malloc(size)
+        };
+        
+        if cpu_ptr.is_null() {
+            return Err(MemoryError::AllocationFailed(size));
+        }
+
+        let block = MemoryBlock {
+            ptr: cpu_ptr,
+            size,
+            allocated_time: Instant::now(),
+            last_accessed: Instant::now(),
+            ref_count: 1,
+            is_cached: false,
+            device_id: -1, // CPU
+            precision: PrecisionMode::Float16,
+            memory_format: MemoryFormat::Contiguous,
+            is_gradient: false,
+            is_activation: true,
+            checkpoint_eligible: true,
+            attention_block: false,
+        };
+
+        {
+            let mut checkpoints = self.checkpoint_blocks.write().unwrap();
+            checkpoints.push(block);
+        }
+
+        Ok(cpu_ptr)
+    }
+
+    pub fn offload_to_cpu(&self, gpu_ptr: *mut c_void) -> Result<*mut c_void> {
+        let block = {
+            let allocated = self.allocated_blocks.read().unwrap();
+            allocated.get(&gpu_ptr).cloned()
+        };
+
+        if let Some(block) = block {
+            // Allocate CPU memory
+            let cpu_ptr = unsafe { libc::malloc(block.size) };
+            if cpu_ptr.is_null() {
+                return Err(MemoryError::AllocationFailed(block.size));
+            }
+
+            // Copy from GPU to CPU
+            unsafe {
+                let result = cuda_sys::cudaMemcpy(
+                    cpu_ptr,
+                    gpu_ptr,
+                    block.size,
+                    cuda_sys::cudaMemcpyDeviceToHost
+                );
+                if result != 0 {
+                    libc::free(cpu_ptr);
+                    return Err(MemoryError::CudaError("Failed to copy to CPU".to_string()));
+                }
+            }
+
+            // Free GPU memory
+            self.deallocate(gpu_ptr)?;
+            
+            Ok(cpu_ptr)
+        } else {
+            Err(MemoryError::MemoryNotFound)
+        }
+    }
+
+    pub fn restore_from_cpu(&self, cpu_ptr: *mut c_void, size: usize) -> Result<*mut c_void> {
+        // Allocate GPU memory
+        let gpu_ptr = self.allocator.allocate(size)?;
+
+        // Copy from CPU to GPU
+        unsafe {
+            let result = cuda_sys::cudaMemcpy(
+                gpu_ptr,
+                cpu_ptr,
+                size,
+                cuda_sys::cudaMemcpyHostToDevice
+            );
+            if result != 0 {
+                self.allocator.deallocate(gpu_ptr)?;
+                return Err(MemoryError::CudaError("Failed to copy from CPU".to_string()));
+            }
+        }
+
+        // Free CPU memory
+        unsafe {
+            libc::free(cpu_ptr);
+        }
+
+        let block = MemoryBlock {
+            ptr: gpu_ptr,
+            size,
+            allocated_time: Instant::now(),
+            last_accessed: Instant::now(),
+            ref_count: 1,
+            is_cached: false,
+            device_id: self.device_id,
+            precision: PrecisionMode::Float16,
+            memory_format: MemoryFormat::Contiguous,
+            is_gradient: false,
+            is_activation: true,
+            checkpoint_eligible: true,
+            attention_block: false,
+        };
+
+        {
+            let mut allocated = self.allocated_blocks.write().unwrap();
+            allocated.insert(gpu_ptr, block);
+        }
+
+        Ok(gpu_ptr)
+    }
+
+    pub fn deallocate(&self, ptr: *mut c_void) -> Result<()> {
+        // Check if it's a gradient block
+        {
+            let mut gradients = self.gradient_blocks.write().unwrap();
+            if let Some(block) = gradients.remove(&ptr) {
+                self.update_stats_deallocation(block.size);
+                return self.allocator.deallocate(ptr);
+            }
+        }
+
+        // Check if it's an activation block  
+        {
+            let mut activations = self.activation_blocks.write().unwrap();
+            if let Some(block) = activations.remove(&ptr) {
+                if block.checkpoint_eligible && self.should_checkpoint_block(&block) {
+                    return self.move_to_checkpoint(ptr, block);
+                }
+            }
+        }
+
+        // Regular deallocation
+        self.deallocate_regular(ptr)
+    }
+
+    fn deallocate_regular(&self, ptr: *mut c_void) -> Result<()> {
+        let block = {
+            let mut allocated = self.allocated_blocks.write().unwrap();
+            allocated.remove(&ptr)
+        };
+
+        if let Some(mut block) = block {
+            block.ref_count -= 1;
+            
+            if block.ref_count == 0 {
+                // Move to cache instead of immediate deallocation
+                block.is_cached = true;
+                block.last_accessed = Instant::now();
+                
+                {
+                    let mut cached = self.cached_blocks.write().unwrap();
+                    cached.push(block.clone());
+                }
+                
+                self.update_stats_deallocation(block.size);
+            }
+        }
+        
+        Ok(())
+    }
+
+    fn move_to_checkpoint(&self, _ptr: *mut c_void, mut block: MemoryBlock) -> Result<()> {
+        // Move block to checkpoint storage
+        block.is_cached = true;
+        block.last_accessed = Instant::now();
+        
+        {
+            let mut checkpoints = self.checkpoint_blocks.write().unwrap();
+            checkpoints.push(block.clone());
+        }
+        
+        self.update_stats_deallocation(block.size);
+        Ok(())
+    }
+
+    pub fn allocate_flux(&self, size: usize) -> Result<*mut c_void> {
+        self.allocate_with_format(size, MemoryFormat::ChannelsLast, PrecisionMode::Mixed)
+    }
+
+    pub fn free_with_checkpoint(&self, ptr: *mut c_void) -> Result<()> {
+        let block = {
+            let allocated = self.allocated_blocks.read().unwrap();
+            allocated.get(&ptr).cloned()
+        };
+
+        if let Some(block) = block {
+            if block.checkpoint_eligible && self.should_checkpoint_block(&block) {
+                self.offload_to_cpu(ptr)?;
+            } else {
+                self.deallocate(ptr)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn should_checkpoint_block(&self, block: &MemoryBlock) -> bool {
+        if let Some(ref config) = self.diffusion_config {
+            if !config.enable_gradient_checkpointing {
+                return false;
+            }
+            
+            let pressure = self.get_memory_pressure();
+            block.is_activation && pressure > 0.7
+        } else {
+            false
+        }
+    }
+
+    pub fn get_recommended_batch_size(&self, per_sample_memory: usize) -> usize {
+        let (free, _total) = self.allocator.get_memory_info().unwrap_or((0, 1));
+        let available = (free as f64 * 0.8) as usize;
+        
+        let recommended = available / per_sample_memory;
+        std::cmp::max(1, recommended)
+    }
+
+    pub fn allocate_with_format(&self, size: usize, memory_format: MemoryFormat, precision: PrecisionMode) -> Result<*mut c_void> {
+        let actual_size = match precision {
+            PrecisionMode::Float16 | PrecisionMode::BFloat16 => size / 2,
+            PrecisionMode::Mixed => size / 2,
+            _ => size,
+        };
+
+        if let Some(block) = self.find_cached_block_with_format(actual_size, memory_format, precision) {
+            self.update_stats_cache_hit(actual_size);
+            return Ok(block.ptr);
+        }
+
+        let ptr = self.allocator.allocate(actual_size)?;
+
+        let block = MemoryBlock {
+            ptr,
+            size: actual_size,
+            allocated_time: Instant::now(),
+            last_accessed: Instant::now(),
+            ref_count: 1,
+            is_cached: false,
+            device_id: self.device_id,
+            precision,
+            memory_format,
+            is_gradient: false,
+            is_activation: false,
+            checkpoint_eligible: false,
+            attention_block: false,
+        };
+
+        {
+            let mut allocated = self.allocated_blocks.write().unwrap();
+            allocated.insert(ptr, block);
+        }
+
+        self.update_stats_allocation(actual_size);
+        Ok(ptr)
+    }
+
+    fn find_cached_block_with_format(&self, size: usize, memory_format: MemoryFormat, precision: PrecisionMode) -> Option<MemoryBlock> {
+        let mut cached = self.cached_blocks.write().unwrap();
+        
+        for (idx, block) in cached.iter().enumerate() {
+            if block.size >= size && 
+               std::mem::discriminant(&block.memory_format) == std::mem::discriminant(&memory_format) &&
+               std::mem::discriminant(&block.precision) == std::mem::discriminant(&precision) {
+                let mut block = cached.swap_remove(idx);
+                block.last_accessed = Instant::now();
+                block.is_cached = false;
+                
+                {
+                    let mut allocated = self.allocated_blocks.write().unwrap();
+                    allocated.insert(block.ptr, block.clone());
+                }
+                
+                return Some(block);
+            }
+        }
+        
+        None
+    }
+
+    pub fn allocate_flux_tensor(&self, height: usize, width: usize, channels: usize, dtype: PrecisionMode) -> Result<*mut c_void> {
+        let element_size = match dtype {
+            PrecisionMode::Float32 => 4,
+            PrecisionMode::Float16 | PrecisionMode::BFloat16 => 2,
+            PrecisionMode::Mixed => 2,
+            PrecisionMode::Dynamic => 2,
+        };
+        
+        let size = height * width * channels * element_size;
+        self.allocate_with_format(size, MemoryFormat::ChannelsLast, dtype)
+    }
+
+    pub fn allocate_flux_attention(&self, batch_size: usize, seq_len: usize, num_heads: usize, head_dim: usize) -> Result<(*mut c_void, *mut c_void, *mut c_void)> {
+        let q_ptr = self.allocate_for_attention(seq_len, batch_size, num_heads * head_dim)?;
+        let k_ptr = self.allocate_for_attention(seq_len, batch_size, num_heads * head_dim)?;
+        let v_ptr = self.allocate_for_attention(seq_len, batch_size, num_heads * head_dim)?;
+        
+        Ok((q_ptr, k_ptr, v_ptr))
+    }
+
+    pub fn create_attention_mask(&self, seq_len: usize, batch_size: usize) -> Result<*mut c_void> {
+        let size = seq_len * seq_len * batch_size;
+        let ptr = self.allocator.allocate(size)?;
+        
+        unsafe {
+            let result = cuda_sys::cudaMemset(ptr, 0, size);
+            if result != 0 {
+                self.allocator.deallocate(ptr)?;
+                return Err(MemoryError::CudaError("Failed to initialize attention mask".to_string()));
+            }
+        }
+        
+        Ok(ptr)
+    }
+
+    pub fn allocate_mmdit_block(&self, resolution: (usize, usize), batch_size: usize, config: &DiffusionConfig) -> Result<MMDiTMemoryBlock> {
+        let (height, width) = resolution;
+        let patch_size = config.patch_size;
+        
+        // Ensure resolution is divisible by patch size
+        if height % patch_size != 0 || width % patch_size != 0 {
+            return Err(MemoryError::PoolError(format!(
+                "Resolution {}x{} not divisible by patch size {}", 
+                height, width, patch_size
+            )));
+        }
+        
+        let seq_len = (height / patch_size) * (width / patch_size);
+        let head_dim = config.hidden_dim / config.num_attention_heads;
+        
+        // Allocate patch embeddings
+        let patch_embed_size = batch_size * seq_len * config.hidden_dim * 2; // FP16
+        let patch_embed_ptr = self.allocate_with_format(
+            patch_embed_size,
+            MemoryFormat::ChannelsLast,
+            PrecisionMode::Float16
+        )?;
+        
+        // Allocate position embeddings (learnable in SD3.5)
+        let pos_embed_ptr = self.allocate_with_format(
+            seq_len * config.hidden_dim * 2,
+            MemoryFormat::Contiguous,
+            PrecisionMode::Float16
+        )?;
+        
+        // Allocate for multi-modal attention (text + image)
+        let text_seq_len = 77; // CLIP text encoder sequence length
+        let (q_ptr, k_ptr, v_ptr) = self.allocate_mmdit_attention(
+            batch_size,
+            seq_len,
+            text_seq_len,
+            config.num_attention_heads,
+            head_dim
+        )?;
+        
+        // Allocate AdaLN modulation parameters (for conditioning)
+        let adaln_size = batch_size * config.num_layers * config.hidden_dim * 6 * 2; // 6 params per layer, FP16
+        let adaln_ptr = self.allocate_with_format(
+            adaln_size,
+            MemoryFormat::Contiguous,
+            PrecisionMode::Float16
+        )?;
+        
+        Ok(MMDiTMemoryBlock {
+            patch_embed_ptr,
+            pos_embed_ptr,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            adaln_ptr,
+            resolution,
+            seq_len,
+            batch_size,
+        })
+    }
+
+    pub fn allocate_mmdit_attention(&self, batch_size: usize, image_seq_len: usize, text_seq_len: usize, num_heads: usize, head_dim: usize) -> Result<(*mut c_void, *mut c_void, *mut c_void)> {
+        let total_seq_len = image_seq_len + text_seq_len;
+        let element_size = 2; // FP16
+        
+        // Allocate Q (only for image tokens in SD3.5)
+        let q_size = batch_size * image_seq_len * num_heads * head_dim * element_size;
+        let q_ptr = self.allocate_for_attention(image_seq_len, batch_size, num_heads * head_dim)?;
+        
+        // Allocate K, V (for both image and text tokens)
+        let kv_size = batch_size * total_seq_len * num_heads * head_dim * element_size;
+        let k_ptr = self.allocate_with_format(kv_size, MemoryFormat::Contiguous, PrecisionMode::Float16)?;
+        let v_ptr = self.allocate_with_format(kv_size, MemoryFormat::Contiguous, PrecisionMode::Float16)?;
+        
+        Ok((q_ptr, k_ptr, v_ptr))
+    }
+
+    pub fn optimize_for_sd35(&mut self) -> Result<()> {
+        // SD3.5 specific optimizations
+        let sd35_config = DiffusionConfig {
+            precision_mode: PrecisionMode::Mixed,
+            attention_strategy: AttentionStrategy::MMDiTOptimized,
+            enable_gradient_checkpointing: true,
+            checkpoint_ratio: 0.4, // More aggressive for larger model
+            enable_cpu_offload: true,
+            enable_model_parallel: false,
+            enable_activation_offload: true,
+            max_sequence_length: 4096, // Max for 1024x1024 with patch size 16
+            batch_size: 1,
+            enable_flash_attention: true,
+            enable_xformers: true,
+            enable_sdp_attention: true,
+            memory_efficient_attention: true,
+            model_type: ModelType::SD35Large,
+            num_attention_heads: 38, // SD3.5 Large
+            hidden_dim: 1536, // SD3.5 Large
+            num_layers: 38, // SD3.5 Large
+            patch_size: 16,
+        };
+
+        self.configure_for_diffusion(sd35_config)?;
+        
+        // Pre-allocate common SD3.5 tensor sizes
+        self.prewarm_sd35_cache()?;
+        
+        Ok(())
+    }
+
+    fn prewarm_sd35_cache(&self) -> Result<()> {
+        // Common SD3.5 tensor sizes for different resolutions
+        let resolutions = [
+            (512, 512),    // Low res
+            (768, 768),    // Medium res
+            (1024, 1024),  // Standard res
+            (1536, 1536),  // High res
+        ];
+
+        let config = self.diffusion_config.as_ref().ok_or_else(|| 
+            MemoryError::PoolError("No diffusion config set".to_string())
+        )?;
+        
+        for resolution in resolutions {
+            // Skip resolutions that aren't divisible by patch size
+            if resolution.0 % config.patch_size != 0 || resolution.1 % config.patch_size != 0 {
+                continue;
+            }
+            
+            // Pre-allocate MMDiT blocks
+            match self.allocate_mmdit_block(resolution, 1, config) {
+                Ok(block) => {
+                    // Cache the allocations
+                    let mut cached = self.cached_blocks.write().unwrap();
+                    
+                    // Calculate correct sizes for each component
+                    let seq_len = (resolution.0 / config.patch_size) * (resolution.1 / config.patch_size);
+                    let text_seq_len = 77;
+                    let total_seq_len = seq_len + text_seq_len;
+                    
+                    // Convert MMDiT block pointers to cached memory blocks
+                    let ptrs = vec![
+                        (block.patch_embed_ptr, block.batch_size * seq_len * config.hidden_dim * 2),
+                        (block.pos_embed_ptr, seq_len * config.hidden_dim * 2),
+                        (block.q_ptr, block.batch_size * seq_len * config.hidden_dim * 2),
+                        (block.k_ptr, block.batch_size * total_seq_len * config.hidden_dim * 2),
+                        (block.v_ptr, block.batch_size * total_seq_len * config.hidden_dim * 2),
+                        (block.adaln_ptr, block.batch_size * config.num_layers * config.hidden_dim * 6 * 2),
+                    ];
+                    
+                    for (ptr, size) in ptrs {
+                        let mem_block = MemoryBlock {
+                            ptr,
+                            size,
+                            allocated_time: Instant::now(),
+                            last_accessed: Instant::now(),
+                            ref_count: 0,
+                            is_cached: true,
+                            device_id: self.device_id,
+                            precision: PrecisionMode::Float16,
+                            memory_format: MemoryFormat::ChannelsLast,
+                            is_gradient: false,
+                            is_activation: true,
+                            checkpoint_eligible: true,
+                            attention_block: false,
+                        };
+                        cached.push(mem_block);
+                    }
+                }
+                Err(_) => break, // Stop if we run out of memory
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn get_optimal_dtype_for_layer(&self, layer_type: &str) -> PrecisionMode {
+        if let Some(ref config) = self.diffusion_config {
+            match layer_type {
+                "attention" => {
+                    if config.memory_efficient_attention {
+                        PrecisionMode::Float16
+                    } else {
+                        PrecisionMode::Float32
+                    }
+                }
+                "layernorm" | "groupnorm" | "rmsnorm" => PrecisionMode::Float32,
+                "adaln" | "adaln_zero" => {
+                    // AdaLN layers in SD3.5 can use FP16
+                    match config.model_type {
+                        ModelType::SD35Large | ModelType::SD35Turbo => PrecisionMode::Float16,
+                        _ => PrecisionMode::Float32,
+                    }
+                }
+                "temporal_attention" => {
+                    // Temporal attention in video models
+                    match config.model_type {
+                        ModelType::WAN21Video | ModelType::WAN21VideoLarge => PrecisionMode::Float16,
+                        _ => PrecisionMode::Float32,
+                    }
+                }
+                "conv3d" => {
+                    // 3D convolutions for video
+                    match config.model_type {
+                        ModelType::WAN21Video | ModelType::WAN21VideoLarge => {
+                            if config.memory_efficient_attention {
+                                PrecisionMode::Float16
+                            } else {
+                                PrecisionMode::Float32
+                            }
+                        }
+                        _ => PrecisionMode::Float32,
+                    }
+                }
+                "motion_vector" => PrecisionMode::Float32, // Always FP32 for accuracy
+                "patch_embed" => PrecisionMode::Float16,
+                "linear" | "conv" => {
+                    match config.precision_mode {
+                        PrecisionMode::Mixed => PrecisionMode::Float16,
+                        other => other,
+                    }
+                }
+                _ => config.precision_mode,
+            }
+        } else {
+            PrecisionMode::Float32
+        }
+    }
+
+    pub fn allocate_quantized(&self, size: usize, quantization: QuantizationMode) -> Result<*mut c_void> {
+        // Calculate actual size based on quantization
+        let actual_size = match quantization {
+            QuantizationMode::None => size,
+            _ => {
+                let elements = size / 4; // Assuming original is FP32
+                let bytes_per_element = quantization.bytes_per_element();
+                ((elements as f32 * bytes_per_element).ceil() as usize)
+            }
+        };
+        
+        // Ensure proper alignment
+        let alignment = quantization.alignment_requirement();
+        let aligned_size = ((actual_size + alignment - 1) / alignment) * alignment;
+        
+        // Allocate with appropriate precision tracking
+        let precision = match quantization {
+            QuantizationMode::INT8 | QuantizationMode::INT4 => PrecisionMode::Dynamic,
+            QuantizationMode::FP8_E4M3 | QuantizationMode::FP8_E5M2 => PrecisionMode::Float16,
+            _ => PrecisionMode::Dynamic,
+        };
+        
+        self.allocate_with_format(aligned_size, MemoryFormat::Contiguous, precision)
+    }
+    
+    pub fn get_quantized_model_config(&self, model_type: ModelType, quantization: QuantizationMode) -> DiffusionConfig {
+        let base_config = match model_type {
+            ModelType::FluxDev => DiffusionConfig {
+                precision_mode: PrecisionMode::Mixed,
+                attention_strategy: AttentionStrategy::FlashAttention2,
+                enable_gradient_checkpointing: true,
+                checkpoint_ratio: 0.3,
+                enable_cpu_offload: true,
+                enable_model_parallel: false,
+                enable_activation_offload: true,
+                max_sequence_length: 8192,
+                batch_size: 1,
+                enable_flash_attention: true,
+                enable_xformers: true,
+                enable_sdp_attention: true,
+                memory_efficient_attention: true,
+                model_type: ModelType::FluxDev,
+                num_attention_heads: 16,
+                hidden_dim: 4096,
+                num_layers: 48,
+                patch_size: 16,
+                temporal_compression: 1,
+                num_frames: 1,
+                frame_size: (1024, 1024),
+                enable_temporal_attention: false,
+                enable_3d_conv: false,
+                video_chunk_size: 1,
+            },
+            ModelType::SD35Large => DiffusionConfig {
+                precision_mode: PrecisionMode::Mixed,
+                attention_strategy: AttentionStrategy::MMDiTOptimized,
+                enable_gradient_checkpointing: true,
+                checkpoint_ratio: 0.4,
+                enable_cpu_offload: true,
+                enable_model_parallel: false,
+                enable_activation_offload: true,
+                max_sequence_length: 4096,
+                batch_size: 1,
+                enable_flash_attention: true,
+                enable_xformers: true,
+                enable_sdp_attention: true,
+                memory_efficient_attention: true,
+                model_type: ModelType::SD35Large,
+                num_attention_heads: 38,
+                hidden_dim: 1536,
+                num_layers: 38,
+                patch_size: 16,
+                temporal_compression: 1,
+                num_frames: 1,
+                frame_size: (1024, 1024),
+                enable_temporal_attention: false,
+                enable_3d_conv: false,
+                video_chunk_size: 1,
+            },
+            _ => self.diffusion_config.clone().unwrap_or(DiffusionConfig {
+                precision_mode: PrecisionMode::Float32,
+                attention_strategy: AttentionStrategy::Standard,
+                enable_gradient_checkpointing: false,
+                checkpoint_ratio: 0.0,
+                enable_cpu_offload: false,
+                enable_model_parallel: false,
+                enable_activation_offload: false,
+                max_sequence_length: 2048,
+                batch_size: 1,
+                enable_flash_attention: false,
+                enable_xformers: false,
+                enable_sdp_attention: false,
+                memory_efficient_attention: false,
+                model_type,
+                num_attention_heads: 16,
+                hidden_dim: 1024,
+                num_layers: 24,
+                patch_size: 16,
+                temporal_compression: 1,
+                num_frames: 1,
+                frame_size: (512, 512),
+                enable_temporal_attention: false,
+                enable_3d_conv: false,
+                video_chunk_size: 1,
+            }),
+        };
+        
+        // Adjust for quantization
+        let mut config = base_config;
+        match quantization {
+            QuantizationMode::INT8 => {
+                config.checkpoint_ratio = 0.5; // More checkpointing for INT8
+                config.enable_cpu_offload = true;
+            }
+            QuantizationMode::INT4 | QuantizationMode::NF4 => {
+                config.checkpoint_ratio = 0.7; // Even more aggressive
+                config.batch_size = config.batch_size * 2; // Can handle larger batches
+            }
+            QuantizationMode::FP8_E4M3 | QuantizationMode::FP8_E5M2 => {
+                config.precision_mode = PrecisionMode::Float16;
+                config.memory_efficient_attention = true;
+            }
+            _ => {}
+        }
+        
+        config
+    }
+
+    pub fn clear_gradients(&self) -> Result<()> {
+        let gradient_blocks = {
+            let mut gradients = self.gradient_blocks.write().unwrap();
+            let blocks: Vec<_> = gradients.drain().collect();
+            blocks
+        };
+
+        for (ptr, _block) in gradient_blocks {
+            self.allocator.deallocate(ptr)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn get_memory_pressure(&self) -> f64 {
+        let (free, total) = self.allocator.get_memory_info().unwrap_or((1, 1));
+        let used = total - free;
+        used as f64 / total as f64
+    }
+
+    pub fn should_checkpoint_activation(&self, layer_idx: usize, total_layers: usize) -> bool {
+        if let Some(ref config) = self.diffusion_config {
+            if !config.enable_gradient_checkpointing {
+                return false;
+            }
+            
+            let memory_pressure = self.get_memory_pressure();
+            let layer_ratio = layer_idx as f32 / total_layers as f32;
+            
+            let base_threshold = config.checkpoint_ratio;
+            let pressure_adjusted_threshold = base_threshold + (memory_pressure as f32 * 0.3);
+            
+            layer_ratio < pressure_adjusted_threshold || memory_pressure > 0.8
+        } else {
+            false
+        }
+    }
+
+    fn find_cached_block(&self, size: usize) -> Option<MemoryBlock> {
+        let mut cached = self.cached_blocks.write().unwrap();
+        
+        let mut best_idx = None;
+        let mut best_size = usize::MAX;
+        
+        for (idx, block) in cached.iter().enumerate() {
+            if block.size >= size && block.size < best_size {
+                best_idx = Some(idx);
+                best_size = block.size;
+            }
+        }
+        
+        if let Some(idx) = best_idx {
+            let mut block = cached.swap_remove(idx);
+            block.last_accessed = Instant::now();
+            block.is_cached = false;
+            
+            {
+                let mut allocated = self.allocated_blocks.write().unwrap();
+                allocated.insert(block.ptr, block.clone());
+            }
+            
+            Some(block)
+        } else {
+            None
+        }
+    }
+
+    fn update_stats_allocation(&self, size: usize) {
+        let mut stats = self.stats.write().unwrap();
+        stats.allocated_bytes += size;
+        stats.allocation_count += 1;
+        stats.peak_allocated = stats.peak_allocated.max(stats.allocated_bytes);
+        stats.cache_miss_count += 1;
+    }
+
+    fn update_stats_cache_hit(&self, size: usize) {
+        let mut stats = self.stats.write().unwrap();
+        stats.cache_hit_count += 1;
+        stats.cached_bytes = stats.cached_bytes.saturating_sub(size);
+        stats.allocated_bytes += size;
+    }
+
+    fn update_stats_deallocation(&self, size: usize) {
+        let mut stats = self.stats.write().unwrap();
+        stats.allocated_bytes = stats.allocated_bytes.saturating_sub(size);
+        stats.cached_bytes += size;
+        stats.deallocation_count += 1;
+    }
+
+    fn maybe_garbage_collect(&self) -> Result<()> {
+        let (allocated, threshold) = {
+            let stats = self.stats.read().unwrap();
+            (stats.allocated_bytes + stats.cached_bytes, 
+             (self.config.max_size as f64 * self.config.garbage_collection_threshold) as usize)
+        };
+
+        if allocated > threshold {
+            self.garbage_collect()?;
+        }
+        
+        Ok(())
+    }
+
+    pub fn garbage_collect(&self) -> Result<()> {
+        let mut cached = self.cached_blocks.write().unwrap();
+        let mut to_remove = Vec::new();
+        
+        cached.sort_by_key(|block| block.last_accessed);
+        
+        let target_size = (self.config.max_size as f64 * self.config.garbage_collection_threshold * 0.8) as usize;
+        let mut current_size = {
+            let stats = self.stats.read().unwrap();
+            stats.allocated_bytes + stats.cached_bytes
+        };
+        
+        for (idx, block) in cached.iter().enumerate() {
+            if current_size <= target_size {
+                break;
+            }
+            
+            to_remove.push(idx);
+            current_size -= block.size;
+        }
+        
+        for &idx in to_remove.iter().rev() {
+            let block = cached.swap_remove(idx);
+            self.allocator.deallocate(block.ptr)?;
+            
+            let mut stats = self.stats.write().unwrap();
+            stats.cached_bytes -= block.size;
+        }
+        
+        log::info!("Garbage collected {} blocks", to_remove.len());
+        
+        Ok(())
+    }
+
+    pub fn empty_cache(&self) -> Result<()> {
+        let mut cached = self.cached_blocks.write().unwrap();
+        let mut total_freed = 0;
+        
+        for block in cached.drain(..) {
+            self.allocator.deallocate(block.ptr)?;
+            total_freed += block.size;
+        }
+        
+        {
+            let mut stats = self.stats.write().unwrap();
+            stats.cached_bytes = 0;
+        }
+        
+        log::info!("Emptied cache, freed {} bytes", total_freed);
+        Ok(())
+    }
+
+    pub fn get_stats(&self) -> MemoryStats {
+        let mut stats = self.stats.read().unwrap().clone();
+        
+        let (free, total) = self.allocator.get_memory_info().unwrap_or((0, 1));
+        stats.fragmentation_ratio = 1.0 - (free as f64 / total as f64);
+        
+        stats
+    }
+}
+
+/// Global GPU memory manager
+pub struct GpuMemoryManager {
+    pools: RwLock<HashMap<i32, Arc<Mutex<MemoryPool>>>>,
+    current_device: Mutex<i32>,
+}
+
+impl GpuMemoryManager {
+    pub fn new() -> Self {
+        Self {
+            pools: RwLock::new(HashMap::new()),
+            current_device: Mutex::new(0),
+        }
+    }
+
+    pub fn set_device(&self, device_id: i32) -> Result<()> {
+        let mut device_count = 0;
+        unsafe {
+            let result = cuda_sys::cudaGetDeviceCount(&mut device_count);
+            if result != 0 || device_id >= device_count {
+                return Err(MemoryError::InvalidDevice(device_id));
+            }
+        }
+        
+        *self.current_device.lock().unwrap() = device_id;
+        Ok(())
+    }
+
+    pub fn current_device(&self) -> i32 {
+        *self.current_device.lock().unwrap()
+    }
+
+    pub fn get_or_create_pool(&self, device_id: i32, config: Option<MemoryPoolConfig>) -> Result<Arc<Mutex<MemoryPool>>> {
+        let pools = self.pools.read().unwrap();
+        
+        if let Some(pool) = pools.get(&device_id) {
+            return Ok(pool.clone());
+        }
+        
+        drop(pools);
+        
+        let config = config.unwrap_or_default();
+        let pool = Arc::new(Mutex::new(MemoryPool::new(device_id, config)?));
+        
+        {
+            let mut pools = self.pools.write().unwrap();
+            pools.insert(device_id, pool.clone());
+        }
+        
+        Ok(pool)
+    }
+
+    pub fn allocate(&self, size: usize) -> Result<*mut c_void> {
+        let device_id = self.current_device();
+        let pool = self.get_or_create_pool(device_id, None)?;
+        pool.lock().unwrap().allocate(size)
+    }
+
+    pub fn deallocate(&self, ptr: *mut c_void) -> Result<()> {
+        let device_id = self.current_device();
+        let pool = self.get_or_create_pool(device_id, None)?;
+        pool.lock().unwrap().deallocate(ptr)
+    }
+
+    pub fn empty_cache(&self) -> Result<()> {
+        let device_id = self.current_device();
+        let pool = self.get_or_create_pool(device_id, None)?;
+        pool.lock().unwrap().empty_cache()
+    }
+
+    pub fn empty_cache_all_devices(&self) -> Result<()> {
+        let pools = self.pools.read().unwrap();
+        
+        for pool in pools.values() {
+            pool.lock().unwrap().empty_cache()?;
+        }
+        
+        Ok(())
+    }
+
+    pub fn memory_allocated(&self, device_id: Option<i32>) -> Result<usize> {
+        let device = device_id.unwrap_or_else(|| self.current_device());
+        let pool = self.get_or_create_pool(device, None)?;
+        Ok(pool.lock().unwrap().get_stats().allocated_bytes)
+    }
+
+    pub fn memory_reserved(&self, device_id: Option<i32>) -> Result<usize> {
+        let device = device_id.unwrap_or_else(|| self.current_device());
+        let pool = self.get_or_create_pool(device, None)?;
+        Ok(pool.lock().unwrap().get_stats().reserved_bytes)
+    }
+
+    pub fn memory_cached(&self, device_id: Option<i32>) -> Result<usize> {
+        let device = device_id.unwrap_or_else(|| self.current_device());
+        let pool = self.get_or_create_pool(device, None)?;
+        Ok(pool.lock().unwrap().get_stats().cached_bytes)
+    }
+
+    pub fn max_memory_allocated(&self, device_id: Option<i32>) -> Result<usize> {
+        let device = device_id.unwrap_or_else(|| self.current_device());
+        let pool = self.get_or_create_pool(device, None)?;
+        Ok(pool.lock().unwrap().get_stats().peak_allocated)
+    }
+
+    pub fn get_device_properties(&self, device_id: i32) -> Result<(usize, usize)> {
+        let allocator = CudaAllocator::new(device_id)?;
+        allocator.get_memory_info()
+    }
+
+    pub fn reset_peak_memory_stats(&self, device_id: Option<i32>) -> Result<()> {
+        let device = device_id.unwrap_or_else(|| self.current_device());
+        let pool = self.get_or_create_pool(device, None)?;
+        
+        let mut pool_guard = pool.lock().unwrap();
+        {
+            let mut stats = pool_guard.stats.write().unwrap();
+            stats.peak_allocated = stats.allocated_bytes;
+            stats.peak_reserved = stats.reserved_bytes;
+        }
+        
+        Ok(())
+    }
+
+    pub fn synchronize(&self) -> Result<()> {
+        unsafe {
+            let result = cuda_sys::cudaDeviceSynchronize();
+            if result != 0 {
+                return Err(MemoryError::CudaError("Device synchronization failed".to_string()));
+            }
+        }
+        Ok(())
+    }
+}
+
+// Global instance
+use once_cell::sync::Lazy;
+
+static GLOBAL_MEMORY_MANAGER: Lazy<GpuMemoryManager> = Lazy::new(|| {
+    GpuMemoryManager::new()
+});
+
+/// Public API functions
+pub mod cuda {
+    use super::*;
+
+    pub fn current_device() -> i32 {
+        GLOBAL_MEMORY_MANAGER.current_device()
+    }
+
+    pub fn set_device(device: i32) -> Result<()> {
+        GLOBAL_MEMORY_MANAGER.set_device(device)
+    }
+
+    pub fn empty_cache() -> Result<()> {
+        GLOBAL_MEMORY_MANAGER.empty_cache()
+    }
+
+    pub fn memory_allocated(device: Option<i32>) -> Result<usize> {
+        GLOBAL_MEMORY_MANAGER.memory_allocated(device)
+    }
+
+    pub fn memory_reserved(device: Option<i32>) -> Result<usize> {
+        GLOBAL_MEMORY_MANAGER.memory_reserved(device)
+    }
+
+    pub fn memory_cached(device: Option<i32>) -> Result<usize> {
+        GLOBAL_MEMORY_MANAGER.memory_cached(device)
+    }
+
+    pub fn max_memory_allocated(device: Option<i32>) -> Result<usize> {
+        GLOBAL_MEMORY_MANAGER.max_memory_allocated(device)
+    }
+
+    pub fn reset_peak_memory_stats(device: Option<i32>) -> Result<()> {
+        GLOBAL_MEMORY_MANAGER.reset_peak_memory_stats(device)
+    }
+
+    pub fn synchronize() -> Result<()> {
+        GLOBAL_MEMORY_MANAGER.synchronize()
+    }
+
+    pub fn get_device_properties(device: i32) -> Result<(usize, usize)> {
+        GLOBAL_MEMORY_MANAGER.get_device_properties(device)
+    }
+
+    pub fn malloc(size: usize) -> Result<*mut c_void> {
+        GLOBAL_MEMORY_MANAGER.allocate(size)
+    }
+
+    pub fn free(ptr: *mut c_void) -> Result<()> {
+        GLOBAL_MEMORY_MANAGER.deallocate(ptr)
+    }
+
+    pub fn malloc_flux(size: usize) -> Result<*mut c_void> {
+        let device_id = GLOBAL_MEMORY_MANAGER.current_device();
+        let pool = GLOBAL_MEMORY_MANAGER.get_or_create_pool(device_id, None)?;
+        pool.allocate_flux(size)
+    }
+
+    pub fn malloc_attention(seq_len: usize, batch_size: usize, head_dim: usize) -> Result<*mut c_void> {
+        let device_id = GLOBAL_MEMORY_MANAGER.current_device();
+        let pool = GLOBAL_MEMORY_MANAGER.get_or_create_pool(device_id, None)?;
+        pool.allocate_for_attention(seq_len, batch_size, head_dim)
+    }
+
+    pub fn malloc_gradient(size: usize, precision: PrecisionMode) -> Result<*mut c_void> {
+        let device_id = GLOBAL_MEMORY_MANAGER.current_device();
+        let pool = GLOBAL_MEMORY_MANAGER.get_or_create_pool(device_id, None)?;
+        pool.allocate_gradient(size, precision)
+    }
+
+    pub fn malloc_activation(size: usize, can_checkpoint: bool) -> Result<*mut c_void> {
+        let device_id = GLOBAL_MEMORY_MANAGER.current_device();
+        let pool = GLOBAL_MEMORY_MANAGER.get_or_create_pool(device_id, None)?;
+        pool.allocate_activation(size, can_checkpoint)
+    }
+
+    pub fn free_with_checkpoint(ptr: *mut c_void) -> Result<()> {
+        let device_id = GLOBAL_MEMORY_MANAGER.current_device();
+        let pool = GLOBAL_MEMORY_MANAGER.get_or_create_pool(device_id, None)?;
+        pool.free_with_checkpoint(ptr)
+    }
+
+    pub fn enable_gradient_checkpointing(_checkpoint_ratio: f32) -> Result<()> {
+        // This would require architectural changes to support mutable access
+        Ok(())
+    }
+
+    pub fn optimize_for_flux() -> Result<()> {
+        // This would require architectural changes to support mutable access
+        Ok(())
+    }
+
+    pub fn optimize_for_sd35() -> Result<()> {
+        // This would require architectural changes to support mutable access
+        Ok(())
+    }
+
+    pub fn optimize_for_sd35_turbo() -> Result<()> {
+        // This would require architectural changes to support mutable access
+        Ok(())
+    }
+
+    pub fn get_recommended_batch_size(per_sample_memory: usize) -> Result<usize> {
+        let device_id = GLOBAL_MEMORY_MANAGER.current_device();
+        let pool = GLOBAL_MEMORY_MANAGER.get_or_create_pool(device_id, None)?;
+        Ok(pool.get_recommended_batch_size(per_sample_memory))
+    }
+
+    pub fn enable_cpu_offload(_enable: bool) -> Result<()> {
+        // This would require architectural changes to support mutable access
+        Ok(())
+    }
+
+    pub fn enable_flash_attention_v2() -> Result<()> {
+        // This would require architectural changes to support mutable access
+        Ok(())
+    }
+
+    pub fn set_gradient_accumulation_steps(_steps: usize) -> Result<()> {
+        // This would require architectural changes to support mutable access
+        Ok(())
+    }
+
+    pub fn clear_gradients() -> Result<()> {
+        let device_id = GLOBAL_MEMORY_MANAGER.current_device();
+        let pool = GLOBAL_MEMORY_MANAGER.get_or_create_pool(device_id, None)?;
+        pool.clear_gradients()
+    }
+
+    pub fn get_memory_pressure() -> Result<f64> {
+        let device_id = GLOBAL_MEMORY_MANAGER.current_device();
+        let pool = GLOBAL_MEMORY_MANAGER.get_or_create_pool(device_id, None)?;
+        Ok(pool.get_memory_pressure())
+    }
+
+    pub fn should_checkpoint_activation(layer_idx: usize, total_layers: usize) -> Result<bool> {
+        let device_id = GLOBAL_MEMORY_MANAGER.current_device();
+        let pool = GLOBAL_MEMORY_MANAGER.get_or_create_pool(device_id, None)?;
+        Ok(pool.should_checkpoint_activation(layer_idx, total_layers))
+    }
+
+    pub fn malloc_with_format(size: usize, memory_format: MemoryFormat, precision: PrecisionMode) -> Result<*mut c_void> {
+        let device_id = GLOBAL_MEMORY_MANAGER.current_device();
+        let pool = GLOBAL_MEMORY_MANAGER.get_or_create_pool(device_id, None)?;
+        pool.allocate_with_format(size, memory_format, precision)
+    }
+
+    pub fn malloc_mmdit(resolution: (usize, usize), batch_size: usize) -> Result<MMDiTMemoryBlock> {
+        let device_id = GLOBAL_MEMORY_MANAGER.current_device();
+        let pool = GLOBAL_MEMORY_MANAGER.get_or_create_pool(device_id, None)?;
+        
+        // Create a default SD3.5 config if none exists
+        let default_config = DiffusionConfig {
+            precision_mode: PrecisionMode::Float16,
+            attention_strategy: AttentionStrategy::MMDiTOptimized,
+            enable_gradient_checkpointing: true,
+            checkpoint_ratio: 0.4,
+            enable_cpu_offload: false,
+            enable_model_parallel: false,
+            enable_activation_offload: false,
+            max_sequence_length: 4096,
+            batch_size: 1,
+            enable_flash_attention: true,
+            enable_xformers: true,
+            enable_sdp_attention: true,
+            memory_efficient_attention: true,
+            model_type: ModelType::SD35Large,
+            num_attention_heads: 38,
+            hidden_dim: 1536,
+            num_layers: 38,
+            patch_size: 16,
+        };
+        
+        let config = pool.diffusion_config.as_ref().unwrap_or(&default_config);
+        pool.allocate_mmdit_block(resolution, batch_size, config)
+    }
+
+    pub fn offload_to_cpu(gpu_ptr: *mut c_void) -> Result<*mut c_void> {
+        let device_id = GLOBAL_MEMORY_MANAGER.current_device();
+        let pool = GLOBAL_MEMORY_MANAGER.get_or_create_pool(device_id, None)?;
+        pool.offload_to_cpu(gpu_ptr)
+    }
+
+    pub fn restore_from_cpu(cpu_ptr: *mut c_void, size: usize) -> Result<*mut c_void> {
+        let device_id = GLOBAL_MEMORY_MANAGER.current_device();
+        let pool = GLOBAL_MEMORY_MANAGER.get_or_create_pool(device_id, None)?;
+        pool.restore_from_cpu(cpu_ptr, size)
+    }
+
+    pub fn get_optimal_dtype_for_layer(layer_type: &str) -> Result<PrecisionMode> {
+        let device_id = GLOBAL_MEMORY_MANAGER.current_device();
+        let pool = GLOBAL_MEMORY_MANAGER.get_or_create_pool(device_id, None)?;
+        Ok(pool.get_optimal_dtype_for_layer(layer_type))
+    }
+    
+    pub fn allocate_quantized(size: usize, quantization: QuantizationMode) -> Result<*mut c_void> {
+        let device_id = GLOBAL_MEMORY_MANAGER.current_device();
+        let pool = GLOBAL_MEMORY_MANAGER.get_or_create_pool(device_id, None)?;
+        pool.allocate_quantized(size, quantization)
+    }
+    
+    pub fn create_safe_tensor(shape: Vec<usize>, dtype: PrecisionMode) -> Result<SafeGPUTensor> {
+        SafeGPUTensor::new(shape, dtype)
+    }
+    
+    pub fn create_quantized_tensor(shape: Vec<usize>, quantization: QuantizationMode) -> Result<SafeGPUTensor> {
+        SafeGPUTensor::new_quantized(shape, quantization)
+    }
+    
+    pub fn create_memory_monitor() -> Arc<MemoryMonitor> {
+        let profiler = Arc::new(MemoryProfiler::new());
+        Arc::new(MemoryMonitor::new(profiler))
+    }
+    
+    // Multi-GPU API
+    pub fn create_multi_gpu_manager(device_ids: Vec<i32>) -> Result<Arc<MultiGPUManager>> {
+        Ok(Arc::new(MultiGPUManager::new(device_ids)?))
+    }
+    
+    pub fn allocate_multi_gpu(manager: &MultiGPUManager, size: usize) -> Result<(i32, *mut c_void)> {
+        manager.allocate_balanced(size)
+    }
+    
+    pub fn create_multi_gpu_tensor_replicated(shape: Vec<usize>, dtype: PrecisionMode, devices: &[i32]) -> Result<MultiGPUTensor> {
+        MultiGPUTensor::new_replicated(shape, dtype, devices)
+    }
+    
+    pub fn create_multi_gpu_tensor_sharded(shape: Vec<usize>, dtype: PrecisionMode, devices: &[i32], strategy: ShardingStrategy) -> Result<MultiGPUTensor> {
+        MultiGPUTensor::new_sharded(shape, dtype, devices, strategy)
+    }
+}
+
+/// Memory profiler
+pub struct MemoryProfiler {
+    events: Mutex<Vec<MemoryEvent>>,
+    start_time: Instant,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryEvent {
+    pub timestamp: Duration,
+    pub event_type: MemoryEventType,
+    pub size: usize,
+    pub device_id: i32,
+    pub ptr: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub enum MemoryEventType {
+    Allocate,
+    Deallocate,
+    CacheHit,
+    CacheMiss,
+    GarbageCollect,
+}
+
+impl MemoryProfiler {
+    pub fn new() -> Self {
+        Self {
+            events: Mutex::new(Vec::new()),
+            start_time: Instant::now(),
+        }
+    }
+
+    pub fn record_event(&self, event_type: MemoryEventType, size: usize, device_id: i32, ptr: *mut c_void) {
+        let event = MemoryEvent {
+            timestamp: self.start_time.elapsed(),
+            event_type,
+            size,
+            device_id,
+            ptr: ptr as usize,
+        };
+
+        self.events.lock().unwrap().push(event);
+    }
+
+    pub fn get_events(&self) -> Vec<MemoryEvent> {
+        self.events.lock().unwrap().clone()
+    }
+
+    pub fn clear(&self) {
+        self.events.lock().unwrap().clear();
+    }
+
+    pub fn export_to_json(&self) -> Result<String> {
+        let events = self.get_events();
+        serde_json::to_string_pretty(&events)
+            .map_err(|e| MemoryError::PoolError(format!("Failed to serialize events: {}", e)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_memory_pool_creation() {
+        let config = MemoryPoolConfig::default();
+        let result = MemoryPool::new(0, config);
+        
+        match result {
+            Ok(_) => println!("Memory pool created successfully"),
+            Err(e) => println!("Expected error without CUDA: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_cuda_api() {
+        let device = cuda::current_device();
+        assert_eq!(device, 0);
+
+        let _ = cuda::memory_allocated(None);
+        let _ = cuda::empty_cache();
+    }
+}
+
+/// Example usage for different models
+pub mod examples {
+    use super::*;
+
+    /// Example: Basic Flux.Dev setup
+    pub fn flux_dev_example() -> Result<()> {
+        cuda::set_device(0)?;
+        
+        // Allocate for 1024x1024 generation
+        let latent_size = 1024 * 1024 * 16 * 2; // 16 channels, FP16
+        let latent_ptr = cuda::malloc_flux(latent_size)?;
+        
+        // Allocate attention
+        let attn_ptr = cuda::malloc_attention(512, 1, 4096)?;
+        
+        // Check memory usage
+        let allocated = cuda::memory_allocated(None)?;
+        println!("Flux allocated: {} MB", allocated / 1024 / 1024);
+        
+        // Cleanup
+        cuda::free(latent_ptr)?;
+        cuda::free(attn_ptr)?;
+        cuda::empty_cache()?;
+        
+        Ok(())
+    }
+
+    /// Example: SD3.5 Large setup with MMDiT
+    pub fn sd35_large_example() -> Result<()> {
+        cuda::set_device(0)?;
+        
+        // Optimize for SD3.5 (would need mutable access in real implementation)
+        cuda::optimize_for_sd35()?;
+        
+        // Allocate MMDiT memory block for 1024x1024 image
+        let mmdit_block = cuda::malloc_mmdit((1024, 1024), 1)?;
+        
+        println!("SD3.5 MMDiT block allocated:");
+        println!("  - Sequence length: {}", mmdit_block.seq_len);
+        println!("  - Resolution: {:?}", mmdit_block.resolution);
+        
+        // Allocate conditioning embeddings
+        let text_embed_size = 77 * 1536 * 2; // CLIP text, hidden_dim=1536, FP16
+        let text_ptr = cuda::malloc_with_format(
+            text_embed_size,
+            MemoryFormat::Contiguous,
+            PrecisionMode::Float16
+        )?;
+        
+        // Allocate timestep embeddings
+        let timestep_size = 1 * 1536 * 2; // batch=1, hidden_dim=1536, FP16
+        let timestep_ptr = cuda::malloc_with_format(
+            timestep_size,
+            MemoryFormat::Contiguous,
+            PrecisionMode::Float16
+        )?;
+        
+        // Check memory pressure
+        let pressure = cuda::get_memory_pressure()?;
+        println!("Memory pressure: {:.1}%", pressure * 100.0);
+        
+        // Cleanup - MMDiT block has multiple pointers
+        cuda::free(mmdit_block.patch_embed_ptr)?;
+        cuda::free(mmdit_block.pos_embed_ptr)?;
+        cuda::free(mmdit_block.q_ptr)?;
+        cuda::free(mmdit_block.k_ptr)?;
+        cuda::free(mmdit_block.v_ptr)?;
+        cuda::free(mmdit_block.adaln_ptr)?;
+        cuda::free(text_ptr)?;
+        cuda::free(timestep_ptr)?;
+        
+        cuda::empty_cache()?;
+        
+        Ok(())
+    }
+
+    /// Example: SD3.5 Turbo optimized setup
+    pub fn sd35_turbo_example() -> Result<()> {
+        cuda::set_device(0)?;
+        
+        // SD3.5 Turbo uses fewer diffusion steps, so we can be less conservative
+        cuda::optimize_for_sd35_turbo()?;
+        
+        // Allocate for batch processing (turbo can handle larger batches)
+        let batch_size = 2;
+        let resolution = (768, 768); // Common resolution for turbo
+        
+        // Check recommended batch size
+        let patch_size = 16;
+        let seq_len = (resolution.0 / patch_size) * (resolution.1 / patch_size);
+        let per_sample_memory = seq_len * 1536 * 2 * 10; // Rough estimate
+        
+        let recommended_batch = cuda::get_recommended_batch_size(per_sample_memory)?;
+        let actual_batch = std::cmp::min(batch_size, recommended_batch);
+        
+        println!("SD3.5 Turbo: requested batch {}, using batch {}", 
+                 batch_size, actual_batch);
+        
+        // Allocate MMDiT blocks for batch
+        let mut blocks = Vec::new();
+        for _ in 0..actual_batch {
+            let block = cuda::malloc_mmdit(resolution, 1)?;
+            blocks.push(block);
+        }
+        
+        // Simulate some processing...
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        
+        // Cleanup
+        for block in blocks {
+            cuda::free(block.patch_embed_ptr)?;
+            cuda::free(block.pos_embed_ptr)?;
+            cuda::free(block.q_ptr)?;
+            cuda::free(block.k_ptr)?;
+            cuda::free(block.v_ptr)?;
+            cuda::free(block.adaln_ptr)?;
+        }
+        
+        cuda::empty_cache()?;
+        
+        Ok(())
+    }
+
+    /// Example: Memory-efficient SD3.5 with gradient checkpointing
+    pub fn sd35_memory_efficient_example() -> Result<()> {
+        cuda::set_device(0)?;
+        
+        // Enable aggressive memory saving features
+        cuda::enable_gradient_checkpointing(0.6)?; // Checkpoint 60% of activations
+        cuda::enable_cpu_offload(true)?;
+        
+        // Get device memory info
+        let (free, total) = cuda::get_device_properties(0)?;
+        println!("GPU Memory: {:.1} GB free / {:.1} GB total", 
+                 free as f64 / 1e9, total as f64 / 1e9);
+        
+        // Allocate for high resolution with memory efficiency
+        let resolution = (1536, 1536);
+        
+        // Check if we need to reduce resolution based on available memory
+        let mmdit_memory_estimate = {
+            let patch_size = 16;
+            let seq_len = (resolution.0 / patch_size) * (resolution.1 / patch_size);
+            seq_len * 1536 * 2 * 38 * 4 // seq * hidden * fp16 * layers * (qkv+mlp)
+        };
+        
+        let final_resolution = if mmdit_memory_estimate > free * 8 / 10 {
+            println!("Reducing resolution due to memory constraints");
+            (1024, 1024)
+        } else {
+            resolution
+        };
+        
+        // Allocate with chosen resolution
+        let block = cuda::malloc_mmdit(final_resolution, 1)?;
+        
+        // Simulate layer-wise processing with checkpointing
+        for layer in 0..38 {
+            let should_checkpoint = cuda::should_checkpoint_activation(layer, 38)?;
+            
+            if should_checkpoint {
+                println!("Layer {} will be checkpointed", layer);
+            }
+            
+            // Allocate temporary activation
+            let activation_size = block.seq_len * 1536 * 4 * 2; // 4x expansion in FFN, FP16
+            let activation_ptr = cuda::malloc_activation(activation_size, should_checkpoint)?;
+            
+            // Simulate computation...
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            
+            // Free or checkpoint
+            cuda::free_with_checkpoint(activation_ptr)?;
+            
+            // Check memory pressure periodically
+            if layer % 10 == 0 {
+                let pressure = cuda::get_memory_pressure()?;
+                if pressure > 0.9 {
+                    println!("High memory pressure at layer {}, running GC", layer);
+                    cuda::empty_cache()?;
+                }
+            }
+        }
+        
+        // Cleanup
+        cuda::free(block.patch_embed_ptr)?;
+        cuda::free(block.pos_embed_ptr)?;
+        cuda::free(block.q_ptr)?;
+        cuda::free(block.k_ptr)?;
+        cuda::free(block.v_ptr)?;
+        cuda::free(block.adaln_ptr)?;
+        
+        cuda::empty_cache()?;
+        
+        Ok(())
+    }
+
+    /// Example: Comparing memory usage between Flux and SD3.5
+    pub fn compare_models_example() -> Result<()> {
+        cuda::set_device(0)?;
+        
+        println!("=== Model Memory Comparison ===");
+        
+        // Flux.Dev memory usage
+        {
+            let latent_size = 1024 * 1024 * 16 * 2; // 1024x1024, 16ch, FP16
+            let text_size = 512 * 4096 * 2; // 512 tokens, 4096 dim, FP16
+            let model_params = 12 * 1024 * 1024 * 1024; // ~12GB model
+            
+            let flux_total = latent_size + text_size + model_params;
+            println!("Flux.Dev (1024x1024):");
+            println!("  - Latent: {} MB", latent_size / 1024 / 1024);
+            println!("  - Text: {} MB", text_size / 1024 / 1024);
+            println!("  - Model: {} GB", model_params / 1024 / 1024 / 1024);
+            println!("  - Total: {:.1} GB", flux_total as f64 / 1e9);
+        }
+        
+        // SD3.5 Large memory usage
+        {
+            let patch_size = 16;
+            let seq_len = (1024 / patch_size) * (1024 / patch_size);
+            let hidden_dim = 1536;
+            let num_layers = 38;
+            
+            let patch_embed_size = seq_len * hidden_dim * 2; // FP16
+            let attention_size = seq_len * hidden_dim * 3 * 2; // QKV, FP16
+            let mlp_size = seq_len * hidden_dim * 4 * 2; // 4x expansion, FP16
+            let layer_memory = (attention_size + mlp_size) * num_layers;
+            let model_params = 8 * 1024 * 1024 * 1024; // ~8GB model
+            
+            let sd35_total = patch_embed_size + layer_memory + model_params;
+            println!("\nSD3.5 Large (1024x1024):");
+            println!("  - Patch embed: {} MB", patch_embed_size / 1024 / 1024);
+            println!("  - Layers: {} MB", layer_memory / 1024 / 1024);
+            println!("  - Model: {} GB", model_params / 1024 / 1024 / 1024);
+            println!("  - Total: {:.1} GB", sd35_total as f64 / 1e9);
+        }
+        
+        // WAN 2.1 Video memory usage
+        {
+            let frames = 32;
+            let height = 512;
+            let width = 512;
+            let channels = 16;
+            let temporal_compression = 4;
+            let compressed_frames = frames / temporal_compression;
+            let patch_size = 8;
+            
+            let video_latent_size = compressed_frames * channels * (height / patch_size) * (width / patch_size) * 2;
+            let spatial_attn_size = compressed_frames * (height / patch_size) * (width / patch_size) * 1280 * 2;
+            let temporal_attn_size = (height / patch_size) * (width / patch_size) * compressed_frames * 1280 * 2;
+            let conv3d_workspace = compressed_frames * channels * (height / patch_size) * (width / patch_size) * 4 * 2;
+            let model_params = 10 * 1024 * 1024 * 1024; // ~10GB model
+            
+            let wan21_total = video_latent_size + spatial_attn_size + temporal_attn_size + conv3d_workspace + model_params;
+            println!("\nWAN 2.1 Video (32 frames @ 512x512):");
+            println!("  - Video latent: {} MB", video_latent_size / 1024 / 1024);
+            println!("  - Spatial attention: {} MB", spatial_attn_size / 1024 / 1024);
+            println!("  - Temporal attention: {} MB", temporal_attn_size / 1024 / 1024);
+            println!("  - Conv3D workspace: {} MB", conv3d_workspace / 1024 / 1024);
+            println!("  - Model: {} GB", model_params / 1024 / 1024 / 1024);
+            println!("  - Total: {:.1} GB", wan21_total as f64 / 1e9);
+        }
+        
+        Ok(())
+    }
+
+    /// Example: WAN 2.1 video generation
+    pub fn wan21_video_example() -> Result<()> {
+        cuda::set_device(0)?;
+        
+        // Optimize for WAN 2.1
+        cuda::optimize_for_wan21()?;
+        
+        // Generate 32 frames at 512x512
+        let num_frames = 32;
+        let height = 512;
+        let width = 512;
+        let batch_size = 1;
+        
+        // Allocate WAN 2.1 video memory block
+        let video_block = cuda::malloc_wan21_video(num_frames, height, width, batch_size)?;
+        
+        println!("WAN 2.1 Video block allocated:");
+        println!("  - Frames: {} (compressed: {})", num_frames, video_block.num_frames);
+        println!("  - Resolution: {}x{}", height, width);
+        println!("  - Latent size: {}x{}", video_block.height, video_block.width);
+        
+        // Allocate text conditioning (T5-XXL for WAN 2.1)
+        let text_tokens = 256;
+        let text_dim = 4096;
+        let text_size = batch_size * text_tokens * text_dim * 2; // FP16
+        let text_ptr = cuda::malloc_with_format(
+            text_size,
+            MemoryFormat::Contiguous,
+            PrecisionMode::Float16
+        )?;
+        
+        // Check memory usage
+        let allocated = cuda::memory_allocated(None)?;
+        println!("Total allocated: {:.1} GB", allocated as f64 / 1e9);
+        
+        // Simulate temporal chunk processing
+        let chunk_size = 8; // Process 8 frames at a time
+        for chunk_start in (0..video_block.num_frames).step_by(chunk_size) {
+            let chunk_frames = std::cmp::min(chunk_size, video_block.num_frames - chunk_start);
+            let chunk_ptr = cuda::malloc_wan21_temporal_chunk(chunk_frames, height, width)?;
+            
+            println!("Processing chunk: frames {}-{}", 
+                     chunk_start, chunk_start + chunk_frames);
+            
+            // Simulate processing...
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            
+            cuda::free(chunk_ptr)?;
+            
+            // Check memory pressure
+            let pressure = cuda::get_memory_pressure()?;
+            if pressure > 0.85 {
+                println!("High memory pressure, clearing cache");
+                cuda::empty_cache()?;
+            }
+        }
+        
+        // Cleanup - properly handle all pointers including null checks
+        cuda::free(video_block.video_latent_ptr)?;
+        cuda::free(video_block.temporal_embed_ptr)?;
+        cuda::free(video_block.spatial_attn_ptr)?;
+        cuda::free(video_block.temporal_attn_ptr)?;
+        cuda::free(video_block.conv3d_workspace_ptr)?;
+        if !video_block.motion_vector_ptr.is_null() {
+            cuda::free(video_block.motion_vector_ptr)?;
+        }
+        cuda::free(video_block.text_embed_ptr)?;
+        if !video_block.frame_buffer_ptr.is_null() {
+            // Check if it's a CPU allocation
+            let (free_mem, _) = cuda::get_device_properties(0)?;
+            if free_mem > 0 {
+                // Try GPU free first
+                match cuda::free(video_block.frame_buffer_ptr) {
+                    Ok(_) => {},
+                    Err(_) => {
+                        // If GPU free fails, it's probably CPU memory
+                        unsafe { libc::free(video_block.frame_buffer_ptr); }
+                    }
+                }
+            } else {
+                unsafe { libc::free(video_block.frame_buffer_ptr); }
+            }
+        }
+        cuda::free(text_ptr)?;
+        
+        cuda::empty_cache()?;
+        
+        Ok(())
+    }
+
+    /// Example: WAN 2.1 high-resolution video with memory optimization
+    pub fn wan21_high_res_video_example() -> Result<()> {
+        cuda::set_device(0)?;
+        
+        // Check available memory
+        let (free, total) = cuda::get_device_properties(0)?;
+        println!("GPU Memory: {:.1} GB free / {:.1} GB total", 
+                 free as f64 / 1e9, total as f64 / 1e9);
+        
+        // Determine maximum feasible resolution
+        let target_frames = 16;
+        let target_resolution = (768, 768);
+        
+        // Estimate memory requirements
+        let est_memory = {
+            let h = target_resolution.0;
+            let w = target_resolution.1;
+            let frames = target_frames;
+            let channels = 16;
+            let hidden = 1280;
+            
+            // Rough estimation
+            frames * channels * (h/8) * (w/8) * 2 * 10 // 10x for all components
+        };
+        
+        let (actual_frames, actual_resolution) = if est_memory > free * 8 / 10 {
+            println!("Reducing video specs due to memory constraints");
+            (8, (512, 512)) // Fallback to lower spec
+        } else {
+            (target_frames, target_resolution)
+        };
+        
+        println!("Generating {} frames at {}x{}", 
+                 actual_frames, actual_resolution.0, actual_resolution.1);
+        
+        // Enable memory optimizations
+        cuda::enable_gradient_checkpointing(0.7)?; // Aggressive checkpointing
+        cuda::enable_cpu_offload(true)?;
+        
+        // Allocate video block
+        let video_block = cuda::malloc_wan21_video(
+            actual_frames, 
+            actual_resolution.0, 
+            actual_resolution.1, 
+            1
+        )?;
+        
+        // Process with memory-aware scheduling
+        let layers = 32; // WAN 2.1 layers
+        for layer in 0..layers {
+            let should_checkpoint = cuda::should_checkpoint_activation(layer, layers)?;
+            
+            // Allocate layer activations
+            let spatial_size = video_block.height * video_block.width * video_block.channels * 2;
+            let temporal_size = video_block.num_frames * 1280 * 2;
+            
+            let spatial_act = cuda::malloc_activation(spatial_size, should_checkpoint)?;
+            let temporal_act = cuda::malloc_activation(temporal_size, should_checkpoint)?;
+            
+            // Simulate layer processing
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            
+            // Free activations
+            cuda::free_with_checkpoint(spatial_act)?;
+            cuda::free_with_checkpoint(temporal_act)?;
+            
+            if layer % 8 == 0 {
+                let pressure = cuda::get_memory_pressure()?;
+                println!("Layer {}: Memory pressure {:.1}%", layer, pressure * 100.0);
+            }
+        }
+        
+        // Cleanup
+        cuda::free(video_block.video_latent_ptr)?;
+        cuda::free(video_block.temporal_embed_ptr)?;
+        cuda::free(video_block.spatial_attn_ptr)?;
+        cuda::free(video_block.temporal_attn_ptr)?;
+        cuda::free(video_block.conv3d_workspace_ptr)?;
+        cuda::free(video_block.motion_vector_ptr)?;
+        cuda::free(video_block.text_embed_ptr)?;
+        if video_block.frame_buffer_ptr != std::ptr::null_mut() {
+            unsafe { libc::free(video_block.frame_buffer_ptr); }
+        }
+        
+        cuda::empty_cache()?;
+        
+        Ok(())
+    }
+
+    /// Example: WAN 2.1 image generation mode
+    pub fn wan21_image_example() -> Result<()> {
+        cuda::set_device(0)?;
+        
+        // WAN 2.1 can also generate single images with enhanced quality
+        println!("WAN 2.1 Image Generation Mode");
+        
+        // For image mode, we use frames=1 with no temporal compression
+        let video_block = cuda::malloc_wan21_video(1, 1024, 1024, 1)?;
+        
+        println!("Image mode allocated:");
+        println!("  - Resolution: 1024x1024");
+        println!("  - Latent: {}x{}", video_block.height, video_block.width);
+        
+        // The temporal attention becomes a self-attention in image mode
+        // This enhances the spatial coherence
+        
+        // Process similar to video but without temporal components
+        let allocated = cuda::memory_allocated(None)?;
+        println!("Memory used: {:.1} GB", allocated as f64 / 1e9);
+        
+        // Cleanup
+        cuda::free(video_block.video_latent_ptr)?;
+        cuda::free(video_block.temporal_embed_ptr)?;
+        cuda::free(video_block.spatial_attn_ptr)?;
+        cuda::free(video_block.temporal_attn_ptr)?;
+        cuda::free(video_block.conv3d_workspace_ptr)?;
+        if !video_block.motion_vector_ptr.is_null() {
+            cuda::free(video_block.motion_vector_ptr)?;
+        }
+        cuda::free(video_block.text_embed_ptr)?;
+        if !video_block.frame_buffer_ptr.is_null() {
+            unsafe { libc::free(video_block.frame_buffer_ptr); }
+        }
+        
+        cuda::empty_cache()?;
+        
+        Ok(())
+    }
+    
+    /// Example: Using quantization for larger models
+    pub fn quantization_example() -> Result<()> {
+        cuda::set_device(0)?;
+        
+        println!("=== Quantization Example ===");
+        
+        // 1. Allocate quantized weights for SD3.5
+        let weight_shape = vec![1536, 1536]; // Typical weight matrix
+        let num_elements: usize = weight_shape.iter().product();
+        
+        // Compare memory usage
+        let fp32_size = num_elements * 4;
+        let fp16_size = num_elements * 2;
+        let int8_size = num_elements;
+        let int4_size = num_elements / 2;
+        
+        println!("Weight matrix {}x{} memory usage:", weight_shape[0], weight_shape[1]);
+        println!("  FP32: {} MB", fp32_size / 1024 / 1024);
+        println!("  FP16: {} MB", fp16_size / 1024 / 1024);
+        println!("  INT8: {} MB", int8_size / 1024 / 1024);
+        println!("  INT4: {} MB", int4_size / 1024 / 1024);
+        
+        // Allocate INT8 quantized weights
+        let quantized_ptr = cuda::allocate_quantized(fp32_size, QuantizationMode::INT8)?;
+        println!("Allocated INT8 quantized weights");
+        
+        // Create safe tensor wrapper
+        let safe_tensor = cuda::create_quantized_tensor(weight_shape.clone(), QuantizationMode::INT4)?;
+        println!("Created INT4 quantized tensor: {} bytes", safe_tensor.nbytes());
+        
+        // Cleanup
+        cuda::free(quantized_ptr)?;
+        // safe_tensor automatically cleans up on drop
+        
+        Ok(())
+    }
+    
+    /// Example: Memory monitoring and profiling
+    pub fn memory_monitoring_example() -> Result<()> {
+        cuda::set_device(0)?;
+        
+        println!("=== Memory Monitoring Example ===");
+        
+        // Create memory monitor
+        let monitor = cuda::create_memory_monitor();
+        monitor.start_monitoring();
+        
+        // Simulate some allocations
+        let mut allocations = Vec::new();
+        for i in 0..5 {
+            let size = 1024 * 1024 * (i + 1) * 10; // 10MB, 20MB, etc.
+            let ptr = cuda::malloc(size)?;
+            allocations.push((ptr, size));
+            
+            // Capture snapshot
+            let snapshot = monitor.capture_snapshot(0)?;
+            println!("Step {}: Allocated {} MB, Total: {} MB", 
+                     i + 1, 
+                     size / 1024 / 1024,
+                     snapshot.allocated_bytes / 1024 / 1024);
+            
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        
+        // Check for fragmentation
+        let frag_report = monitor.analyze_fragmentation(0)?;
+        println!("\nFragmentation Report:");
+        println!("  Total fragments: {}", frag_report.total_fragments);
+        println!("  Largest free block: {} MB", frag_report.largest_free_block / 1024 / 1024);
+        println!("  Fragmentation: {:.1}%", frag_report.fragmentation_percentage);
+        
+        // Simulate some deallocations
+        for (i, (ptr, _)) in allocations.iter().enumerate().take(3) {
+            cuda::free(*ptr)?;
+            println!("Freed allocation {}", i + 1);
+        }
+        
+        // Check for potential leaks
+        let potential_leaks = monitor.detect_memory_leaks(0, Duration::from_millis(200))?;
+        println!("\nPotential leaks detected: {}", potential_leaks.len());
+        for leak in &potential_leaks {
+            println!("  - Ptr: 0x{:x}, Size: {} KB, Age: {:?}", 
+                     leak.ptr, 
+                     leak.size / 1024,
+                     leak.allocation_time);
+        }
+        
+        // Export timeline
+        let timeline = monitor.get_memory_timeline();
+        println!("\nCaptured {} memory snapshots", timeline.len());
+        
+        // Export Chrome trace format
+        if let Ok(trace) = monitor.export_chrome_trace() {
+            // Save to file in real usage
+            println!("Exported Chrome trace format (length: {} bytes)", trace.len());
+        }
+        
+        // Cleanup remaining allocations
+        for (ptr, _) in allocations.iter().skip(3) {
+            cuda::free(*ptr)?;
+        }
+        
+        monitor.stop_monitoring();
+        
+        Ok(())
+    }
+    
+    /// Example: Safe tensor operations
+    pub fn safe_tensor_example() -> Result<()> {
+        cuda::set_device(0)?;
+        
+        println!("=== Safe Tensor Example ===");
+        
+        // Create a safe tensor
+        let mut tensor = SafeGPUTensor::new(vec![2, 3, 224, 224], PrecisionMode::Float16)?;
+        println!("Created tensor with shape: {:?}", tensor.shape());
+        println!("Size in bytes: {}", tensor.nbytes());
+        
+        // Prepare some data
+        let num_elements = tensor.numel();
+        let mut host_data: Vec<f16> = vec![0; num_elements];
+        for (i, val) in host_data.iter_mut().enumerate() {
+            *val = ((i % 255) as f32 * 255.0) as u16; // Simple conversion for demo
+        }
+        
+        // Copy data to GPU
+        tensor.copy_from_slice(&host_data)?;
+        println!("Copied {} elements to GPU", num_elements);
+        
+        // Create a view with different shape
+        let view = tensor.view(vec![2 * 3, 224 * 224])?;
+        println!("Created view with shape: {:?}", view.shape());
+        
+        // Resize tensor
+        tensor.resize(vec![4, 3, 224, 224])?;
+        println!("Resized tensor to: {:?}", tensor.shape());
+        
+        // Copy back to host
+        let mut result = vec![0u16; tensor.numel()];
+        tensor.copy_to_slice(&mut result)?;
+        println!("Copied {} elements back to host", result.len());
+        
+        // Tensor automatically deallocates on drop
+        println!("Safe tensor will be automatically freed");
+        
+        Ok(())
+    }
+    
+    /// Example: Quantized model loading simulation
+    pub fn quantized_model_example() -> Result<()> {
+        cuda::set_device(0)?;
+        
+        println!("=== Quantized Model Loading ===");
+        
+        // Get quantized configuration for SD3.5
+        let device_id = cuda::current_device();
+        let pool = GLOBAL_MEMORY_MANAGER.get_or_create_pool(device_id, None)?;
+        let quantized_config = pool.lock().unwrap().get_quantized_model_config(ModelType::SD35Large, QuantizationMode::INT4);
+        
+        println!("SD3.5 Large INT4 Configuration:");
+        println!("  Checkpoint ratio: {}", quantized_config.checkpoint_ratio);
+        println!("  Batch size: {}", quantized_config.batch_size);
+        println!("  CPU offload: {}", quantized_config.enable_cpu_offload);
+        
+        // Simulate loading quantized layers
+        let layer_configs = [
+            ("attention.q_proj", vec![1536, 1536]),
+            ("attention.k_proj", vec![1536, 1536]),
+            ("attention.v_proj", vec![1536, 1536]),
+            ("attention.out_proj", vec![1536, 1536]),
+            ("mlp.fc1", vec![1536, 6144]),
+            ("mlp.fc2", vec![6144, 1536]),
+        ];
+        
+        let mut tensors = Vec::new();
+        let mut total_saved = 0i64;
+        
+        for (name, shape) in &layer_configs {
+            let fp32_size = shape.iter().product::<usize>() * 4;
+            let quant_tensor = SafeGPUTensor::new_quantized(shape.clone(), QuantizationMode::INT4)?;
+            let saved = fp32_size as i64 - quant_tensor.nbytes() as i64;
+            total_saved += saved;
+            
+            println!("  {}: {:?} - Saved {} MB", 
+                     name, 
+                     shape,
+                     saved / 1024 / 1024);
+            
+            tensors.push(quant_tensor);
+        }
+        
+        println!("\nTotal memory saved: {} MB ({:.1}% reduction)", 
+                 total_saved / 1024 / 1024,
+                 (total_saved as f64 / (total_saved as f64 + tensors.iter().map(|t| t.nbytes() as f64).sum::<f64>())) * 100.0);
+        
+        // Tensors automatically cleaned up on drop
+        Ok(())
+    }
+    
+    /// Example: Multi-GPU setup and usage
+    pub fn multi_gpu_example() -> Result<()> {
+        println!("=== Multi-GPU Example ===");
+        
+        // Check available GPUs
+        let mut device_count = 0;
+        unsafe {
+            cuda_sys::cudaGetDeviceCount(&mut device_count);
+        }
+        
+        if device_count < 2 {
+            println!("Multi-GPU example requires at least 2 GPUs. Found: {}", device_count);
+            return Ok(());
+        }
+        
+        // Create multi-GPU manager with first 2 devices
+        let devices = vec![0, 1];
+        let mgpu_manager = cuda::create_multi_gpu_manager(devices.clone())?;
+        
+        println!("Created multi-GPU manager with devices: {:?}", devices);
+        println!("Total memory: {} GB", mgpu_manager.get_total_memory() as f64 / 1e9);
+        println!("Total free memory: {} GB", mgpu_manager.get_total_free_memory() as f64 / 1e9);
+        
+        // Enable P2P if available
+        match mgpu_manager.enable_p2p() {
+            Ok(_) => println!("P2P enabled between devices"),
+            Err(e) => println!("P2P not available: {}", e),
+        }
+        
+        // Test different distribution strategies
+        
+        // 1. Balanced allocation
+        mgpu_manager.set_distribution_strategy(DistributionStrategy::Balanced)?;
+        let mut allocations = Vec::new();
+        
+        for i in 0..4 {
+            let size = 100 * 1024 * 1024; // 100MB
+            let (device_id, ptr) = cuda::allocate_multi_gpu(&mgpu_manager, size)?;
+            println!("Allocation {}: {} MB on device {}", i, size / 1024 / 1024, device_id);
+            allocations.push((device_id, ptr));
+        }
+        
+        // 2. Create replicated tensor
+        let shape = vec![2, 3, 224, 224];
+        let mut replicated_tensor = cuda::create_multi_gpu_tensor_replicated(
+            shape.clone(), 
+            PrecisionMode::Float16, 
+            &devices
+        )?;
+        println!("\nCreated replicated tensor {:?} on {} devices", shape, devices.len());
+        
+        // Broadcast data from primary
+        replicated_tensor.broadcast_from_primary()?;
+        println!("Broadcasted data from primary device");
+        
+        // 3. Create sharded tensor
+        let large_shape = vec![8, 512, 512, 512]; // Large tensor
+        let sharded_tensor = cuda::create_multi_gpu_tensor_sharded(
+            large_shape.clone(),
+            PrecisionMode::Float16,
+            &devices,
+            ShardingStrategy::Batch
+        )?;
+        println!("\nCreated sharded tensor {:?} across {} devices (batch dimension)", 
+                 large_shape, devices.len());
+        
+        // 4. Test model distribution
+        println!("\n--- Model Distribution ---");
+        
+        // Data parallel distribution
+        let data_parallel_dist = mgpu_manager.distribute_model(
+            ModelType::SD35Large,
+            DistributionStrategy::DataParallel
+        )?;
+        println!("Data parallel distribution:");
+        for (component, device) in &data_parallel_dist.device_assignments {
+            println!("  {} -> device {}", component, device);
+        }
+        
+        // Model parallel distribution
+        let mut layer_dist = HashMap::new();
+        let total_layers = 38; // SD3.5 has 38 layers
+        for i in 0..total_layers {
+            layer_dist.insert(i, devices[i % devices.len()]);
+        }
+        
+        let model_parallel_config = ModelParallelConfig {
+            layer_distribution: layer_dist,
+            pipeline_stages: devices.clone(),
+        };
+        
+        let model_parallel_dist = mgpu_manager.distribute_model(
+            ModelType::SD35Large,
+            DistributionStrategy::ModelParallel(model_parallel_config)
+        )?;
+        
+        println!("\nModel parallel distribution (first 10 layers):");
+        for i in 0..10 {
+            if let Some(&device) = model_parallel_dist.device_assignments.get(&format!("layer_{}", i)) {
+                println!("  Layer {} -> device {}", i, device);
+            }
+        }
+        
+        // Cleanup
+        for (device_id, ptr) in allocations {
+            cuda::set_device(device_id)?;
+            cuda::free(ptr)?;
+        }
+        
+        // Synchronize all devices
+        mgpu_manager.synchronize_all_devices()?;
+        println!("\nAll devices synchronized");
+        
+        Ok(())
+    }
+    
+    /// Example: Multi-GPU video generation with WAN 2.1
+    pub fn multi_gpu_video_example() -> Result<()> {
+        println!("=== Multi-GPU Video Generation ===");
+        
+        // Check for multiple GPUs
+        let mut device_count = 0;
+        unsafe {
+            cuda_sys::cudaGetDeviceCount(&mut device_count);
+        }
+        
+        if device_count < 2 {
+            println!("This example requires at least 2 GPUs");
+            return Ok(());
+        }
+        
+        let devices = vec![0, 1];
+        let mgpu_manager = cuda::create_multi_gpu_manager(devices.clone())?;
+        mgpu_manager.enable_p2p()?;
+        
+        // Configure for temporal sharding (split frames across GPUs)
+        mgpu_manager.set_distribution_strategy(DistributionStrategy::Balanced)?;
+        
+        // Total video parameters
+        let total_frames = 32;
+        let height = 512;
+        let width = 512;
+        let frames_per_gpu = total_frames / devices.len();
+        
+        println!("Generating {} frames across {} GPUs ({} frames each)",
+                 total_frames, devices.len(), frames_per_gpu);
+        
+        // Allocate video blocks on each GPU
+        let mut video_blocks = Vec::new();
+        
+        for (i, &device_id) in devices.iter().enumerate() {
+            cuda::set_device(device_id)?;
+            
+            let start_frame = i * frames_per_gpu;
+            let end_frame = if i == devices.len() - 1 {
+                total_frames
+            } else {
+                (i + 1) * frames_per_gpu
+            };
+            let gpu_frames = end_frame - start_frame;
+            
+            let video_block = cuda::malloc_wan21_video(gpu_frames, height, width, 1)?;
+            println!("GPU {}: Allocated {} frames ({}x{})", 
+                     device_id, gpu_frames, height, width);
+            
+            video_blocks.push((device_id, video_block));
+        }
+        
+        // Simulate distributed processing
+        for (device_id, video_block) in &video_blocks {
+            cuda::set_device(*device_id)?;
+            
+            // Process frames on this GPU
+            let chunk_size = 4;
+            for chunk_start in (0..video_block.num_frames).step_by(chunk_size) {
+                let chunk_frames = std::cmp::min(chunk_size, video_block.num_frames - chunk_start);
+                println!("GPU {}: Processing chunk frames {}-{}", 
+                         device_id, chunk_start, chunk_start + chunk_frames);
+                
+                // Simulate processing
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        
+        // Gather results (simulate)
+        println!("\nGathering results from all GPUs...");
+        mgpu_manager.synchronize_all_devices()?;
+        
+        // Cleanup
+        for (device_id, video_block) in video_blocks {
+            cuda::set_device(device_id)?;
+            
+            cuda::free(video_block.video_latent_ptr)?;
+            cuda::free(video_block.temporal_embed_ptr)?;
+            cuda::free(video_block.spatial_attn_ptr)?;
+            cuda::free(video_block.temporal_attn_ptr)?;
+            cuda::free(video_block.conv3d_workspace_ptr)?;
+            if !video_block.motion_vector_ptr.is_null() {
+                cuda::free(video_block.motion_vector_ptr)?;
+            }
+            cuda::free(video_block.text_embed_ptr)?;
+            if !video_block.frame_buffer_ptr.is_null() {
+                unsafe { libc::free(video_block.frame_buffer_ptr); }
+            }
+        }
+        
+        println!("Multi-GPU video generation complete");
+        
+        Ok(())
+    }
+}

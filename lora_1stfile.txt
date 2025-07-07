@@ -1,0 +1,472 @@
+//! LoRA (Low-Rank Adaptation) module implementation
+//! Production-ready code without mocks or placeholders
+
+use anyhow::Result;
+use candle_core::{Device, DType, Module, Tensor, D};
+use candle_nn::{Init, VarBuilder, VarMap};
+use std::collections::HashMap;
+
+/// LoRA module for parameter-efficient fine-tuning
+#[derive(Debug, Clone)]
+pub struct LoRAModule {
+   pub lora_a: Tensor,
+   pub lora_b: Tensor,
+   pub scale: f32,
+   rank: usize,
+   alpha: f32,
+   dropout: Option<f32>,
+}
+
+impl LoRAModule {
+   /// Create a new LoRA module
+   pub fn new(
+       in_features: usize,
+       out_features: usize,
+       rank: usize,
+       alpha: f32,
+       device: Device,
+       dtype: DType,
+   ) -> Result<Self> {
+       // Initialize lora_A with kaiming uniform
+       let bound = (1.0 / (in_features as f32)).sqrt();
+       let lora_a = Tensor::rand(-bound, bound, (rank, in_features), &device)?.to_dtype(dtype)?;
+       
+       // Initialize lora_B with zeros
+       let lora_b = Tensor::zeros((out_features, rank), dtype, &device)?;
+       
+       let scale = alpha / (rank as f32);
+       
+       Ok(Self {
+           lora_a,
+           lora_b,
+           scale,
+           rank,
+           alpha,
+           dropout: None,
+       })
+   }
+   
+   /// Create with dropout
+   pub fn with_dropout(mut self, dropout: f32) -> Self {
+       self.dropout = Some(dropout);
+       self
+   }
+   
+   /// Create from VarBuilder
+   pub fn new_from_vb(
+       in_features: usize,
+       out_features: usize,
+       rank: usize,
+       alpha: f32,
+       vb: VarBuilder,
+   ) -> Result<Self> {
+       let bound = (1.0 / (in_features as f32)).sqrt();
+       let init_a = Init::Uniform { lo: -bound, up: bound };
+       
+       let lora_a = vb.get_with_hints((rank, in_features), "lora_down.weight", init_a)?;
+       let lora_b = vb.get((out_features, rank), "lora_up.weight")?;
+       
+       let scale = alpha / (rank as f32);
+       
+       Ok(Self {
+           lora_a,
+           lora_b,
+           scale,
+           rank,
+           alpha,
+           dropout: None,
+       })
+   }
+   
+   /// Get trainable parameters
+   pub fn trainable_params(&self) -> Vec<&Tensor> {
+       vec![&self.lora_a, &self.lora_b]
+   }
+   
+   /// Get trainable parameters as mutable
+   pub fn trainable_params_mut(&mut self) -> Vec<&mut Tensor> {
+       vec![&mut self.lora_a, &mut self.lora_b]
+   }
+   
+   /// Get the scaling factor
+   pub fn get_scale(&self) -> f32 {
+       self.scale
+   }
+   
+   /// Apply LoRA to base weights for inference
+   pub fn merge_weights(&self, base_weight: &Tensor) -> Result<Tensor> {
+       // For linear layers: W' = W + (B @ A) * scale
+       let lora_weight = self.lora_b.matmul(&self.lora_a)?;
+       let scaled_weight = (lora_weight * self.scale)?;
+       base_weight.add(&scaled_weight)
+   }
+   
+   /// Forward pass with optional dropout
+   pub fn forward_training(&self, xs: &Tensor, training: bool) -> Result<Tensor> {
+       // xs: [batch, seq_len, in_features] or [batch, in_features]
+       let h = xs.matmul(&self.lora_a.t()?)?;
+       
+       let h = if training && self.dropout.is_some() {
+           candle_nn::ops::dropout(&h, self.dropout.unwrap())?
+       } else {
+           h
+       };
+       
+       let out = h.matmul(&self.lora_b.t()?)?;
+       out * self.scale
+   }
+   
+   /// Get number of parameters
+   pub fn num_parameters(&self) -> usize {
+       self.lora_a.elem_count() + self.lora_b.elem_count()
+   }
+   
+   /// Save weights in AI-Toolkit/SimpleTuner format
+   pub fn save_weights(&self, prefix: &str) -> HashMap<String, Tensor> {
+       let mut tensors = HashMap::new();
+       
+       // AI-Toolkit format uses lora_down/lora_up naming
+       tensors.insert(
+           format!("{}.lora_down.weight", prefix),
+           self.lora_a.clone()
+       );
+       tensors.insert(
+           format!("{}.lora_up.weight", prefix),
+           self.lora_b.clone()
+       );
+       
+       // Also save alpha as metadata
+       tensors.insert(
+           format!("{}.alpha", prefix),
+           Tensor::new(&[self.alpha], self.lora_a.device()).unwrap()
+       );
+       
+       tensors
+   }
+   
+   /// Load weights from tensors
+   pub fn load_weights(
+       prefix: &str,
+       tensors: &HashMap<String, Tensor>,
+       device: &Device,
+       dtype: DType,
+   ) -> Result<Self> {
+       let lora_a = tensors
+           .get(&format!("{}.lora_down.weight", prefix))
+           .ok_or_else(|| anyhow::anyhow!("Missing {}.lora_down.weight", prefix))?
+           .to_device(device)?
+           .to_dtype(dtype)?;
+           
+       let lora_b = tensors
+           .get(&format!("{}.lora_up.weight", prefix))
+           .ok_or_else(|| anyhow::anyhow!("Missing {}.lora_up.weight", prefix))?
+           .to_device(device)?
+           .to_dtype(dtype)?;
+       
+       // Try to load alpha, default to rank if not found
+       let rank = lora_a.dim(0)?;
+       let alpha = tensors
+           .get(&format!("{}.alpha", prefix))
+           .and_then(|t| t.to_vec0::<f32>().ok())
+           .unwrap_or(rank as f32);
+       
+       Ok(Self {
+           lora_a,
+           lora_b,
+           scale: alpha / (rank as f32),
+           rank,
+           alpha,
+           dropout: None,
+       })
+   }
+}
+
+impl Module for LoRAModule {
+   fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+       // Standard LoRA forward: (x @ A^T @ B^T) * scale
+       let h = xs.matmul(&self.lora_a.t()?)?;
+       let out = h.matmul(&self.lora_b.t()?)?;
+       out * self.scale
+   }
+}
+
+/// LoRA configuration
+#[derive(Debug, Clone)]
+pub struct LoRAConfig {
+   pub rank: usize,
+   pub alpha: f32,
+   pub dropout: Option<f32>,
+   pub target_modules: Vec<String>,
+}
+
+impl Default for LoRAConfig {
+   fn default() -> Self {
+       Self {
+           rank: 16,
+           alpha: 16.0,
+           dropout: None,
+           target_modules: vec![
+               "to_q".to_string(),
+               "to_k".to_string(),
+               "to_v".to_string(),
+               "to_out.0".to_string(),
+           ],
+       }
+   }
+}
+
+/// Linear layer with LoRA
+#[derive(Debug)]
+pub struct LinearWithLoRA {
+   base: candle_nn::Linear,
+   lora: Option<LoRAModule>,
+}
+
+impl LinearWithLoRA {
+   pub fn new(base: candle_nn::Linear, lora: Option<LoRAModule>) -> Self {
+       Self { base, lora }
+   }
+   
+   pub fn forward(&self, xs: &Tensor, use_lora: bool) -> Result<Tensor> {
+       let base_output = self.base.forward(xs)?;
+       
+       if use_lora && self.lora.is_some() {
+           let lora_output = self.lora.as_ref().unwrap().forward(xs)?;
+           base_output.add(&lora_output)
+       } else {
+           Ok(base_output)
+       }
+   }
+   
+   pub fn merge_lora(&mut self) -> Result<()> {
+       if let Some(ref lora) = self.lora {
+           let merged_weight = lora.merge_weights(self.base.weight())?;
+           *self.base.weight_mut() = merged_weight;
+           self.lora = None;
+       }
+       Ok(())
+   }
+}
+
+/// Collection of LoRA modules for a model
+pub struct LoRACollection {
+   modules: HashMap<String, LoRAModule>,
+   config: LoRAConfig,
+}
+
+impl LoRACollection {
+   pub fn new(config: LoRAConfig) -> Self {
+       Self {
+           modules: HashMap::new(),
+           config,
+       }
+   }
+   
+   pub fn add_module(&mut self, name: String, module: LoRAModule) {
+       self.modules.insert(name, module);
+   }
+   
+   pub fn get(&self, name: &str) -> Option<&LoRAModule> {
+       self.modules.get(name)
+   }
+   
+   pub fn get_mut(&mut self, name: &str) -> Option<&mut LoRAModule> {
+       self.modules.get_mut(name)
+   }
+   
+   /// Get all trainable parameters
+   pub fn trainable_params(&self) -> Vec<&Tensor> {
+       self.modules
+           .values()
+           .flat_map(|m| m.trainable_params())
+           .collect()
+   }
+   
+   /// Total number of parameters
+   pub fn num_parameters(&self) -> usize {
+       self.modules.values().map(|m| m.num_parameters()).sum()
+   }
+   
+   /// Save all modules in AI-Toolkit format
+   pub fn save_safetensors(&self) -> HashMap<String, Tensor> {
+       let mut all_tensors = HashMap::new();
+       
+       for (name, module) in &self.modules {
+           let module_tensors = module.save_weights(name);
+           all_tensors.extend(module_tensors);
+       }
+       
+       // Add metadata
+       all_tensors.insert(
+           "metadata.rank".to_string(),
+           Tensor::new(&[self.config.rank as i32], &Device::Cpu).unwrap()
+       );
+       all_tensors.insert(
+           "metadata.alpha".to_string(),
+           Tensor::new(&[self.config.alpha], &Device::Cpu).unwrap()
+       );
+       
+       all_tensors
+   }
+   
+   /// Load from safetensors file
+   pub fn load_safetensors(
+       tensors: &HashMap<String, Tensor>,
+       device: &Device,
+       dtype: DType,
+   ) -> Result<Self> {
+       // Extract metadata
+       let rank = tensors
+           .get("metadata.rank")
+           .and_then(|t| t.to_vec0::<i32>().ok())
+           .unwrap_or(16) as usize;
+           
+       let alpha = tensors
+           .get("metadata.alpha")
+           .and_then(|t| t.to_vec0::<f32>().ok())
+           .unwrap_or(16.0);
+       
+       let config = LoRAConfig {
+           rank,
+           alpha,
+           dropout: None,
+           target_modules: vec![],
+       };
+       
+       let mut collection = Self::new(config);
+       
+       // Find all LoRA modules by looking for .lora_down.weight keys
+       let mut module_names = std::collections::HashSet::new();
+       for key in tensors.keys() {
+           if key.ends_with(".lora_down.weight") {
+               let module_name = key.trim_end_matches(".lora_down.weight");
+               module_names.insert(module_name.to_string());
+           }
+       }
+       
+       // Load each module
+       for module_name in module_names {
+           let module = LoRAModule::load_weights(&module_name, tensors, device, dtype)?;
+           collection.add_module(module_name, module);
+       }
+       
+       Ok(collection)
+   }
+   
+   /// Create LoRA modules for specific layer shapes
+   pub fn create_for_layer(
+       &mut self,
+       name: &str,
+       in_features: usize,
+       out_features: usize,
+       device: Device,
+       dtype: DType,
+   ) -> Result<()> {
+       let module = LoRAModule::new(
+           in_features,
+           out_features,
+           self.config.rank,
+           self.config.alpha,
+           device,
+           dtype,
+       )?;
+       
+       let module = if let Some(dropout) = self.config.dropout {
+           module.with_dropout(dropout)
+       } else {
+           module
+       };
+       
+       self.add_module(name.to_string(), module);
+       Ok(())
+   }
+}
+
+/// Flux-specific LoRA layer names
+pub fn flux_lora_target_modules() -> Vec<String> {
+   vec![
+       // Single transformer blocks
+       "single_blocks.*.attn.to_q",
+       "single_blocks.*.attn.to_k", 
+       "single_blocks.*.attn.to_v",
+       "single_blocks.*.attn.to_out.0",
+       // Double transformer blocks
+       "double_blocks.*.img_attn.to_q",
+       "double_blocks.*.img_attn.to_k",
+       "double_blocks.*.img_attn.to_v", 
+       "double_blocks.*.img_attn.to_out.0",
+       "double_blocks.*.txt_attn.to_q",
+       "double_blocks.*.txt_attn.to_k",
+       "double_blocks.*.txt_attn.to_v",
+       "double_blocks.*.txt_attn.to_out.0",
+   ]
+   .into_iter()
+   .map(String::from)
+   .collect()
+}
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+   
+   #[test]
+   fn test_lora_forward() -> Result<()> {
+       let device = Device::Cpu;
+       let dtype = DType::F32;
+       let batch_size = 2;
+       let seq_len = 10;
+       let in_features = 768;
+       let out_features = 768;
+       let rank = 16;
+       let alpha = 16.0;
+       
+       let lora = LoRAModule::new(in_features, out_features, rank, alpha, device.clone(), dtype)?;
+       
+       let input = Tensor::randn(0.0, 1.0, (batch_size, seq_len, in_features), &device)?;
+       let output = lora.forward(&input)?;
+       
+       assert_eq!(output.dims(), &[batch_size, seq_len, out_features]);
+       
+       Ok(())
+   }
+   
+   #[test]
+   fn test_lora_save_load() -> Result<()> {
+       let device = Device::Cpu;
+       let dtype = DType::F32;
+       let rank = 8;
+       let alpha = 16.0;
+       
+       // Create and save
+       let lora = LoRAModule::new(128, 256, rank, alpha, device.clone(), dtype)?;
+       let tensors = lora.save_weights("test_module");
+       
+       // Load
+       let loaded = LoRAModule::load_weights("test_module", &tensors, &device, dtype)?;
+       
+       assert_eq!(loaded.rank, lora.rank);
+       assert_eq!(loaded.alpha, lora.alpha);
+       assert_eq!(loaded.scale, lora.scale);
+       
+       Ok(())
+   }
+   
+   #[test]
+   fn test_lora_merge() -> Result<()> {
+       let device = Device::Cpu;
+       let dtype = DType::F32;
+       
+       // Create base weight
+       let base_weight = Tensor::randn(0.0, 1.0, (256, 128), &device)?;
+       
+       // Create LoRA
+       let lora = LoRAModule::new(128, 256, 8, 16.0, device, dtype)?;
+       
+       // Merge
+       let merged = lora.merge_weights(&base_weight)?;
+       
+       assert_eq!(merged.dims(), base_weight.dims());
+       
+       Ok(())
+   }
+}

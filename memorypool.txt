@@ -1,0 +1,272 @@
+Fixed Memory Pool Implementation for Candle
+rust// File: candle-core/src/cuda_backend/memory_pool.rs
+
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
+use crate::{Result, Error};
+
+// Size thresholds
+const SMALL_SIZE_THRESHOLD: usize = 1024 * 1024; // 1MB
+const ROUND_SIZE_SMALL: usize = 512;            // Round up small allocations to 512B
+const ROUND_SIZE_LARGE: usize = 131072;         // Round up large allocations to 128KB
+
+// We need to store raw device pointers since CudaSlice<T> is typed
+struct PooledBlock {
+    ptr: DevicePtr<u8>,
+    size: usize,
+}
+
+pub struct CudaMemoryPool {
+    device: Arc<CudaDevice>,
+    // Map from size -> list of free blocks of that size
+    small_blocks: Mutex<BTreeMap<usize, Vec<PooledBlock>>>,
+    large_blocks: Mutex<BTreeMap<usize, Vec<PooledBlock>>>,
+    
+    // Statistics
+    allocated_bytes: AtomicUsize,
+    cached_bytes: AtomicUsize,
+    
+    // Configuration
+    max_cached_bytes: usize,
+}
+
+impl CudaMemoryPool {
+    pub fn new(device: Arc<CudaDevice>) -> Self {
+        Self {
+            device,
+            small_blocks: Mutex::new(BTreeMap::new()),
+            large_blocks: Mutex::new(BTreeMap::new()),
+            allocated_bytes: AtomicUsize::new(0),
+            cached_bytes: AtomicUsize::new(0),
+            max_cached_bytes: 2 * 1024 * 1024 * 1024, // 2GB cache by default
+        }
+    }
+    
+    // Round allocation size to reduce fragmentation
+    fn round_size(size: usize) -> usize {
+        if size == 0 {
+            return ROUND_SIZE_SMALL;
+        }
+        
+        if size < SMALL_SIZE_THRESHOLD {
+            // Round up to multiple of ROUND_SIZE_SMALL
+            ((size + ROUND_SIZE_SMALL - 1) / ROUND_SIZE_SMALL) * ROUND_SIZE_SMALL
+        } else {
+            // Round up to multiple of ROUND_SIZE_LARGE
+            ((size + ROUND_SIZE_LARGE - 1) / ROUND_SIZE_LARGE) * ROUND_SIZE_LARGE
+        }
+    }
+    
+    pub unsafe fn alloc<T>(&self, len: usize) -> Result<CudaSlice<T>> {
+        let bytes_needed = len * std::mem::size_of::<T>();
+        let rounded_size = Self::round_size(bytes_needed);
+        
+        // Try to find a cached block
+        let pool = if rounded_size < SMALL_SIZE_THRESHOLD {
+            &self.small_blocks
+        } else {
+            &self.large_blocks
+        };
+        
+        // Look for exact size match first
+        let cached_block = {
+            let mut pool_guard = pool.lock().unwrap();
+            pool_guard.get_mut(&rounded_size).and_then(|blocks| blocks.pop())
+        };
+        
+        if let Some(block) = cached_block {
+            self.cached_bytes.fetch_sub(rounded_size, Ordering::Relaxed);
+            
+            // Create CudaSlice from the pooled block
+            // This is unsafe because we're constructing CudaSlice manually
+            let slice = CudaSlice::from_raw_parts(
+                block.ptr.cast::<T>(), 
+                len, 
+                self.device.clone()
+            );
+            return Ok(slice);
+        }
+        
+        // No cached block found, allocate new one
+        self.allocated_bytes.fetch_add(rounded_size, Ordering::Relaxed);
+        
+        // Allocate the actual memory
+        let slice = self.device.alloc::<T>(len)?;
+        Ok(slice)
+    }
+    
+    pub unsafe fn dealloc<T>(&self, slice: CudaSlice<T>) -> Result<()> {
+        let len = slice.len();
+        let bytes = len * std::mem::size_of::<T>();
+        let rounded_size = Self::round_size(bytes);
+        
+        // Check if we should cache this block
+        let current_cached = self.cached_bytes.load(Ordering::Relaxed);
+        if current_cached + rounded_size > self.max_cached_bytes {
+            // Cache is full, just deallocate
+            // slice will be dropped and deallocated
+            self.allocated_bytes.fetch_sub(rounded_size, Ordering::Relaxed);
+            return Ok(());
+        }
+        
+        // Extract device pointer before slice is consumed
+        let device_ptr = slice.device_ptr();
+        let ptr_u8 = device_ptr.cast::<u8>();
+        
+        // Prevent automatic deallocation by forgetting the slice
+        std::mem::forget(slice);
+        
+        // Create pooled block
+        let block = PooledBlock {
+            ptr: ptr_u8,
+            size: rounded_size,
+        };
+        
+        // Add to appropriate pool
+        let pool = if rounded_size < SMALL_SIZE_THRESHOLD {
+            &self.small_blocks
+        } else {
+            &self.large_blocks
+        };
+        
+        let mut pool_guard = pool.lock().unwrap();
+        pool_guard.entry(rounded_size)
+            .or_insert_with(Vec::new)
+            .push(block);
+        
+        self.cached_bytes.fetch_add(rounded_size, Ordering::Relaxed);
+        Ok(())
+    }
+    
+    // Clear all cached memory
+    pub fn clear_cache(&self) -> Result<()> {
+        let mut small = self.small_blocks.lock().unwrap();
+        let mut large = self.large_blocks.lock().unwrap();
+        
+        // Properly deallocate all cached blocks
+        for (_, blocks) in small.drain() {
+            for block in blocks {
+                // Create a slice to properly deallocate
+                let slice = unsafe {
+                    CudaSlice::<u8>::from_raw_parts(
+                        block.ptr, 
+                        block.size, 
+                        self.device.clone()
+                    )
+                };
+                // Dropping the slice will deallocate
+                drop(slice);
+            }
+        }
+        
+        for (_, blocks) in large.drain() {
+            for block in blocks {
+                let slice = unsafe {
+                    CudaSlice::<u8>::from_raw_parts(
+                        block.ptr, 
+                        block.size, 
+                        self.device.clone()
+                    )
+                };
+                drop(slice);
+            }
+        }
+        
+        self.cached_bytes.store(0, Ordering::Relaxed);
+        Ok(())
+    }
+    
+    // Get memory statistics
+    pub fn stats(&self) -> MemoryStats {
+        MemoryStats {
+            allocated_bytes: self.allocated_bytes.load(Ordering::Relaxed),
+            cached_bytes: self.cached_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+// Make sure to properly clean up on drop
+impl Drop for CudaMemoryPool {
+    fn drop(&mut self) {
+        // Clear cache to free all memory
+        let _ = self.clear_cache();
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryStats {
+    pub allocated_bytes: usize,
+    pub cached_bytes: usize,
+}
+
+// Thread-safe global pool per device
+use once_cell::sync::Lazy;
+static MEMORY_POOLS: Lazy<Mutex<BTreeMap<usize, Arc<CudaMemoryPool>>>> = 
+    Lazy::new(|| Mutex::new(BTreeMap::new()));
+
+pub fn get_memory_pool(device: &Arc<CudaDevice>) -> Arc<CudaMemoryPool> {
+    let device_id = device.ordinal();
+    let mut pools = MEMORY_POOLS.lock().unwrap();
+    
+    pools.entry(device_id)
+        .or_insert_with(|| Arc::new(CudaMemoryPool::new(device.clone())))
+        .clone()
+}
+Integration changes:
+rust// File: candle-core/src/cuda_backend/mod.rs
+
+// Add a feature flag for memory pooling
+#[cfg(feature = "cuda-memory-pool")]
+use super::memory_pool::get_memory_pool;
+
+impl CudaDevice {
+    pub fn alloc_zeros<T: cudarc::driver::DeviceRepr>(&self, len: usize) -> Result<CudaSlice<T>> {
+        #[cfg(feature = "cuda-memory-pool")]
+        {
+            let pool = get_memory_pool(&Arc::new(self.clone()));
+            unsafe { pool.alloc::<T>(len) }
+        }
+        
+        #[cfg(not(feature = "cuda-memory-pool"))]
+        {
+            // Original implementation
+            self.device.alloc_zeros::<T>(len).w()
+        }
+    }
+}
+
+// For the Storage implementation, we need a custom wrapper
+#[cfg(feature = "cuda-memory-pool")]
+pub struct PooledCudaStorage {
+    slice: Option<CudaSlice<f32>>, // or appropriate type
+    device: Arc<CudaDevice>,
+}
+
+#[cfg(feature = "cuda-memory-pool")]
+impl Drop for PooledCudaStorage {
+    fn drop(&mut self) {
+        if let Some(slice) = self.slice.take() {
+            let pool = get_memory_pool(&self.device);
+            // Return to pool
+            let _ = unsafe { pool.dealloc(slice) };
+        }
+    }
+}
+Add to Cargo.toml:
+toml[dependencies]
+once_cell = "1.19"
+
+[features]
+cuda-memory-pool = []
+Key Fixes:
+
+Fixed unsafe transmute - Can't transmute between different generic types
+Proper DevicePtr handling - Store raw pointers in pool
+Memory safety - Use forget() to prevent double-free
+Proper cleanup - Implement Drop for pool
+Feature flag - Make it optional to avoid breaking changes
+Fixed CudaSlice construction - Need from_raw_parts method
+
+Note: This assumes CudaSlice::from_raw_parts exists in cudarc. If not, you'll need to work with the cudarc API to properly construct slices from raw device pointers.

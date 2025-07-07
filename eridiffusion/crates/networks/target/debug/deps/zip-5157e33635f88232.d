@@ -1,0 +1,20 @@
+/home/alex/diffusers-rs/eridiffusion/crates/networks/target/debug/deps/libzip-5157e33635f88232.rmeta: /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/lib.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/compression.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/cp437.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/crc32.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/extra_fields/mod.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/extra_fields/extended_timestamp.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/read.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/read/stream.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/result.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/spec.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/types.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/write.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/zipcrypto.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/unstable.rs
+
+/home/alex/diffusers-rs/eridiffusion/crates/networks/target/debug/deps/zip-5157e33635f88232.d: /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/lib.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/compression.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/cp437.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/crc32.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/extra_fields/mod.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/extra_fields/extended_timestamp.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/read.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/read/stream.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/result.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/spec.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/types.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/write.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/zipcrypto.rs /home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/unstable.rs
+
+/home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/lib.rs:
+/home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/compression.rs:
+/home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/cp437.rs:
+/home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/crc32.rs:
+/home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/extra_fields/mod.rs:
+/home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/extra_fields/extended_timestamp.rs:
+/home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/read.rs:
+/home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/read/stream.rs:
+/home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/result.rs:
+/home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/spec.rs:
+/home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/types.rs:
+/home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/write.rs:
+/home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/zipcrypto.rs:
+/home/alex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zip-1.1.4/src/unstable.rs:
+
+# env-dep:CARGO_PKG_VERSION=1.1.4

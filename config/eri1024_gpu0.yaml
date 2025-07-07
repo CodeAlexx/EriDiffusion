@@ -1,0 +1,107 @@
+---
+job: extension
+config:
+  # this name will be the folder and filename name
+  name: "rachv1Sd3"
+  process:
+    - type: 'sd_trainer'
+      # root folder to save training sessions/samples/weights
+      training_folder: "output"
+      # uncomment to see performance stats in the terminal every N steps
+#      performance_log_every: 1000
+      device: cuda:0
+      # if a trigger word is specified, it will be added to captions of training data if it does not already exist
+      # alternatively, in your captions you can add [trigger] and it will be replaced with the trigger word
+      trigger_word: "eri1024"
+      network:
+        type: "lokr"
+        lokr_full_rank: true
+        lokr_factor: 4
+        linear: 64
+        linear_alpha: 64
+      save:
+        dtype: float16 # precision to save
+        save_every: 250 # save every this many steps
+        max_step_saves_to_keep: 4 # how many intermittent saves to keep
+        push_to_hub: false #change this to True to push your trained model to Hugging Face.
+        # You can either set up a HF_TOKEN env variable or you'll be prompted to log-in         
+#       hf_repo_id: your-username/your-model-slug
+#       hf_private: true #whether the repo is private or public
+      datasets:
+        # datasets are a folder of images. captions need to be txt files with the same name as the image
+        # for instance image2.jpg and image2.txt. Only jpg, jpeg, and png are supported currently
+        # images will automatically be resized and bucketed into the resolution specified
+        # on windows, escape back slashes with another backslash so
+        # "C:\\path\\to\\images\\folder"
+        - folder_path: "/home/alex/diffusers-rs/datasets/40_woman"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.00  # will drop out the caption 5% of time
+          shuffle_tokens: false  # shuffle caption order, split by commas
+          cache_latents_to_disk: true  # leave this true unless you know what you're doing
+          resolution: [ 1024 ]  # flex enjoys multiple resolutions
+      train:
+        batch_size: 4
+        # IMPORTANT! For Flex, you must bypass the guidance embedder during training
+        bypass_guidance_embedding: false
+        
+        steps: 4000  # total number of steps to train 500 - 4000 is a good range
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false  # probably won't work with flex
+        gradient_checkpointing: true  # need the on unless you have a ton of vram
+        noise_scheduler: "flowmatch" # for training only
+        optimizer: "adamw8bit"
+        lr: 1e-05  # Reduced from 5e-05 to prevent inf loss
+        # uncomment this to skip the pre training sample
+#        skip_first_sample: true
+        # uncomment to completely disable sampling
+#        disable_sampling: true
+        # uncomment to use new vell curved weighting. Experimental but may produce better results
+        linear_timesteps: true
+
+        # ema will smooth out learning, but could slow it down. Recommended to leave on.
+        ema_config:
+          use_ema: true
+          ema_decay: 0.99
+
+        # will probably need this if gpu supports it for flex, other dtypes may not work correctly
+        dtype: bf16
+      model:
+       # huggingface model name or path
+        name_or_path: "/home/alex/SwarmUI/Models/diffusion_models/sd3.5_large.safetensors"
+        is_v3: true
+        quantize: true  # run 8bit mixed precision
+        max_grad_norm: 0.01
+        t5_max_length: 154
+        snr_gamma: 5
+        
+      sample:
+        sampler: "flowmatch" # must match train.noise_scheduler
+        sample_every: 250 # sample every this many steps
+        width: 1024
+        height: 1024
+        prompts:
+          # you can add [trigger] to the prompts here and it will be replaced with the trigger word
+#          - "[trigger] holding a sign that says 'I LOVE PROMPTS!'"\\
+          - " eri1024 nude woman with red hair, playing chess at the park, bomb going off in the background"
+          - "rachv1Sd3 ,a nude woman holding a coffee cup, in a beanie, sitting at a cafe"
+          - "rachv1Sd3a ,high-resolution photograph featuring a nude woman lying on her back on a beige-colored surface"
+          - "eri1024 Close-up shot of a fashion model with flawless makeup and a sharp gaze, captured in high-detail. she is styled with trendy accessories, with subtle lighting emphasizing her facial features and adding depth"
+          - "eri1024woman playing the guitar, on stage, singing a song, laser lights, punk rocker"
+          - " eri1024a photograph featuring a nude woman with long, wavy brown hair and fair skin, lounging on a white lounge chair on a balcony overlooking a cityscape at sunset, the eri1024 is of caucasian descent, with a slender physique and small breasts, she is wearing high-heeled brown sandals with a delicate, strappy design, her pose is relaxed, with her arms raised above her head, and her legs spread apart, revealing her toned legs, the balcony has a large glass window behind her, allowing a view of the cityscape and mountains outside, the sky is a gradient of soft pastel hues, transitioning from a deep blue at the top to a lighter lighter at the bottom, the floor is a light gray, and the overall setting appears to be a modern, high-rise building with a modern design, the lighting is soft and diffused, creating a warm and inviting atmosphere, the photograph captures a moment of relaxation and sensuality, emphasizing the natural beauty and tranquility of the subject"
+          - "eri1024 photo of a woman white background, medium shot, modeling clothing, studio lighting, white backdrop"
+          - "eri1024a nude woman holding a sign abover her head that says, 'this is a sign'"
+          - "eri1024a woman, in a post apocalyptic world, with a shotgun, in a leather jacket, in a desert, with a motorcycle"
+          - "eri1024 A fantasy-inspired, high-fashion gothic portrait of a porcelain-skinned woman with lace veils and white butterflies resting on her face and hair. Her lips are slightly parted with a smile, and she exudes an air of mystery and delicate beauty. Ornate floral decorations surround her, blending seamlessly into her flowing gown. Soft diffused lighting, high-definition textures, fantasy photography, hyperrealistic composition, intricate lace details, art nouveau aesthetic."
+          - "eri1024 a nude woman standing in a room with red walls. She has long, wavy brown hair and a slender, curvaceous physique with small breasts. Her skin is smooth, and she stands with one arm raised, resting her hand on her head, while the other arm hangs by her side. She is looking downward, possibly at her own body. The room features a large, framed mirror reflecting part of the room, and a wooden door to the right. The lighting is soft, creating a warm, intimate atmosphere. The overall mood is serene and contemplative."
+          - "eri1024 A woman is wearing a red and gold dress. She is sitting on a bench and playing a stringed instrument. There is a large moon behind her,masterpiece,best quality,(8k, RAW photo, best quality, masterpiece:1.2),(realistic, photo-realistic:1.37),stunning 8k fashion photo"
+
+        neg: ""  # not used on flex
+        seed: 42
+        walk_seed: true
+        guidance_scale: 4
+        sample_steps: 10  # Reduced to 10 for memory efficiency
+# you can add any additional meta info here. [name] is replaced with config name at top
+meta:
+  name: "[name]"
+  version: '1.0'

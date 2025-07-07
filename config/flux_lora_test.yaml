@@ -1,0 +1,47 @@
+job: extension
+config:
+  name: "flux_lora_test"
+  process:
+    - type: 'flux_lora_trainer'
+      device: cuda:0
+      low_vram: true
+      trigger_word: "style"
+      network:
+        type: "lora"
+        linear: 16          # LoRA rank
+        linear_alpha: 16    # LoRA alpha
+      save:
+        dtype: bfloat16
+        save_every: 100
+        max_step_saves_to_keep: 4
+      datasets:
+        - folder_path: "/home/alex/test_dataset"  # Update with actual path
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          shuffle_tokens: false
+          cache_latents_to_disk: true
+          resolution: [1024, 1024]
+      train:
+        batch_size: 1
+        steps: 1000
+        gradient_accumulation: 4
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        linear_timesteps: false  # Flux uses shifted sigmoid
+        bypass_guidance_embedding: true
+        warmup_steps: 100
+        save_every: 100
+        sample_every: 50
+        max_grad_norm: 1.0
+        dtype: bf16
+      model:
+        name_or_path: "/home/alex/SwarmUI/Models/diffusion_models/flux1-dev.safetensors"
+        is_flux: true
+        quantize: false  # For initial testing
+      output:
+        name: "flux_lora_output"
+        save_every: 100

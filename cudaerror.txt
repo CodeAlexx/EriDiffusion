@@ -1,0 +1,98 @@
+Here's how to add targeted debugging to pinpoint the exact failure:
+rust// Add this debug wrapper
+use candle_core::{Device, Tensor, Result};
+
+fn debug_cuda_op<F, T>(op_name: &str, op: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    println!("🔍 [CUDA OP] Starting: {}", op_name);
+    let start = std::time::Instant::now();
+    
+    match op() {
+        Ok(result) => {
+            println!("✅ [CUDA OP] {} succeeded in {:?}", op_name, start.elapsed());
+            Ok(result)
+        }
+        Err(e) => {
+            println!("❌ [CUDA OP] {} failed: {:?}", op_name, e);
+            println!("   Error type: {}", std::any::type_name_of_val(&e));
+            
+            // Check CUDA error code
+            if let Some(cuda_err) = e.downcast_ref::<candle_core::cuda::DriverError>() {
+                println!("   CUDA Error Code: {:?}", cuda_err);
+            }
+            
+            Err(e)
+        }
+    }
+}
+
+// In your forward pass
+impl Module for YourModel {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // Wrap each operation
+        let x = debug_cuda_op("input_projection", || {
+            self.input_proj.forward(x)
+        })?;
+        
+        let x = debug_cuda_op("layer_norm", || {
+            self.norm.forward(&x)
+        })?;
+        
+        // For attention layers
+        let x = debug_cuda_op("attention_qkv", || {
+            self.attn.to_qkv.forward(&x)
+        })?;
+        
+        let x = debug_cuda_op("attention_compute", || {
+            // This is often where Flash Attention fails
+            self.attn.compute_attention(&x)
+        })?;
+        
+        // For any tensor operations
+        let x = debug_cuda_op("reshape", || {
+            x.reshape(&[batch_size, seq_len, hidden_dim])
+        })?;
+        
+        let x = debug_cuda_op("transpose", || {
+            x.transpose(1, 2)?.contiguous()
+        })?;
+        
+        Ok(x)
+    }
+}
+
+// Also add CUDA device info
+fn print_cuda_info() -> Result<()> {
+    println!("\n🖥️  CUDA Environment:");
+    println!("  nvcc version: {}", std::process::Command::new("nvcc")
+        .arg("--version")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("unknown").to_string())
+        .unwrap_or_else(|_| "not found".to_string()));
+    
+    if let Ok(device) = Device::new_cuda(0) {
+        println!("  Device: {:?}", device);
+        
+        // Test basic ops
+        let test = Tensor::ones((2, 2), candle_core::DType::F32, &device)?;
+        println!("  Basic tensor creation: ✅");
+        
+        let _ = test.matmul(&test)?;
+        println!("  Basic matmul: ✅");
+    }
+    
+    // Check environment variables
+    println!("\n🔧 Candle Settings:");
+    for (key, value) in std::env::vars() {
+        if key.starts_with("CANDLE_") || key.starts_with("CUDA_") {
+            println!("  {}={}", key, value);
+        }
+    }
+    
+    Ok(())
+}
+
+// Call before your model
+print_cuda_info()?;

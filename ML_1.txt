@@ -1,0 +1,395 @@
+# Rust Vision ML Framework - Architecture Design
+
+## Core Architecture
+
+### 1. Tensor System
+
+```rust
+// Core tensor trait hierarchy
+pub trait Tensor: Send + Sync {
+    type Dtype: DType;
+    type Device: Device;
+    
+    fn shape(&self) -> &Shape;
+    fn strides(&self) -> &[usize];
+    fn device(&self) -> &Self::Device;
+    fn layout(&self) -> Layout;
+}
+
+// Specialized vision tensor with layout awareness
+pub struct VisionTensor<T: DType, D: Device> {
+    data: Storage<T, D>,
+    shape: Shape,
+    layout: Layout,
+    strides: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum Layout {
+    NCHW,  // Batch, Channels, Height, Width (default)
+    NHWC,  // Batch, Height, Width, Channels (optimized for some ops)
+    NCDHW, // Batch, Channels, Depth, Height, Width (video)
+    NDHWC, // Batch, Depth, Height, Width, Channels (video)
+}
+
+impl<T: DType, D: Device> VisionTensor<T, D> {
+    // Zero-copy view with different layout
+    pub fn with_layout(self, layout: Layout) -> Result<Self> {
+        match (self.layout, layout) {
+            (Layout::NCHW, Layout::NHWC) => self.transpose_axes(&[0, 2, 3, 1]),
+            // ... other conversions
+        }
+    }
+    
+    // Efficient slice operations for patches
+    pub fn extract_patches(&self, patch_size: usize, stride: usize) -> PatchIterator<T, D> {
+        PatchIterator::new(self, patch_size, stride)
+    }
+}
+```
+
+### 2. Device Abstraction
+
+```rust
+pub trait Device: Send + Sync + 'static {
+    type Storage<T: DType>: Storage<T>;
+    
+    fn allocate<T: DType>(&self, size: usize) -> Result<Self::Storage<T>>;
+    fn synchronize(&self) -> Result<()>;
+}
+
+pub struct Cuda {
+    device_id: u32,
+    stream: CudaStream,
+    memory_pool: MemoryPool,
+}
+
+pub struct Metal {
+    device: metal::Device,
+    command_queue: metal::CommandQueue,
+    memory_pool: MemoryPool,
+}
+
+// Automatic device selection
+pub fn best_available_device() -> Box<dyn Device> {
+    if cuda::is_available() { Box::new(Cuda::new(0)) }
+    else if metal::is_available() { Box::new(Metal::new()) }
+    else { Box::new(Cpu::new()) }
+}
+```
+
+### 3. Model Building API
+
+```rust
+// Clean model trait without builder boilerplate
+pub trait Model: Send + Sync {
+    fn forward(&self, input: &VisionTensor) -> Result<VisionTensor>;
+    fn parameters(&self) -> Vec<&Parameter>;
+    fn load_weights(&mut self, weights: WeightDict) -> Result<()>;
+}
+
+// Composable layers
+pub struct Conv2d {
+    weight: Parameter,
+    bias: Option<Parameter>,
+    config: Conv2dConfig,
+}
+
+pub struct MultiHeadAttention {
+    qkv_proj: Linear,
+    out_proj: Linear,
+    config: AttentionConfig,
+}
+
+// Type-safe model composition
+#[derive(Module)]
+pub struct VisionTransformer {
+    patch_embed: PatchEmbedding,
+    pos_embed: Parameter,
+    blocks: Vec<TransformerBlock>,
+    norm: LayerNorm,
+    head: Linear,
+}
+
+// Derive macro generates boilerplate
+impl Model for VisionTransformer {
+    fn forward(&self, x: &VisionTensor) -> Result<VisionTensor> {
+        let x = self.patch_embed.forward(x)?;
+        let x = x + &self.pos_embed;
+        
+        let mut x = x;
+        for block in &self.blocks {
+            x = block.forward(&x)?;
+        }
+        
+        self.head.forward(&self.norm.forward(&x)?)
+    }
+}
+```
+
+### 4. Weight Loading System
+
+```rust
+pub trait WeightLoader {
+    fn load(&self, path: &Path) -> Result<WeightDict>;
+    fn detect_architecture(&self, weights: &WeightDict) -> Option<Architecture>;
+}
+
+pub struct UnifiedLoader {
+    loaders: Vec<Box<dyn WeightLoader>>,
+    adapters: Vec<Box<dyn WeightAdapter>>,
+}
+
+impl UnifiedLoader {
+    pub fn load_into_model<M: Model>(&self, path: &Path, model: &mut M) -> Result<()> {
+        let weights = self.load(path)?;
+        
+        // Automatic weight name adaptation
+        let adapted = self.adapt_weights(&weights, model.weight_mapping())?;
+        
+        model.load_weights(adapted)?;
+        Ok(())
+    }
+}
+
+// Smart weight adaptation
+pub trait WeightAdapter {
+    fn can_adapt(&self, from: &str, to: &str) -> bool;
+    fn adapt(&self, name: &str) -> String;
+}
+
+pub struct PyTorchAdapter;
+impl WeightAdapter for PyTorchAdapter {
+    fn adapt(&self, name: &str) -> String {
+        // Convert PyTorch naming to our convention
+        name.replace("self_attn", "attention")
+            .replace("mlp.fc1", "ffn.linear1")
+            // ... more mappings
+    }
+}
+```
+
+### 5. Memory Management
+
+```rust
+pub struct MemoryPool {
+    free_blocks: BTreeMap<usize, Vec<MemoryBlock>>,
+    allocated: HashMap<*mut u8, MemoryBlock>,
+    high_water_mark: AtomicUsize,
+}
+
+impl MemoryPool {
+    pub fn allocate(&mut self, size: usize, alignment: usize) -> Result<MemoryBlock> {
+        // Try to reuse existing block
+        if let Some(block) = self.find_free_block(size, alignment) {
+            return Ok(block);
+        }
+        
+        // Allocate new block
+        self.allocate_new(size, alignment)
+    }
+    
+    pub fn enable_gradient_checkpointing(&mut self) {
+        // Mark certain tensors as recomputable
+    }
+}
+
+// Memory-mapped checkpoint support
+pub struct MappedCheckpoint {
+    mmap: memmap2::Mmap,
+    metadata: CheckpointMetadata,
+}
+
+impl MappedCheckpoint {
+    pub fn tensor(&self, name: &str) -> Result<VisionTensor<'_>> {
+        let info = self.metadata.tensors.get(name)?;
+        
+        // Zero-copy tensor view into mmap
+        VisionTensor::from_bytes(
+            &self.mmap[info.offset..info.offset + info.size],
+            info.shape.clone(),
+            info.dtype,
+        )
+    }
+}
+```
+
+### 6. Vision-Specific Operations
+
+```rust
+pub mod ops {
+    // Efficient convolution with automatic algorithm selection
+    pub fn conv2d(
+        input: &VisionTensor,
+        weight: &VisionTensor,
+        config: Conv2dConfig,
+    ) -> Result<VisionTensor> {
+        match input.device() {
+            Device::Cuda(_) => cuda_conv2d_optimized(input, weight, config),
+            Device::Metal(_) => metal_conv2d(input, weight, config),
+            _ => cpu_conv2d(input, weight, config),
+        }
+    }
+    
+    // Flash attention with automatic backend selection
+    pub fn attention(
+        q: &VisionTensor,
+        k: &VisionTensor,
+        v: &VisionTensor,
+        mask: Option<&VisionTensor>,
+    ) -> Result<VisionTensor> {
+        if flash_attention::is_available() {
+            flash_attention::forward(q, k, v, mask)
+        } else {
+            memory_efficient_attention(q, k, v, mask)
+        }
+    }
+    
+    // Vision-specific operations
+    pub fn extract_patches(input: &VisionTensor, patch_size: usize) -> Result<VisionTensor>;
+    pub fn pixel_shuffle(input: &VisionTensor, upscale_factor: usize) -> Result<VisionTensor>;
+    pub fn space_to_depth(input: &VisionTensor, block_size: usize) -> Result<VisionTensor>;
+}
+```
+
+### 7. Training API
+
+```rust
+pub struct Trainer<M: Model> {
+    model: M,
+    optimizer: Box<dyn Optimizer>,
+    config: TrainerConfig,
+    device: Box<dyn Device>,
+}
+
+impl<M: Model> Trainer<M> {
+    pub fn new(model: M) -> Self {
+        Self {
+            model,
+            optimizer: Box::new(AdamW::default()),
+            config: TrainerConfig::default(),
+            device: best_available_device(),
+        }
+    }
+    
+    pub fn batch_size(mut self, size: usize) -> Self {
+        self.config.batch_size = size;
+        self
+    }
+    
+    pub fn train(mut self, dataset: impl Dataset) -> Result<TrainingResult> {
+        let dataloader = DataLoader::new(dataset, self.config.batch_size);
+        
+        for epoch in 0..self.config.epochs {
+            for batch in dataloader {
+                let loss = self.training_step(batch)?;
+                self.optimizer.step(&mut self.model)?;
+            }
+        }
+        
+        Ok(TrainingResult { /* ... */ })
+    }
+}
+```
+
+### 8. LoRA Support
+
+```rust
+pub trait LoRAble: Model {
+    fn add_lora(&mut self, config: LoRAConfig) -> Result<()>;
+    fn merge_lora(&mut self) -> Result<()>;
+    fn disable_lora(&mut self);
+}
+
+pub struct LoRALayer {
+    base_weight: Parameter,
+    lora_a: Parameter,
+    lora_b: Parameter,
+    scale: f32,
+}
+
+impl LoRALayer {
+    pub fn forward(&self, input: &VisionTensor) -> Result<VisionTensor> {
+        let base_out = input.matmul(&self.base_weight)?;
+        
+        if self.is_enabled() {
+            let lora_out = input
+                .matmul(&self.lora_a)?
+                .matmul(&self.lora_b)?
+                .scale(self.scale)?;
+            base_out + lora_out
+        } else {
+            Ok(base_out)
+        }
+    }
+}
+```
+
+## Implementation Strategy
+
+### Phase 1: Core Foundation (Months 1-2)
+1. Implement basic tensor operations and memory management
+2. Create device abstraction for CPU and CUDA
+3. Build basic neural network layers (Linear, Conv2d, etc.)
+4. Implement SafeTensors loading
+
+### Phase 2: Vision Features (Months 3-4)
+1. Add specialized vision operations (patches, attention)
+2. Implement common vision architectures
+3. Add preprocessing pipelines
+4. Optimize memory layouts for vision workloads
+
+### Phase 3: Advanced Features (Months 5-6)
+1. Multi-GPU support
+2. Mixed precision training
+3. Advanced checkpoint formats (GGUF, etc.)
+4. LoRA/QLoRA implementation
+
+### Phase 4: Optimization (Months 7-8)
+1. Flash attention integration
+2. Kernel fusion for common patterns
+3. Memory pooling optimization
+4. Gradient checkpointing
+
+## Key Design Decisions
+
+1. **Type Safety**: Use Rust's type system to prevent common errors (shape mismatches, device mismatches)
+2. **Zero-Copy**: Design APIs to minimize memory copies, especially for large video tensors
+3. **Lazy Evaluation**: Option to build computation graphs for optimization
+4. **Plugin System**: Allow external backends and custom operations
+5. **Interop**: First-class support for Python interop via PyO3
+
+## Example Usage
+
+```rust
+use vision_ml::prelude::*;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Load a pre-trained model
+    let mut model = FluxModel::from_checkpoint("flux-dev.safetensors")?;
+    
+    // Add LoRA adaptation
+    model.add_lora(LoRAConfig {
+        rank: 32,
+        alpha: 16.0,
+        targets: vec!["attention", "mlp"],
+    })?;
+    
+    // Load and preprocess image
+    let image = Image::load("input.jpg")?
+        .resize(512, 512)?
+        .normalize(IMAGENET_MEAN, IMAGENET_STD)?
+        .to_tensor()?;
+    
+    // Run inference
+    let output = model.forward(&image)?;
+    
+    // Save result
+    output.to_image()?.save("output.jpg")?;
+    
+    Ok(())
+}
+```
+
+This framework prioritizes developer experience while maintaining performance, with a focus on the specific needs of vision models.

@@ -1,0 +1,265 @@
+You're right - the issue is a tensor naming mismatch. Looking at the error, the model is looking for double_blocks.0.img_mlp.w1.weight but can't find it. This suggests either:
+
+The model structure in your code doesn't match the actual Flux model
+The weight loading/translation is incomplete
+
+Here's what we need to fix:
+1. First, let's create a tensor name mapper:
+rust//! Flux model tensor name mapping utilities
+
+use std::collections::HashMap;
+use anyhow::Result;
+
+/// Maps tensor names from the saved model to what our implementation expects
+pub struct FluxTensorMapper {
+    mappings: HashMap<String, String>,
+}
+
+impl FluxTensorMapper {
+    pub fn new() -> Self {
+        let mut mappings = HashMap::new();
+        
+        // MLP mappings - Flux uses 'w1' and 'w2' for MLP layers
+        // Your code might expect 'fc1' and 'fc2' or similar
+        for i in 0..38 {  // Assuming 38 double blocks
+            // Image MLP
+            mappings.insert(
+                format!("double_blocks.{}.img_mlp.fc1.weight", i),
+                format!("double_blocks.{}.img_mlp.w1.weight", i),
+            );
+            mappings.insert(
+                format!("double_blocks.{}.img_mlp.fc2.weight", i),
+                format!("double_blocks.{}.img_mlp.w2.weight", i),
+            );
+            
+            // Text MLP
+            mappings.insert(
+                format!("double_blocks.{}.txt_mlp.fc1.weight", i),
+                format!("double_blocks.{}.txt_mlp.w1.weight", i),
+            );
+            mappings.insert(
+                format!("double_blocks.{}.txt_mlp.fc2.weight", i),
+                format!("double_blocks.{}.txt_mlp.w2.weight", i),
+            );
+        }
+        
+        // Add more mappings as needed
+        
+        Self { mappings }
+    }
+    
+    pub fn map_name(&self, expected_name: &str) -> String {
+        self.mappings.get(expected_name)
+            .cloned()
+            .unwrap_or_else(|| expected_name.to_string())
+    }
+    
+    pub fn reverse_map_name(&self, actual_name: &str) -> String {
+        // Find the key that maps to this value
+        self.mappings.iter()
+            .find(|(_, v)| *v == actual_name)
+            .map(|(k, _)| k.clone())
+            .unwrap_or_else(|| actual_name.to_string())
+    }
+}
+2. Create a diagnostic tool to inspect the actual tensor names:
+rust//! Diagnostic tool to inspect tensor names in safetensors files
+
+use safetensors::SafeTensors;
+use std::fs::File;
+use std::io::Read;
+use anyhow::Result;
+
+pub fn inspect_safetensors_keys(path: &str) -> Result<Vec<String>> {
+    let mut file = File::open(path)?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)?;
+    
+    let tensors = SafeTensors::deserialize(&buffer)?;
+    let mut keys: Vec<String> = tensors.names().into_iter().collect();
+    keys.sort();
+    
+    Ok(keys)
+}
+
+pub fn print_flux_structure(path: &str) -> Result<()> {
+    let keys = inspect_safetensors_keys(path)?;
+    
+    println!("=== Flux Model Structure ===");
+    
+    // Group by component
+    let mut double_blocks: Vec<String> = vec![];
+    let mut single_blocks: Vec<String> = vec![];
+    let mut other: Vec<String> = vec![];
+    
+    for key in keys {
+        if key.starts_with("double_blocks.") {
+            double_blocks.push(key);
+        } else if key.starts_with("single_blocks.") {
+            single_blocks.push(key);
+        } else {
+            other.push(key);
+        }
+    }
+    
+    println!("\nDouble Blocks (found {}):", double_blocks.len());
+    for key in double_blocks.iter().take(10) {
+        println!("  {}", key);
+    }
+    if double_blocks.len() > 10 {
+        println!("  ... and {} more", double_blocks.len() - 10);
+    }
+    
+    println!("\nSingle Blocks (found {}):", single_blocks.len());
+    for key in single_blocks.iter().take(10) {
+        println!("  {}", key);
+    }
+    
+    println!("\nOther tensors (found {}):", other.len());
+    for key in other.iter().take(10) {
+        println!("  {}", key);
+    }
+    
+    // Analyze MLP structure
+    println!("\n=== MLP Structure Analysis ===");
+    let mlp_keys: Vec<&String> = double_blocks.iter()
+        .filter(|k| k.contains("mlp"))
+        .take(5)
+        .collect();
+    
+    for key in mlp_keys {
+        println!("  {}", key);
+    }
+    
+    Ok(())
+}
+3. Update your model loading to handle the actual names:
+rust//! Updated Flux model loading with proper tensor mapping
+
+use candle_core::{Device, DType, Tensor};
+use safetensors::SafeTensors;
+use std::collections::HashMap;
+use anyhow::Result;
+
+pub struct FluxWeightLoader {
+    tensors: HashMap<String, Tensor>,
+    device: Device,
+    dtype: DType,
+}
+
+impl FluxWeightLoader {
+    pub fn new(safetensors_data: &[u8], device: Device, dtype: DType) -> Result<Self> {
+        let st = SafeTensors::deserialize(safetensors_data)?;
+        let mut tensors = HashMap::new();
+        
+        for (name, tensor_view) in st.tensors() {
+            let tensor = tensor_view.load(&device)?
+                .to_dtype(dtype)?;
+            tensors.insert(name.to_string(), tensor);
+        }
+        
+        Ok(Self { tensors, device, dtype })
+    }
+    
+    pub fn get_tensor(&self, name: &str) -> Result<&Tensor> {
+        // First try exact match
+        if let Some(tensor) = self.tensors.get(name) {
+            return Ok(tensor);
+        }
+        
+        // Try common variations
+        let variations = vec![
+            name.to_string(),
+            name.replace("fc1", "w1"),
+            name.replace("fc2", "w2"),
+            name.replace("w1", "fc1"),
+            name.replace("w2", "fc2"),
+            name.replace("to_out.0", "to_out_0"),
+            name.replace("to_out_0", "to_out.0"),
+        ];
+        
+        for variant in variations {
+            if let Some(tensor) = self.tensors.get(&variant) {
+                println!("Mapped {} -> {}", name, variant);
+                return Ok(tensor);
+            }
+        }
+        
+        // If still not found, print available keys that might match
+        let prefix = name.split('.').next().unwrap_or("");
+        let similar_keys: Vec<&String> = self.tensors.keys()
+            .filter(|k| k.starts_with(prefix))
+            .take(5)
+            .collect();
+            
+        anyhow::bail!(
+            "Cannot find tensor: {}\nSimilar keys: {:?}\nTotal keys: {}",
+            name, similar_keys, self.tensors.len()
+        )
+    }
+    
+    pub fn has_tensor(&self, name: &str) -> bool {
+        self.tensors.contains_key(name) ||
+        self.tensors.contains_key(&name.replace("fc1", "w1")) ||
+        self.tensors.contains_key(&name.replace("fc2", "w2"))
+    }
+    
+    pub fn list_keys(&self) -> Vec<&str> {
+        let mut keys: Vec<&str> = self.tensors.keys().map(|s| s.as_str()).collect();
+        keys.sort();
+        keys
+    }
+}
+4. Quick fix for your immediate issue:
+In your Flux model implementation, update the MLP layer names:
+rust// In your flux model file, change:
+pub struct FluxMLP {
+    pub fc1: Linear,  // Change to w1
+    pub fc2: Linear,  // Change to w2
+}
+
+// To:
+pub struct FluxMLP {
+    pub w1: Linear,   // Matches actual Flux naming
+    pub w2: Linear,   // Matches actual Flux naming
+}
+
+// And update the forward method accordingly
+impl FluxMLP {
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x = self.w1.forward(x)?;
+        let x = activation_function(x)?;  // GELU or whatever Flux uses
+        self.w2.forward(&x)
+    }
+}
+5. To diagnose and fix completely:
+rust// Add this to your main training script before loading weights
+pub fn diagnose_model_mismatch(model_path: &str) -> Result<()> {
+    println!("Inspecting model file: {}", model_path);
+    
+    let keys = inspect_safetensors_keys(model_path)?;
+    
+    // Look for MLP structure
+    let mlp_keys: Vec<&String> = keys.iter()
+        .filter(|k| k.contains("mlp"))
+        .collect();
+    
+    println!("\nMLP layer naming pattern:");
+    for key in mlp_keys.iter().take(10) {
+        println!("  {}", key);
+    }
+    
+    // Check if using w1/w2 or fc1/fc2
+    let uses_w1w2 = mlp_keys.iter().any(|k| k.contains(".w1.") || k.contains(".w2."));
+    let uses_fc = mlp_keys.iter().any(|k| k.contains(".fc1.") || k.contains(".fc2."));
+    
+    println!("\nNaming convention:");
+    println!("  Uses w1/w2: {}", uses_w1w2);
+    println!("  Uses fc1/fc2: {}", uses_fc);
+    
+    Ok(())
+}
+
+// Run this before training:
+diagnose_model_mismatch(&args.model_path)?;
+The issue is that Flux models use w1/w2 for MLP layers while your code expects different names. The quickest fix is to update your model structure to match the actual Flux naming convention.RetryClaude can make mistakes. Please double-check responses.Research Opus 4

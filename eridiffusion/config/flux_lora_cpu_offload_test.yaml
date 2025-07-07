@@ -1,0 +1,49 @@
+job: extension
+config:
+  name: "flux_lora_cpu_offload_test"
+  process:
+    - type: 'sd_trainer'
+      device: cuda:0
+      low_vram: true
+      trigger_word: "style"
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+      save:
+        dtype: float16
+        save_every: 100
+        max_step_saves_to_keep: 1
+      datasets:
+        - folder_path: "/home/alex/diffusers-rs/eridiffusion/test_dataset"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.0
+          shuffle_tokens: false
+          cache_latents_to_disk: true
+          resolution: [512, 768, 1024]
+      train:
+        batch_size: 1
+        steps: 10
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        dtype: bf16
+        bypass_guidance_embedding: true
+      model:
+        name_or_path: "/home/alex/SwarmUI/Models/diffusion_models/flux1-dev.safetensors"
+        is_flux: true
+        quantize: false
+        max_grad_norm: 1.0
+      sample:
+        sampler: "flowmatch"
+        sample_every: 5
+        width: 1024
+        height: 1024
+        prompts:
+          - "A majestic mountain landscape"
+        guidance_scale: 3.5
+        sample_steps: 20

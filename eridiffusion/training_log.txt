@@ -1,0 +1,830 @@
+warning: unused imports: `DType` and `Device`
+ --> crates/core/src/tensor.rs:4:34
+  |
+4 | use candle_core::{Tensor, Shape, Device, DType};
+  |                                  ^^^^^^  ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `Path`
+ --> crates/core/src/config.rs:7:17
+  |
+7 | use std::path::{Path, PathBuf};
+  |                 ^^^^
+
+warning: unused import: `VecDeque`
+ --> crates/core/src/memory.rs:7:43
+  |
+7 | use std::collections::{BTreeMap, HashMap, VecDeque};
+  |                                           ^^^^^^^^
+
+warning: unused import: `Shape`
+ --> crates/core/src/validation.rs:4:34
+  |
+4 | use candle_core::{Tensor, DType, Shape};
+  |                                  ^^^^^
+
+warning: unused import: `anyhow::Context as ErrorContext`
+ --> crates/core/src/cuda.rs:4:5
+  |
+4 | use anyhow::Context as ErrorContext;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> crates/core/src/cuda.rs:6:5
+  |
+6 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Module`
+ --> crates/core/src/model.rs:5:27
+  |
+5 | use candle_core::{Tensor, Module};
+  |                           ^^^^^^
+
+warning: unused variable: `event`
+  --> crates/core/src/plugin.rs:35:34
+   |
+35 |     async fn on_event(&mut self, event: PluginEvent) -> Result<()> {
+   |                                  ^^^^^ help: if this is intentional, prefix it with an underscore: `_event`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `batch_size`
+   --> crates/core/src/tensor.rs:290:14
+    |
+290 |         let (batch_size, num_heads, seq_len, head_dim) = self.dims4()
+    |              ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_batch_size`
+
+warning: unused variable: `num_heads`
+   --> crates/core/src/tensor.rs:290:26
+    |
+290 |         let (batch_size, num_heads, seq_len, head_dim) = self.dims4()
+    |                          ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_num_heads`
+
+warning: unused variable: `seq_len`
+   --> crates/core/src/tensor.rs:290:37
+    |
+290 |         let (batch_size, num_heads, seq_len, head_dim) = self.dims4()
+    |                                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_seq_len`
+
+warning: variable does not need to be mutable
+   --> crates/core/src/config.rs:100:46
+    |
+100 |     fn apply_env_overrides<T: Config>(&self, mut config: T) -> Result<T> {
+    |                                              ----^^^^^^
+    |                                              |
+    |                                              help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `device_id`
+   --> crates/core/src/memory.rs:258:26
+    |
+258 |             Device::Cuda(device_id) => {
+    |                          ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_device_id`
+
+warning: unused variable: `block`
+   --> crates/core/src/memory.rs:276:9
+    |
+276 |         block: MemoryBlock,
+    |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_block`
+
+warning: unused variable: `cuda_device`
+  --> crates/core/src/cuda.rs:44:28
+   |
+44 |         CandleDevice::Cuda(cuda_device) => {
+   |                            ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_cuda_device`
+
+warning: unused variable: `size`
+  --> crates/core/src/cuda.rs:38:5
+   |
+38 |     size: usize,
+   |     ^^^^ help: if this is intentional, prefix it with an underscore: `_size`
+
+warning: unused variable: `cuda_device`
+   --> crates/core/src/cuda.rs:114:28
+    |
+114 |         CandleDevice::Cuda(cuda_device) => {
+    |                            ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_cuda_device`
+
+warning: unused variable: `cuda_device`
+   --> crates/core/src/cuda.rs:128:31
+    |
+128 |     if let CandleDevice::Cuda(cuda_device) = device {
+    |                               ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_cuda_device`
+
+warning: unused variable: `shape`
+  --> crates/core/src/candle_utils.rs:59:9
+   |
+59 |         shape: &[usize],
+   |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_shape`
+
+warning: unused variable: `hints`
+  --> crates/core/src/candle_utils.rs:61:9
+   |
+61 |         hints: candle_nn::Init,
+   |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_hints`
+
+warning: unused variable: `dtype`
+  --> crates/core/src/candle_utils.rs:62:9
+   |
+62 |         dtype: DType,
+   |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_dtype`
+
+warning: unused variable: `device`
+  --> crates/core/src/candle_utils.rs:63:9
+   |
+63 |         device: &Device,
+   |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_device`
+
+warning: fields `purpose` and `allocated_at` are never read
+   --> crates/core/src/device.rs:104:9
+    |
+102 | struct AllocationInfo {
+    |        -------------- fields in this struct
+103 |     pub size: usize,
+104 |     pub purpose: String,
+    |         ^^^^^^^
+105 |     pub allocated_at: std::time::Instant,
+    |         ^^^^^^^^^^^^
+    |
+    = note: `AllocationInfo` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+    = note: `#[warn(dead_code)]` on by default
+
+warning: `eridiffusion-core` (lib) generated 23 warnings (run `cargo fix --lib -p eridiffusion-core` to apply 7 suggestions)
+   Compiling eridiffusion v0.1.0 (/home/alex/diffusers-rs/eridiffusion)
+warning: unused imports: `DType`, `D`, and `Device`
+ --> src/models/flux_lora/double_block.rs:6:43
+  |
+6 | use candle_core::{Tensor, Module, Result, Device, DType, D};
+  |                                           ^^^^^^  ^^^^^  ^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `ModulationOut`
+  --> src/models/flux_lora/double_block.rs:10:50
+   |
+10 | use super::modulation::{Modulation, Modulation2, ModulationOut, ModulationParams, apply_modulation};
+   |                                                  ^^^^^^^^^^^^^
+
+warning: unused imports: `GroupNorm` and `group_norm`
+  --> src/models/flux_lora/double_block.rs:14:18
+   |
+14 | use crate::ops::{GroupNorm, group_norm, get_2d_positions};
+   |                  ^^^^^^^^^  ^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+  --> src/models/flux_lora/model.rs:11:5
+   |
+11 | use std::sync::Arc;
+   |     ^^^^^^^^^^^^^^
+
+warning: unused imports: `DType` and `Device`
+ --> src/models/flux_lora/modulation.rs:5:43
+  |
+5 | use candle_core::{Tensor, Module, Result, Device, DType, D};
+  |                                           ^^^^^^  ^^^^^
+
+warning: unused imports: `DType` and `Device`
+ --> src/models/flux_lora/attention_rope.rs:5:43
+  |
+5 | use candle_core::{Tensor, Module, Result, Device, DType, D};
+  |                                           ^^^^^^  ^^^^^
+
+warning: unused import: `D`
+ --> src/models/flux_lora/attention_flux.rs:3:43
+  |
+3 | use candle_core::{Tensor, Module, Result, D};
+  |                                           ^
+
+warning: unused imports: `DType` and `Device`
+ --> src/models/flux_lora/lora_layers.rs:3:48
+  |
+3 | use candle_core::{Tensor, Module, Var, Result, Device, DType, D};
+  |                                                ^^^^^^  ^^^^^
+
+warning: unused imports: `CpuStorage`, `CustomOp1`, `D`, `Layout`, and `Shape`
+ --> src/ops/group_norm.rs:6:19
+  |
+6 | use candle_core::{CpuStorage, CustomOp1, Layout, Result, Shape, Tensor, DType, Device, D};
+  |                   ^^^^^^^^^^  ^^^^^^^^^  ^^^^^^          ^^^^^                         ^
+
+warning: unused import: `std::sync::Arc`
+ --> src/ops/group_norm.rs:7:5
+  |
+7 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused imports: `DevicePtrMut` and `DevicePtr`
+   --> src/ops/group_norm.rs:143:57
+    |
+143 |         use candle_core::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
+    |                                                         ^^^^^^^^^  ^^^^^^^^^^^^
+
+warning: unused import: `candle_core::cuda_backend::WrapErr`
+   --> src/ops/group_norm.rs:144:13
+    |
+144 |         use candle_core::cuda_backend::WrapErr;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `c_float` and `c_int`
+   --> src/ops/group_norm.rs:146:28
+    |
+146 |         use std::os::raw::{c_float, c_int};
+    |                            ^^^^^^^  ^^^^^
+
+warning: unused import: `D`
+ --> src/ops/rope.rs:6:50
+  |
+6 | use candle_core::{Device, Result, Tensor, DType, D};
+  |                                                  ^
+
+warning: unused import: `std::sync::Arc`
+ --> src/ops/rope.rs:7:5
+  |
+7 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `crate::kernels::cuda_kernels`
+  --> src/ops/rope.rs:50:25
+   |
+50 |                     use crate::kernels::cuda_kernels;
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `candle_core::cuda_backend::WrapErr`
+  --> src/ops/rope.rs:51:25
+   |
+51 |                     use candle_core::cuda_backend::WrapErr;
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `c_float` and `c_int`
+  --> src/ops/rope.rs:52:40
+   |
+52 |                     use std::os::raw::{c_float, c_int};
+   |                                        ^^^^^^^  ^^^^^
+
+warning: unused import: `crate::kernels::cuda_kernels`
+   --> src/ops/rope.rs:165:13
+    |
+165 |         use crate::kernels::cuda_kernels;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `candle_core::cuda_backend::WrapErr`
+   --> src/ops/rope.rs:166:13
+    |
+166 |         use candle_core::cuda_backend::WrapErr;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `c_float` and `c_int`
+   --> src/ops/rope.rs:167:28
+    |
+167 |         use std::os::raw::{c_float, c_int};
+    |                            ^^^^^^^  ^^^^^
+
+warning: unused import: `text_encoders::TextEncoders`
+  --> src/trainers/sd35_lokr.rs:10:89
+   |
+10 | use super::{Config, ProcessConfig, NetworkConfig, SaveConfig, TrainConfig, ModelConfig, text_encoders::TextEncoders, real_tokenizers::Rea...
+   |                                                                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `DType` and `D`
+ --> src/trainers/mmdit_loader.rs:2:19
+  |
+2 | use candle_core::{DType, Device, Tensor, D};
+  |                   ^^^^^                  ^
+
+warning: unused import: `RmsNorm`
+ --> src/trainers/mmdit_loader.rs:6:29
+  |
+6 | use super::rms_norm_patch::{RmsNorm, verify_gpu_rms_norm};
+  |                             ^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> src/trainers/cuda_rms_norm.rs:3:5
+  |
+3 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `std::thread`
+  --> src/trainers/text_encoder_cached.rs:11:5
+   |
+11 | use std::thread;
+   |     ^^^^^^^^^^^
+
+warning: unused import: `std::time::Duration`
+  --> src/trainers/text_encoder_cached.rs:12:5
+   |
+12 | use std::time::Duration;
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `D`
+ --> src/trainers/sampling.rs:2:50
+  |
+2 | use candle_core::{Device, Tensor, DType, Module, D};
+  |                                                  ^
+
+warning: unused import: `Context`
+ --> src/trainers/flux_lora.rs:9:22
+  |
+9 | use anyhow::{Result, Context};
+  |                      ^^^^^^^
+
+warning: unused import: `D`
+  --> src/trainers/flux_lora.rs:10:47
+   |
+10 | use candle_core::{Tensor, Device, DType, Var, D};
+   |                                               ^
+
+warning: unused import: `safetensors`
+  --> src/trainers/flux_lora.rs:13:5
+   |
+13 | use safetensors;
+   |     ^^^^^^^^^^^
+
+warning: unused import: `Duration`
+  --> src/trainers/flux_lora.rs:17:26
+   |
+17 | use std::time::{Instant, Duration};
+   |                          ^^^^^^^^
+
+warning: unused imports: `ImageBuffer` and `Rgb`
+  --> src/trainers/flux_lora.rs:19:27
+   |
+19 | use image::{DynamicImage, ImageBuffer, Rgb};
+   |                           ^^^^^^^^^^^  ^^^
+
+warning: unused import: `tokenizers::Tokenizer`
+  --> src/trainers/flux_lora.rs:20:5
+   |
+20 | use tokenizers::Tokenizer;
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ModelType`
+  --> src/trainers/flux_lora.rs:26:36
+   |
+26 | use super::{Config, ProcessConfig, ModelType};
+   |                                    ^^^^^^^^^
+
+warning: unused import: `eridiffusion_core::ModelInputs`
+  --> src/trainers/flux_lora.rs:31:5
+   |
+31 | use eridiffusion_core::ModelInputs;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `BlockType`
+  --> src/trainers/flux_lora.rs:36:40
+   |
+36 |     BlockSwapManager, BlockSwapConfig, BlockType
+   |                                        ^^^^^^^^^
+
+warning: unused import: `Tensor`
+  --> src/trainers/flux_data_loader.rs:10:27
+   |
+10 | use candle_core::{Device, Tensor};
+   |                           ^^^^^^
+
+warning: unused imports: `ImageBuffer` and `Rgb`
+  --> src/trainers/flux_data_loader.rs:11:27
+   |
+11 | use image::{DynamicImage, ImageBuffer, Rgb};
+   |                           ^^^^^^^^^^^  ^^^
+
+warning: unused import: `Path`
+  --> src/trainers/flux_data_loader.rs:12:17
+   |
+12 | use std::path::{Path, PathBuf};
+   |                 ^^^^
+
+warning: unused import: `Context`
+ --> src/trainers/flux_sampling.rs:6:22
+  |
+6 | use anyhow::{Result, Context};
+  |                      ^^^^^^^
+
+warning: unused imports: `DType` and `D`
+ --> src/trainers/flux_sampling.rs:7:35
+  |
+7 | use candle_core::{Tensor, Device, DType, D};
+  |                                   ^^^^^  ^
+
+warning: unused import: `MemoryError`
+ --> src/memory/pool.rs:3:44
+  |
+3 | use super::cuda_allocator::{CudaAllocator, MemoryError, Result};
+  |                                            ^^^^^^^^^^^
+
+warning: unused import: `Arc`
+ --> src/memory/pool.rs:6:17
+  |
+6 | use std::sync::{Arc, RwLock};
+  |                 ^^^
+
+warning: unused import: `std::ptr`
+ --> src/memory/cuda_allocator.rs:3:5
+  |
+3 | use std::ptr;
+  |     ^^^^^^^^
+
+warning: variant `FP8_E4M3` should have an upper camel case name
+  --> src/memory/config.rs:33:5
+   |
+33 |     FP8_E4M3, // FP8 with 4-bit exponent, 3-bit mantissa
+   |     ^^^^^^^^ help: convert the identifier to upper camel case: `Fp8E4m3`
+   |
+   = note: `#[warn(non_camel_case_types)]` on by default
+
+warning: variant `FP8_E5M2` should have an upper camel case name
+  --> src/memory/config.rs:34:5
+   |
+34 |     FP8_E5M2, // FP8 with 5-bit exponent, 2-bit mantissa
+   |     ^^^^^^^^ help: convert the identifier to upper camel case: `Fp8E5m2`
+
+warning: unused import: `Arc`
+ --> src/memory/block_swapping.rs:5:17
+  |
+5 | use std::sync::{Arc, Mutex, RwLock};
+  |                 ^^^
+
+warning: unused import: `Duration`
+ --> src/memory/block_swapping.rs:6:17
+  |
+6 | use std::time::{Duration, Instant};
+  |                 ^^^^^^^^
+
+warning: unused imports: `DiffusionConfig`, `MemoryFormat`, `PrecisionMode`, `cuda_allocator::MemoryError`, and `cuda`
+  --> src/memory/block_swapping.rs:16:5
+   |
+16 |     cuda_allocator::MemoryError, cuda, PrecisionMode,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^  ^^^^^^^^^^^^^
+17 |     MemoryFormat, DiffusionConfig,
+   |     ^^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+
+warning: unused imports: `PrecisionMode` and `cuda_allocator::MemoryError`
+ --> src/memory/model_blocks.rs:4:13
+  |
+4 | use super::{cuda_allocator::MemoryError, PrecisionMode, MemoryFormat};
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^
+
+warning: unused import: `anyhow::Result`
+ --> src/memory/model_blocks.rs:5:5
+  |
+5 | use anyhow::Result;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `crate::memory::config::PrecisionMode`
+  --> src/memory/mod.rs:87:9
+   |
+87 |     use crate::memory::config::PrecisionMode;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `D`
+ --> src/networks/lora.rs:5:50
+  |
+5 | use candle_core::{Device, DType, Module, Tensor, D};
+  |                                                  ^
+
+warning: unused import: `D`
+ --> src/networks/sd_lora.rs:5:50
+  |
+5 | use candle_core::{Device, DType, Module, Tensor, D};
+  |                                                  ^
+
+warning: unused imports: `Init`, `VarBuilder`, and `VarMap`
+ --> src/networks/sd_lora.rs:6:17
+  |
+6 | use candle_nn::{Init, VarBuilder, VarMap};
+  |                 ^^^^  ^^^^^^^^^^  ^^^^^^
+
+error[E0277]: cannot subtract `{float}` from `std::result::Result<candle_core::Tensor, candle_core::Error>`
+  --> src/models/flux_vae.rs:33:26
+   |
+33 |         let x = (x * 2.0 - 1.0)?;
+   |                          ^ no implementation for `std::result::Result<candle_core::Tensor, candle_core::Error> - {float}`
+   |
+   = help: the trait `std::ops::Sub<{float}>` is not implemented for `std::result::Result<candle_core::Tensor, candle_core::Error>`
+   = help: the following other types implement trait `std::ops::Sub<Rhs>`:
+             `std::result::Result<B, candle_core::Error>` implements `std::ops::Sub<&candle_core::Tensor>`
+             `std::result::Result<B, candle_core::Error>` implements `std::ops::Sub<candle_core::Tensor>`
+
+warning: unused import: `Module`
+ --> src/networks/sd_lora.rs:5:34
+  |
+5 | use candle_core::{Device, DType, Module, Tensor, D};
+  |                                  ^^^^^^
+
+warning: unused import: `DiffusionModel`
+  --> src/trainers/flux_sampling.rs:15:38
+   |
+15 | use eridiffusion_core::{ModelInputs, DiffusionModel};
+   |                                      ^^^^^^^^^^^^^^
+
+warning: unused import: `Module`
+ --> src/models/flux_lora/attention_flux.rs:3:27
+  |
+3 | use candle_core::{Tensor, Module, Result, D};
+  |                           ^^^^^^
+
+warning: unused import: `Module`
+  --> src/trainers/rms_norm_patch.rs:70:23
+   |
+70 |     use candle_core::{Module as _, Result};
+   |                       ^^^^^^
+
+warning: unused import: `Module`
+ --> src/trainers/mmdit_loader.rs:3:17
+  |
+3 | use candle_nn::{Module, VarBuilder};
+  |                 ^^^^^^
+
+warning: unused variable: `batch_size`
+   --> src/models/flux_lora/double_block.rs:205:13
+    |
+205 |         let batch_size = img.dim(0)?;
+    |             ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_batch_size`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `positions`
+   --> src/models/flux_lora/double_block.rs:212:13
+    |
+212 |         let positions = get_2d_positions(img_height / 2, img_width / 2, device)?;
+    |             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_positions`
+
+warning: variable does not need to be mutable
+  --> src/models/flux_lora/tensor_mapping.rs:14:13
+   |
+14 |         let mut mappings = HashMap::new();
+   |             ----^^^^^^^^
+   |             |
+   |             help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `rank`
+  --> src/models/flux_lora/save_lora.rs:75:17
+   |
+75 |             let rank = lora_a.dims()[1]; // lora_a: [in_features, rank]
+   |                 ^^^^ help: if this is intentional, prefix it with an underscore: `_rank`
+
+warning: unused variable: `end`
+  --> src/models/flux_lora/save_lora.rs:82:21
+   |
+82 |                 let end = (idx + 1) * split_size;
+   |                     ^^^ help: if this is intentional, prefix it with an underscore: `_end`
+
+warning: unused variable: `dtype`
+   --> src/models/flux_lora/weight_translator.rs:164:5
+    |
+164 |     dtype: DType,
+    |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_dtype`
+
+warning: unused variable: `device`
+   --> src/ops/group_norm.rs:147:13
+    |
+147 |         let device = x.device().as_cuda_device()?;
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_device`
+
+warning: unused variable: `x_layout`
+   --> src/ops/group_norm.rs:150:25
+    |
+150 |         let (x_storage, x_layout) = x.storage_and_layout();
+    |                         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_x_layout`
+
+warning: unused variable: `x_storage`
+   --> src/ops/group_norm.rs:151:13
+    |
+151 |         let x_storage = match &*x_storage {
+    |             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_x_storage`
+
+warning: unused variable: `output_storage`
+   --> src/ops/group_norm.rs:157:13
+    |
+157 |         let output_storage = match &*output_storage {
+    |             ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_output_storage`
+
+warning: unused variable: `mean_storage`
+   --> src/ops/group_norm.rs:163:13
+    |
+163 |         let mean_storage = match &*mean_storage {
+    |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mean_storage`
+
+warning: unused variable: `rstd_storage`
+   --> src/ops/group_norm.rs:169:13
+    |
+169 |         let rstd_storage = match &*rstd_storage {
+    |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_rstd_storage`
+
+warning: unused variable: `cos_storage`
+  --> src/ops/rope.rs:54:25
+   |
+54 |                     let cos_storage = cos_cache.storage_and_layout().0;
+   |                         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_cos_storage`
+
+warning: unused variable: `sin_storage`
+  --> src/ops/rope.rs:55:25
+   |
+55 |                     let sin_storage = sin_cache.storage_and_layout().0;
+   |                         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_sin_storage`
+
+warning: unused variable: `output`
+   --> src/ops/rope.rs:169:13
+    |
+169 |         let output = Tensor::zeros_like(x)?;
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_output`
+
+warning: unused variable: `batch_size`
+   --> src/ops/rope.rs:159:9
+    |
+159 |         batch_size: usize,
+    |         ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_batch_size`
+
+warning: unused variable: `seq_len`
+   --> src/ops/rope.rs:160:9
+    |
+160 |         seq_len: usize,
+    |         ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_seq_len`
+
+warning: unused variable: `num_heads`
+   --> src/ops/rope.rs:161:9
+    |
+161 |         num_heads: usize,
+    |         ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_num_heads`
+
+warning: unused variable: `head_dim`
+   --> src/ops/rope.rs:162:9
+    |
+162 |         head_dim: usize,
+    |         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_head_dim`
+
+warning: unused variable: `output`
+   --> src/ops/rope.rs:189:17
+    |
+189 |         let mut output = x.zeros_like()?;
+    |                 ^^^^^^ help: if this is intentional, prefix it with an underscore: `_output`
+
+warning: unused variable: `rot0`
+   --> src/ops/rope.rs:214:29
+    |
+214 |                         let rot0 = x0 * cos_val - x1 * sin_val;
+    |                             ^^^^ help: if this is intentional, prefix it with an underscore: `_rot0`
+
+warning: unused variable: `rot1`
+   --> src/ops/rope.rs:215:29
+    |
+215 |                         let rot1 = x0 * sin_val + x1 * cos_val;
+    |                             ^^^^ help: if this is intentional, prefix it with an underscore: `_rot1`
+
+warning: variable does not need to be mutable
+   --> src/ops/rope.rs:189:13
+    |
+189 |         let mut output = x.zeros_like()?;
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: unused variable: `name`
+   --> src/trainers/sd35_lokr.rs:302:18
+    |
+302 |             for (name, lokr) in &self.lokr_layers {
+    |                  ^^^^ help: if this is intentional, prefix it with an underscore: `_name`
+
+warning: unused variable: `vae_cpu`
+   --> src/trainers/sd35_lokr.rs:575:25
+    |
+575 |             if let Some(vae_cpu) = &self.vae_cpu {
+    |                         ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_vae_cpu`
+
+warning: unused variable: `sample_config`
+    --> src/trainers/sd35_lokr.rs:1082:25
+     |
+1082 |         if let Some(ref sample_config) = self.sample_config {
+     |                         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_sample_config`
+
+warning: unused variable: `text_embeds_cache`
+    --> src/trainers/sd35_lokr.rs:1269:9
+     |
+1269 |         text_embeds_cache: &HashMap<usize, Tensor>,
+     |         ^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_text_embeds_cache`
+
+warning: unused variable: `pooled_embeds_cache`
+    --> src/trainers/sd35_lokr.rs:1270:9
+     |
+1270 |         pooled_embeds_cache: &HashMap<usize, Tensor>,
+     |         ^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_pooled_embeds_cache`
+
+warning: unused variable: `device`
+  --> src/trainers/mmdit_loader.rs:12:5
+   |
+12 |     device: &Device,
+   |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_device`
+
+warning: unused variable: `t5_path`
+  --> src/trainers/real_tokenizers.rs:52:9
+   |
+52 |         t5_path: &str,
+   |         ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_t5_path`
+
+warning: unused variable: `batch_size`
+  --> src/trainers/sampling.rs:37:13
+   |
+37 |         let batch_size = prompts.len();
+   |             ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_batch_size`
+
+warning: unused variable: `mmdit`
+   --> src/trainers/sampling.rs:146:9
+    |
+146 |         mmdit: &impl Module,
+    |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_mmdit`
+
+warning: unused variable: `timestep`
+   --> src/trainers/sampling.rs:148:9
+    |
+148 |         timestep: &Tensor,
+    |         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_timestep`
+
+warning: unused variable: `context`
+   --> src/trainers/sampling.rs:149:9
+    |
+149 |         context: &Tensor,
+    |         ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_context`
+
+warning: unused variable: `pooled`
+   --> src/trainers/sampling.rs:150:9
+    |
+150 |         pooled: &Tensor,
+    |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_pooled`
+
+warning: unused variable: `channels`
+   --> src/trainers/sampling.rs:167:14
+    |
+167 |         let (channels, height, width) = (3, 1024, 1024); // SD3.5 default
+    |              ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_channels`
+
+warning: unused variable: `pool_config`
+   --> src/trainers/flux_lora.rs:188:13
+    |
+188 |         let pool_config = MemoryPoolConfig::flux_24gb();
+    |             ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_pool_config`
+
+warning: unused variable: `swap_manager`
+   --> src/trainers/flux_lora.rs:509:38
+    |
+509 |         let output = if let Some(ref swap_manager) = self.block_swap_manager {
+    |                                      ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_swap_manager`
+
+warning: unused variable: `config`
+   --> src/trainers/flux_lora.rs:977:24
+    |
+977 | pub fn train_flux_lora(config: &Config, process_config: &ProcessConfig) -> Result<()> {
+    |                        ^^^^^^ help: if this is intentional, prefix it with an underscore: `_config`
+
+warning: variable does not need to be mutable
+   --> src/trainers/flux_data_loader.rs:251:29
+    |
+251 |     fn prepare_image(&self, mut img: DynamicImage, target_resolution: (usize, usize)) -> Result<DynamicImage> {
+    |                             ----^^^
+    |                             |
+    |                             help: remove this `mut`
+
+warning: unused variable: `seed`
+   --> src/trainers/flux_sampling.rs:126:39
+    |
+126 |         let mut latents = if let Some(seed) = self.config.seed {
+    |                                       ^^^^ help: if this is intentional, prefix it with an underscore: `_seed`
+
+warning: unused variable: `sampler`
+   --> src/trainers/flux_sampling.rs:279:13
+    |
+279 |         let sampler = FluxSampler::new(sampling_config, self.device().clone());
+    |             ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_sampler`
+
+warning: unused variable: `step`
+   --> src/trainers/flux_sampling.rs:274:9
+    |
+274 |         step: usize,
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_step`
+
+warning: unused variable: `output_dir`
+   --> src/trainers/flux_sampling.rs:275:9
+    |
+275 |         output_dir: &Path,
+    |         ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_output_dir`
+
+warning: unnecessary `unsafe` block
+  --> src/memory/cuda_allocator.rs:56:9
+   |
+56 |         unsafe {
+   |         ^^^^^^ unnecessary `unsafe` block
+   |
+   = note: `#[warn(unused_unsafe)]` on by default
+
+warning: unused variable: `lora`
+   --> src/networks/lora.rs:247:24
+    |
+247 |        if let Some(ref lora) = self.lora {
+    |                        ^^^^ help: if this is intentional, prefix it with an underscore: `_lora`
+
+For more information about this error, try `rustc --explain E0277`.
+warning: `eridiffusion` (lib) generated 107 warnings
+error: could not compile `eridiffusion` (lib) due to 1 previous error; 107 warnings emitted

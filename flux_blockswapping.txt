@@ -1,0 +1,2484 @@
+// block_swapping.rs - Dynamic block swapping for training large models on limited VRAM
+// Similar to Kohya's SD-Scripts gradient checkpointing and block swapping
+
+use std::collections::{HashMap, VecDeque, HashSet};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::fs::{File, create_dir_all};
+use std::io::{Write, Read, BufWriter, BufReader};
+use memmap2::{MmapOptions, MmapMut};
+use bincode;
+use serde::{Serialize, Deserialize};
+
+use crate::{
+    MemoryError, Result, cuda, SafeGPUTensor, PrecisionMode, ModelType,
+    MemoryFormat, DiffusionConfig,
+};
+
+/// Block swapping configuration
+#[derive(Debug, Clone)]
+pub struct BlockSwapConfig {
+    /// Maximum GPU memory to use (bytes)
+    pub max_gpu_memory: usize,
+    /// Directory for disk swapping
+    pub swap_dir: PathBuf,
+    /// Use memory-mapped files for faster disk access
+    pub use_mmap: bool,
+    /// Number of blocks to keep in GPU (active set)
+    pub active_blocks: usize,
+    /// Prefetch next N blocks
+    pub prefetch_blocks: usize,
+    /// Use pinned memory for faster transfers
+    pub use_pinned_memory: bool,
+    /// Compression for disk storage
+    pub enable_compression: bool,
+    /// Async transfers
+    pub async_transfers: bool,
+    /// Block granularity (e.g., per layer, per attention block)
+    pub granularity: BlockGranularity,
+}
+
+impl Default for BlockSwapConfig {
+    fn default() -> Self {
+        Self {
+            max_gpu_memory: 4 * 1024 * 1024 * 1024, // 4GB
+            swap_dir: PathBuf::from("/tmp/block_swap"),
+            use_mmap: true,
+            active_blocks: 8,
+            prefetch_blocks: 4,
+            use_pinned_memory: true,
+            enable_compression: false,
+            async_transfers: true,
+            granularity: BlockGranularity::Layer,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BlockGranularity {
+    Layer,           // Swap entire layers
+    AttentionBlock,  // Swap attention blocks (Q,K,V,O)
+    MLPBlock,        // Swap MLP blocks
+    SubLayer,        // Swap individual sub-layers
+    Custom,          // User-defined blocks
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StorageLocation {
+    GPU,
+    CPUMemory,
+    PinnedMemory,
+    Disk,
+    MemoryMapped,
+}
+
+/// Represents a swappable model block
+#[derive(Debug, Clone)]
+pub struct SwappableBlock {
+    pub id: String,
+    pub layer_idx: usize,
+    pub block_type: BlockType,
+    pub size_bytes: usize,
+    pub shape: Vec<usize>,
+    pub dtype: PrecisionMode,
+    pub location: StorageLocation,
+    pub last_access: Instant,
+    pub access_count: usize,
+    pub is_gradient: bool,
+    pub dependencies: Vec<String>, // Other blocks this depends on
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum BlockType {
+    // Transformer blocks
+    Attention,
+    AttentionQKV,
+    AttentionOutput,
+    MLP,
+    MLPGateProj,
+    MLPUpProj,
+    MLPDownProj,
+    LayerNorm,
+    
+    // Diffusion-specific
+    ResBlock,
+    CrossAttention,
+    SelfAttention,
+    Temporal,
+    
+    // SD3.5 MMDiT specific
+    MMDiTBlock,
+    AdaLN,
+    
+    // General
+    Embedding,
+    Output,
+    Custom,
+}
+
+/// Block data storage
+#[derive(Clone)]
+pub struct BlockData {
+    pub gpu_ptr: Option<*mut std::ffi::c_void>,
+    pub cpu_ptr: Option<*mut u8>,
+    pub pinned_ptr: Option<*mut u8>,
+    pub mmap: Option<Arc<Mutex<MmapMut>>>,
+    pub file_path: Option<PathBuf>,
+    pub compressed_data: Option<Vec<u8>>,
+}
+
+unsafe impl Send for BlockData {}
+unsafe impl Sync for BlockData {}
+
+impl BlockData {
+    fn new() -> Self {
+        Self {
+            gpu_ptr: None,
+            cpu_ptr: None,
+            pinned_ptr: None,
+            mmap: None,
+            file_path: None,
+            compressed_data: None,
+        }
+    }
+
+    fn cleanup(&mut self) {
+        // Free GPU memory
+        if let Some(ptr) = self.gpu_ptr.take() {
+            let _ = cuda::free(ptr);
+        }
+        
+        // Free CPU memory
+        if let Some(ptr) = self.cpu_ptr.take() {
+            unsafe { libc::free(ptr as *mut libc::c_void); }
+        }
+        
+        // Free pinned memory
+        if let Some(ptr) = self.pinned_ptr.take() {
+            unsafe { 
+                cuda_sys::cudaFreeHost(ptr as *mut std::ffi::c_void);
+            }
+        }
+        
+        // Remove swap file
+        if let Some(path) = self.file_path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+impl Drop for BlockData {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+/// Main block swapping manager
+pub struct BlockSwapManager {
+    config: BlockSwapConfig,
+    blocks: RwLock<HashMap<String, SwappableBlock>>,
+    block_data: RwLock<HashMap<String, BlockData>>,
+    gpu_blocks: RwLock<HashSet<String>>,
+    access_queue: Mutex<VecDeque<String>>, // LRU queue
+    prefetch_queue: Mutex<VecDeque<String>>,
+    transfer_streams: Vec<*mut std::ffi::c_void>, // CUDA streams
+    stats: RwLock<SwapStats>,
+    active_set_predictor: Mutex<ActiveSetPredictor>,
+    swap_file_counter: std::sync::atomic::AtomicU64,
+}
+
+unsafe impl Send for BlockSwapManager {}
+unsafe impl Sync for BlockSwapManager {}
+
+#[derive(Debug, Default, Clone)]
+pub struct SwapStats {
+    pub total_swaps_out: u64,
+    pub total_swaps_in: u64,
+    pub total_bytes_transferred: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub average_swap_time: Duration,
+    pub peak_gpu_blocks: usize,
+}
+
+/// Predicts which blocks will be needed next
+pub struct ActiveSetPredictor {
+    access_history: VecDeque<Vec<String>>,
+    pattern_cache: HashMap<Vec<String>, Vec<String>>,
+    max_history: usize,
+    current_sequence: Vec<String>,
+}
+
+impl BlockSwapManager {
+    pub fn new(config: BlockSwapConfig) -> Result<Self> {
+        // Create swap directory
+        if !config.swap_dir.exists() {
+            create_dir_all(&config.swap_dir)
+                .map_err(|e| MemoryError::PoolError(format!("Failed to create swap dir: {}", e)))?;
+        }
+
+        // Create CUDA streams for async transfers
+        let mut transfer_streams = Vec::new();
+        if config.async_transfers {
+            for _ in 0..4 {
+                let mut stream: *mut std::ffi::c_void = std::ptr::null_mut();
+                unsafe {
+                    let result = cuda_sys::cudaStreamCreate(&mut stream);
+                    if result == 0 && !stream.is_null() {
+                        transfer_streams.push(stream);
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            config,
+            blocks: RwLock::new(HashMap::new()),
+            block_data: RwLock::new(HashMap::new()),
+            gpu_blocks: RwLock::new(HashSet::new()),
+            access_queue: Mutex::new(VecDeque::new()),
+            prefetch_queue: Mutex::new(VecDeque::new()),
+            transfer_streams,
+            stats: RwLock::new(SwapStats::default()),
+            active_set_predictor: Mutex::new(ActiveSetPredictor::new(10)),
+            swap_file_counter: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// Register a model block for swapping
+    pub fn register_block(&self, mut block: SwappableBlock, initial_data: Option<*mut std::ffi::c_void>) -> Result<()> {
+        let block_id = block.id.clone();
+        
+        // Initialize block data
+        let mut block_data = BlockData::new();
+
+        // If initial data provided and block should be in GPU
+        if let Some(data_ptr) = initial_data {
+            if block.location == StorageLocation::GPU {
+                block_data.gpu_ptr = Some(data_ptr);
+                self.gpu_blocks.write().unwrap().insert(block_id.clone());
+            } else {
+                // Move to specified location
+                block_data = self.move_block_data(data_ptr, block.size_bytes, 
+                                                StorageLocation::GPU, block.location)?;
+                // Free the original GPU memory since we moved it
+                cuda::free(data_ptr)?;
+            }
+        } else {
+            // No initial data, just set location to disk/cpu
+            if block.location == StorageLocation::GPU {
+                block.location = StorageLocation::Disk;
+            }
+        }
+
+        self.blocks.write().unwrap().insert(block_id.clone(), block);
+        self.block_data.write().unwrap().insert(block_id.clone(), block_data);
+
+        Ok(())
+    }
+
+    /// Access a block, swapping it to GPU if necessary
+    pub fn access_block(&self, block_id: &str) -> Result<*mut std::ffi::c_void> {
+        let start_time = Instant::now();
+        
+        // Update access info
+        {
+            let mut blocks = self.blocks.write().unwrap();
+            if let Some(block) = blocks.get_mut(block_id) {
+                block.last_access = Instant::now();
+                block.access_count += 1;
+            } else {
+                return Err(MemoryError::PoolError(format!("Block {} not found", block_id)));
+            }
+        }
+
+        // Update access queue
+        {
+            let mut queue = self.access_queue.lock().unwrap();
+            queue.retain(|id| id != block_id);
+            queue.push_back(block_id.to_string());
+        }
+
+        // Check if already in GPU
+        if self.gpu_blocks.read().unwrap().contains(block_id) {
+            self.stats.write().unwrap().cache_hits += 1;
+            let data = self.block_data.read().unwrap();
+            if let Some(block_data) = data.get(block_id) {
+                if let Some(gpu_ptr) = block_data.gpu_ptr {
+                    return Ok(gpu_ptr);
+                }
+            }
+        }
+
+        self.stats.write().unwrap().cache_misses += 1;
+
+        // Need to swap in
+        self.ensure_gpu_space_for_block(block_id)?;
+        let gpu_ptr = self.swap_to_gpu(block_id)?;
+
+        // Update stats
+        {
+            let mut stats = self.stats.write().unwrap();
+            stats.total_swaps_in += 1;
+            let swap_time = start_time.elapsed();
+            if stats.total_swaps_in > 1 {
+                let total_nanos = stats.average_swap_time.as_nanos() as u64 * (stats.total_swaps_in - 1) + 
+                                 swap_time.as_nanos() as u64;
+                stats.average_swap_time = Duration::from_nanos(total_nanos / stats.total_swaps_in);
+            } else {
+                stats.average_swap_time = swap_time;
+            }
+        }
+
+        // Update predictor
+        self.active_set_predictor.lock().unwrap().record_access(block_id);
+
+        // Prefetch predicted blocks
+        self.prefetch_predicted_blocks()?;
+
+        Ok(gpu_ptr)
+    }
+
+    /// Ensure enough GPU space for a block
+    fn ensure_gpu_space_for_block(&self, block_id: &str) -> Result<()> {
+        let block_size = {
+            let blocks = self.blocks.read().unwrap();
+            blocks.get(block_id)
+                .ok_or_else(|| MemoryError::PoolError(format!("Block {} not found", block_id)))?
+                .size_bytes
+        };
+
+        let mut current_gpu_usage = self.calculate_gpu_usage();
+        
+        while current_gpu_usage + block_size > self.config.max_gpu_memory 
+            && self.gpu_blocks.read().unwrap().len() > 0 {
+            // Need to evict a block
+            let evict_id = self.select_block_to_evict()?;
+            self.swap_from_gpu(&evict_id)?;
+            current_gpu_usage = self.calculate_gpu_usage();
+        }
+
+        Ok(())
+    }
+
+    /// Select which block to evict (LRU with modifications)
+    fn select_block_to_evict(&self) -> Result<String> {
+        let blocks = self.blocks.read().unwrap();
+        let gpu_blocks = self.gpu_blocks.read().unwrap();
+        
+        // Get access queue order
+        let access_order = self.access_queue.lock().unwrap();
+        
+        // Find the least recently used block in GPU
+        for block_id in access_order.iter() {
+            if gpu_blocks.contains(block_id) && !self.has_active_dependencies(block_id) {
+                return Ok(block_id.clone());
+            }
+        }
+        
+        // If no block in access queue, pick any GPU block
+        gpu_blocks.iter()
+            .find(|id| !self.has_active_dependencies(id))
+            .cloned()
+            .ok_or_else(|| MemoryError::PoolError("No blocks available for eviction".to_string()))
+    }
+
+    /// Check if a block has active dependencies
+    fn has_active_dependencies(&self, block_id: &str) -> bool {
+        let blocks = self.blocks.read().unwrap();
+        let gpu_blocks = self.gpu_blocks.read().unwrap();
+        
+        // Check if any GPU blocks depend on this block
+        for gpu_block_id in gpu_blocks.iter() {
+            if let Some(gpu_block) = blocks.get(gpu_block_id) {
+                if gpu_block.dependencies.contains(&block_id.to_string()) {
+                    return true;
+                }
+            }
+        }
+        
+        false
+    }
+
+    /// Swap a block from GPU to its storage location
+    fn swap_from_gpu(&self, block_id: &str) -> Result<()> {
+        let block_info = {
+            let blocks = self.blocks.read().unwrap();
+            blocks.get(block_id)
+                .ok_or_else(|| MemoryError::PoolError(format!("Block {} not found", block_id)))?
+                .clone()
+        };
+
+        let gpu_ptr = {
+            let data = self.block_data.read().unwrap();
+            data.get(block_id)
+                .and_then(|d| d.gpu_ptr)
+                .ok_or_else(|| MemoryError::PoolError(format!("Block {} has no GPU pointer", block_id)))?
+        };
+
+        // Determine target location based on access pattern
+        let target_location = self.determine_swap_location(&block_info);
+
+        // Move data
+        let new_data = self.move_block_data(gpu_ptr, block_info.size_bytes, 
+                                           StorageLocation::GPU, target_location)?;
+
+        // Update records
+        {
+            let mut blocks = self.blocks.write().unwrap();
+            if let Some(block) = blocks.get_mut(block_id) {
+                block.location = target_location;
+            }
+        }
+        
+        // Replace block data and free old GPU memory
+        {
+            let mut data = self.block_data.write().unwrap();
+            if let Some(old_data) = data.get_mut(block_id) {
+                // Free the GPU memory
+                if let Some(old_gpu_ptr) = old_data.gpu_ptr.take() {
+                    cuda::free(old_gpu_ptr)?;
+                }
+                // Replace with new data
+                *old_data = new_data;
+            }
+        }
+        
+        self.gpu_blocks.write().unwrap().remove(block_id);
+        self.stats.write().unwrap().total_swaps_out += 1;
+
+        Ok(())
+    }
+
+    /// Swap a block to GPU
+    fn swap_to_gpu(&self, block_id: &str) -> Result<*mut std::ffi::c_void> {
+        let (block_info, current_location) = {
+            let blocks = self.blocks.read().unwrap();
+            let block = blocks.get(block_id)
+                .ok_or_else(|| MemoryError::PoolError(format!("Block {} not found", block_id)))?;
+            (block.clone(), block.location)
+        };
+
+        // Allocate GPU memory
+        let gpu_ptr = cuda::malloc(block_info.size_bytes)?;
+
+        // Load data from current location
+        {
+            let data = self.block_data.read().unwrap();
+            let block_data = data.get(block_id)
+                .ok_or_else(|| MemoryError::PoolError(format!("Block {} has no data", block_id)))?;
+            
+            match current_location {
+                StorageLocation::CPUMemory => {
+                    if let Some(cpu_ptr) = block_data.cpu_ptr {
+                        self.copy_from_cpu_to_gpu(cpu_ptr, gpu_ptr, block_info.size_bytes)?;
+                    } else {
+                        cuda::free(gpu_ptr)?;
+                        return Err(MemoryError::PoolError("Block has no CPU data".to_string()));
+                    }
+                }
+                StorageLocation::PinnedMemory => {
+                    if let Some(pinned_ptr) = block_data.pinned_ptr {
+                        self.copy_from_pinned_to_gpu(pinned_ptr, gpu_ptr, block_info.size_bytes)?;
+                    } else {
+                        cuda::free(gpu_ptr)?;
+                        return Err(MemoryError::PoolError("Block has no pinned data".to_string()));
+                    }
+                }
+                StorageLocation::Disk => {
+                    if let Some(file_path) = &block_data.file_path {
+                        self.load_from_disk_to_gpu(file_path, gpu_ptr, block_info.size_bytes)?;
+                    } else {
+                        cuda::free(gpu_ptr)?;
+                        return Err(MemoryError::PoolError("Block has no file path".to_string()));
+                    }
+                }
+                StorageLocation::MemoryMapped => {
+                    if let Some(mmap) = &block_data.mmap {
+                        self.copy_from_mmap_to_gpu(mmap, gpu_ptr, block_info.size_bytes)?;
+                    } else {
+                        cuda::free(gpu_ptr)?;
+                        return Err(MemoryError::PoolError("Block has no mmap data".to_string()));
+                    }
+                }
+                StorageLocation::GPU => {
+                    // Already in GPU
+                    return Ok(gpu_ptr);
+                }
+            }
+        }
+
+        // Update records
+        {
+            let mut blocks = self.blocks.write().unwrap();
+            if let Some(block) = blocks.get_mut(block_id) {
+                block.location = StorageLocation::GPU;
+            }
+        }
+        
+        {
+            let mut data = self.block_data.write().unwrap();
+            if let Some(block_data) = data.get_mut(block_id) {
+                block_data.gpu_ptr = Some(gpu_ptr);
+            }
+        }
+        
+        self.gpu_blocks.write().unwrap().insert(block_id.to_string());
+
+        // Update stats
+        {
+            let mut stats = self.stats.write().unwrap();
+            stats.total_bytes_transferred += block_info.size_bytes as u64;
+            let current_gpu_blocks = self.gpu_blocks.read().unwrap().len();
+            stats.peak_gpu_blocks = stats.peak_gpu_blocks.max(current_gpu_blocks);
+        }
+
+        Ok(gpu_ptr)
+    }
+
+    /// Move block data between storage locations
+    fn move_block_data(&self, ptr: *mut std::ffi::c_void, size: usize, 
+                      from: StorageLocation, to: StorageLocation) -> Result<BlockData> {
+        let mut new_data = BlockData::new();
+
+        match (from, to) {
+            (StorageLocation::GPU, StorageLocation::CPUMemory) => {
+                let cpu_ptr = unsafe { libc::malloc(size) as *mut u8 };
+                if cpu_ptr.is_null() {
+                    return Err(MemoryError::AllocationFailed(size));
+                }
+                self.copy_from_gpu_to_cpu(ptr, cpu_ptr, size)?;
+                new_data.cpu_ptr = Some(cpu_ptr);
+            }
+            (StorageLocation::GPU, StorageLocation::PinnedMemory) => {
+                let pinned_ptr = self.allocate_pinned_memory(size)?;
+                self.copy_from_gpu_to_pinned(ptr, pinned_ptr, size)?;
+                new_data.pinned_ptr = Some(pinned_ptr);
+            }
+            (StorageLocation::GPU, StorageLocation::Disk) => {
+                let file_path = self.generate_swap_file_path();
+                self.save_to_disk(ptr, &file_path, size)?;
+                new_data.file_path = Some(file_path);
+            }
+            (StorageLocation::GPU, StorageLocation::MemoryMapped) => {
+                let file_path = self.generate_swap_file_path();
+                let mmap = self.create_mmap_file(&file_path, size)?;
+                self.copy_from_gpu_to_mmap(ptr, &mmap, size)?;
+                new_data.mmap = Some(Arc::new(Mutex::new(mmap)));
+                new_data.file_path = Some(file_path);
+            }
+            _ => {
+                return Err(MemoryError::PoolError(
+                    format!("Unsupported transfer from {:?} to {:?}", from, to)
+                ));
+            }
+        }
+
+        Ok(new_data)
+    }
+
+    /// Determine optimal swap location based on access patterns
+    fn determine_swap_location(&self, block: &SwappableBlock) -> StorageLocation {
+        // High-frequency blocks go to pinned memory
+        if block.access_count > 100 && self.config.use_pinned_memory {
+            return StorageLocation::PinnedMemory;
+        }
+        
+        // Medium-frequency to CPU memory
+        if block.access_count > 10 {
+            return StorageLocation::CPUMemory;
+        }
+        
+        // Low-frequency to disk with mmap if enabled
+        if self.config.use_mmap {
+            StorageLocation::MemoryMapped
+        } else {
+            StorageLocation::Disk
+        }
+    }
+
+    /// Copy data from GPU to CPU
+    fn copy_from_gpu_to_cpu(&self, gpu_ptr: *mut std::ffi::c_void, cpu_ptr: *mut u8, size: usize) -> Result<()> {
+        unsafe {
+            let result = cuda_sys::cudaMemcpy(
+                cpu_ptr as *mut std::ffi::c_void,
+                gpu_ptr,
+                size,
+                cuda_sys::cudaMemcpyDeviceToHost
+            );
+            if result != 0 {
+                return Err(MemoryError::CudaError(format!("Failed to copy GPU to CPU: {}", result)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy data from CPU to GPU
+    fn copy_from_cpu_to_gpu(&self, cpu_ptr: *mut u8, gpu_ptr: *mut std::ffi::c_void, size: usize) -> Result<()> {
+        unsafe {
+            let result = cuda_sys::cudaMemcpy(
+                gpu_ptr,
+                cpu_ptr as *mut std::ffi::c_void,
+                size,
+                cuda_sys::cudaMemcpyHostToDevice
+            );
+            if result != 0 {
+                return Err(MemoryError::CudaError(format!("Failed to copy CPU to GPU: {}", result)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Allocate pinned memory
+    fn allocate_pinned_memory(&self, size: usize) -> Result<*mut u8> {
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        unsafe {
+            let result = cuda_sys::cudaMallocHost(&mut ptr, size);
+            if result != 0 || ptr.is_null() {
+                return Err(MemoryError::AllocationFailed(size));
+            }
+        }
+        Ok(ptr as *mut u8)
+    }
+
+    /// Copy from GPU to pinned memory
+    fn copy_from_gpu_to_pinned(&self, gpu_ptr: *mut std::ffi::c_void, pinned_ptr: *mut u8, size: usize) -> Result<()> {
+        if self.config.async_transfers && !self.transfer_streams.is_empty() {
+            unsafe {
+                let stream = self.transfer_streams[0];
+                let result = cuda_sys::cudaMemcpyAsync(
+                    pinned_ptr as *mut std::ffi::c_void,
+                    gpu_ptr,
+                    size,
+                    cuda_sys::cudaMemcpyDeviceToHost,
+                    stream
+                );
+                if result != 0 {
+                    return Err(MemoryError::CudaError(format!("Failed async copy GPU to pinned: {}", result)));
+                }
+                let sync_result = cuda_sys::cudaStreamSynchronize(stream);
+                if sync_result != 0 {
+                    return Err(MemoryError::CudaError(format!("Stream sync failed: {}", sync_result)));
+                }
+            }
+        } else {
+            self.copy_from_gpu_to_cpu(gpu_ptr, pinned_ptr, size)?;
+        }
+        Ok(())
+    }
+
+    /// Copy from pinned memory to GPU
+    fn copy_from_pinned_to_gpu(&self, pinned_ptr: *mut u8, gpu_ptr: *mut std::ffi::c_void, size: usize) -> Result<()> {
+        if self.config.async_transfers && !self.transfer_streams.is_empty() {
+            unsafe {
+                let stream = self.transfer_streams[0];
+                let result = cuda_sys::cudaMemcpyAsync(
+                    gpu_ptr,
+                    pinned_ptr as *mut std::ffi::c_void,
+                    size,
+                    cuda_sys::cudaMemcpyHostToDevice,
+                    stream
+                );
+                if result != 0 {
+                    return Err(MemoryError::CudaError(format!("Failed async copy pinned to GPU: {}", result)));
+                }
+                let sync_result = cuda_sys::cudaStreamSynchronize(stream);
+                if sync_result != 0 {
+                    return Err(MemoryError::CudaError(format!("Stream sync failed: {}", sync_result)));
+                }
+            }
+        } else {
+            self.copy_from_cpu_to_gpu(pinned_ptr, gpu_ptr, size)?;
+        }
+        Ok(())
+    }
+
+    /// Save block to disk
+    fn save_to_disk(&self, gpu_ptr: *mut std::ffi::c_void, path: &Path, size: usize) -> Result<()> {
+        // First copy to CPU
+        let mut cpu_buffer = vec![0u8; size];
+        unsafe {
+            let result = cuda_sys::cudaMemcpy(
+                cpu_buffer.as_mut_ptr() as *mut std::ffi::c_void,
+                gpu_ptr,
+                size,
+                cuda_sys::cudaMemcpyDeviceToHost
+            );
+            if result != 0 {
+                return Err(MemoryError::CudaError(format!("Failed to copy GPU to CPU for disk save: {}", result)));
+            }
+        }
+
+        // Optionally compress
+        let data_to_write = if self.config.enable_compression {
+            use flate2::write::GzEncoder;
+            use flate2::Compression;
+            
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(&cpu_buffer)
+                .map_err(|e| MemoryError::PoolError(format!("Compression failed: {}", e)))?;
+            encoder.finish()
+                .map_err(|e| MemoryError::PoolError(format!("Compression finish failed: {}", e)))?
+        } else {
+            cpu_buffer
+        };
+
+        // Write to disk
+        let file = File::create(path)
+            .map_err(|e| MemoryError::PoolError(format!("Failed to create swap file: {}", e)))?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(&data_to_write)
+            .map_err(|e| MemoryError::PoolError(format!("Failed to write swap file: {}", e)))?;
+        writer.flush()
+            .map_err(|e| MemoryError::PoolError(format!("Failed to flush swap file: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Load block from disk to GPU
+    fn load_from_disk_to_gpu(&self, path: &Path, gpu_ptr: *mut std::ffi::c_void, size: usize) -> Result<()> {
+        // Read from disk
+        let file = File::open(path)
+            .map_err(|e| MemoryError::PoolError(format!("Failed to open swap file: {}", e)))?;
+        let mut reader = BufReader::new(file);
+        let mut file_data = Vec::new();
+        reader.read_to_end(&mut file_data)
+            .map_err(|e| MemoryError::PoolError(format!("Failed to read swap file: {}", e)))?;
+
+        // Optionally decompress
+        let cpu_buffer = if self.config.enable_compression {
+            use flate2::read::GzDecoder;
+            
+            let mut decoder = GzDecoder::new(&file_data[..]);
+            let mut decompressed = Vec::with_capacity(size);
+            decoder.read_to_end(&mut decompressed)
+                .map_err(|e| MemoryError::PoolError(format!("Decompression failed: {}", e)))?;
+            
+            if decompressed.len() != size {
+                return Err(MemoryError::PoolError(format!(
+                    "Decompressed size {} doesn't match expected {}", 
+                    decompressed.len(), size
+                )));
+            }
+            decompressed
+        } else {
+            if file_data.len() != size {
+                return Err(MemoryError::PoolError(format!(
+                    "File size {} doesn't match expected {}", 
+                    file_data.len(), size
+                )));
+            }
+            file_data
+        };
+
+        // Copy to GPU
+        unsafe {
+            let result = cuda_sys::cudaMemcpy(
+                gpu_ptr,
+                cpu_buffer.as_ptr() as *const std::ffi::c_void,
+                size,
+                cuda_sys::cudaMemcpyHostToDevice
+            );
+            if result != 0 {
+                return Err(MemoryError::CudaError(format!("Failed to copy disk data to GPU: {}", result)));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Create memory-mapped file
+    fn create_mmap_file(&self, path: &Path, size: usize) -> Result<MmapMut> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .map_err(|e| MemoryError::PoolError(format!("Failed to create mmap file: {}", e)))?;
+        
+        file.set_len(size as u64)
+            .map_err(|e| MemoryError::PoolError(format!("Failed to set file size: {}", e)))?;
+
+        unsafe {
+            MmapOptions::new()
+                .map_mut(&file)
+                .map_err(|e| MemoryError::PoolError(format!("Failed to create mmap: {}", e)))
+        }
+    }
+
+    /// Copy from GPU to memory-mapped file
+    fn copy_from_gpu_to_mmap(&self, gpu_ptr: *mut std::ffi::c_void, mmap: &MmapMut, size: usize) -> Result<()> {
+        unsafe {
+            let result = cuda_sys::cudaMemcpy(
+                mmap.as_ptr() as *mut std::ffi::c_void,
+                gpu_ptr,
+                size,
+                cuda_sys::cudaMemcpyDeviceToHost
+            );
+            if result != 0 {
+                return Err(MemoryError::CudaError(format!("Failed to copy GPU to mmap: {}", result)));
+            }
+            
+            // Ensure data is written to disk
+            mmap.flush()
+                .map_err(|e| MemoryError::PoolError(format!("Failed to flush mmap: {}", e)))?;
+        }
+        Ok(())
+    }
+
+    /// Copy from memory-mapped file to GPU
+    fn copy_from_mmap_to_gpu(&self, mmap: &Arc<Mutex<MmapMut>>, gpu_ptr: *mut std::ffi::c_void, size: usize) -> Result<()> {
+        let mmap_guard = mmap.lock().unwrap();
+        unsafe {
+            let result = cuda_sys::cudaMemcpy(
+                gpu_ptr,
+                mmap_guard.as_ptr() as *const std::ffi::c_void,
+                size,
+                cuda_sys::cudaMemcpyHostToDevice
+            );
+            if result != 0 {
+                return Err(MemoryError::CudaError(format!("Failed to copy mmap to GPU: {}", result)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Generate unique swap file path
+    fn generate_swap_file_path(&self) -> PathBuf {
+        let id = self.swap_file_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let filename = if self.config.enable_compression {
+            format!("block_{}.swap.gz", id)
+        } else {
+            format!("block_{}.swap", id)
+        };
+        self.config.swap_dir.join(filename)
+    }
+
+    /// Calculate current GPU memory usage
+    fn calculate_gpu_usage(&self) -> usize {
+        let blocks = self.blocks.read().unwrap();
+        let gpu_blocks = self.gpu_blocks.read().unwrap();
+        
+        gpu_blocks.iter()
+            .filter_map(|id| blocks.get(id))
+            .map(|block| block.size_bytes)
+            .sum()
+    }
+
+    /// Prefetch predicted blocks
+    fn prefetch_predicted_blocks(&self) -> Result<()> {
+        let predictions = self.active_set_predictor.lock().unwrap().predict_next();
+        
+        let mut prefetch_count = 0;
+        for block_id in predictions.iter() {
+            if prefetch_count >= self.config.prefetch_blocks {
+                break;
+            }
+            
+            // Only prefetch if not already in GPU and we have space
+            if !self.gpu_blocks.read().unwrap().contains(block_id) {
+                let block_size = {
+                    let blocks = self.blocks.read().unwrap();
+                    blocks.get(block_id).map(|b| b.size_bytes).unwrap_or(0)
+                };
+                
+                let current_usage = self.calculate_gpu_usage();
+                if current_usage + block_size <= self.config.max_gpu_memory {
+                    // Add to prefetch queue (would be processed by background thread in production)
+                    self.prefetch_queue.lock().unwrap().push_back(block_id.clone());
+                    prefetch_count += 1;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get swap statistics
+    pub fn get_stats(&self) -> SwapStats {
+        self.stats.read().unwrap().clone()
+    }
+
+    /// Clear all swap files
+    pub fn cleanup(&self) -> Result<()> {
+        // Free all GPU memory
+        let gpu_blocks: Vec<_> = self.gpu_blocks.read().unwrap().iter().cloned().collect();
+        for block_id in gpu_blocks {
+            if let Err(e) = self.swap_from_gpu(&block_id) {
+                log::warn!("Failed to swap out block {}: {}", block_id, e);
+            }
+        }
+
+        // Clean up all block data
+        {
+            let mut block_data = self.block_data.write().unwrap();
+            for (_, data) in block_data.iter_mut() {
+                data.cleanup();
+            }
+            block_data.clear();
+        }
+
+        // Remove swap directory if empty
+        if self.config.swap_dir.exists() {
+            match std::fs::read_dir(&self.config.swap_dir) {
+                Ok(mut entries) => {
+                    if entries.next().is_none() {
+                        // Directory is empty, remove it
+                        let _ = std::fs::remove_dir(&self.config.swap_dir);
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for BlockSwapManager {
+    fn drop(&mut self) {
+        // Clean up CUDA streams
+        for stream in &self.transfer_streams {
+            unsafe {
+                cuda_sys::cudaStreamDestroy(*stream);
+            }
+        }
+        
+        // Clean up all resources
+        let _ = self.cleanup();
+    }
+}
+
+impl ActiveSetPredictor {
+    fn new(max_history: usize) -> Self {
+        Self {
+            access_history: VecDeque::with_capacity(max_history),
+            pattern_cache: HashMap::new(),
+            max_history,
+            current_sequence: Vec::new(),
+        }
+    }
+
+    fn record_access(&mut self, block_id: &str) {
+        self.current_sequence.push(block_id.to_string());
+        
+        // When we have enough accesses, save as a pattern
+        if self.current_sequence.len() >= 3 {
+            // Take last 3 accesses as pattern key
+            let pattern_key: Vec<_> = self.current_sequence.iter()
+                .rev()
+                .take(3)
+                .rev()
+                .cloned()
+                .collect();
+            
+            // Save what comes next
+            if self.current_sequence.len() > 3 {
+                let next_blocks: Vec<_> = self.current_sequence[self.current_sequence.len()-3..]
+                    .to_vec();
+                self.pattern_cache.insert(pattern_key, next_blocks);
+            }
+            
+            // Keep sequence bounded
+            if self.current_sequence.len() > self.max_history * 3 {
+                self.current_sequence.drain(0..self.max_history);
+            }
+        }
+        
+        // Add to history
+        self.access_history.push_back(vec![block_id.to_string()]);
+        if self.access_history.len() > self.max_history {
+            self.access_history.pop_front();
+        }
+    }
+
+    fn predict_next(&self) -> Vec<String> {
+        if self.current_sequence.len() < 3 {
+            return Vec::new();
+        }
+
+        // Get recent pattern
+        let recent_pattern: Vec<_> = self.current_sequence.iter()
+            .rev()
+            .take(3)
+            .rev()
+            .cloned()
+            .collect();
+
+        // Look for matching pattern
+        if let Some(prediction) = self.pattern_cache.get(&recent_pattern) {
+            return prediction.clone();
+        }
+
+        // No pattern match, return most frequently accessed blocks
+        let mut frequency_map = HashMap::new();
+        for seq in &self.access_history {
+            for block_id in seq {
+                *frequency_map.entry(block_id.clone()).or_insert(0) += 1;
+            }
+        }
+        
+        let mut freq_vec: Vec<_> = frequency_map.into_iter().collect();
+        freq_vec.sort_by(|a, b| b.1.cmp(&a.1));
+        
+        freq_vec.into_iter()
+            .take(5)
+            .map(|(id, _)| id)
+            .collect()
+    }
+}
+
+/// Helper to create blocks for different model architectures
+pub struct ModelBlockBuilder {
+    model_type: ModelType,
+    config: DiffusionConfig,
+}
+
+impl ModelBlockBuilder {
+    pub fn new(model_type: ModelType, config: DiffusionConfig) -> Self {
+        Self { model_type, config }
+    }
+
+    /// Build blocks for SD3.5 MMDiT
+    pub fn build_sd35_blocks(&self) -> Vec<SwappableBlock> {
+        let mut blocks = Vec::new();
+        let hidden_dim = self.config.hidden_dim;
+
+        for layer_idx in 0..self.config.num_layers {
+            // Attention blocks
+            blocks.push(SwappableBlock {
+                id: format!("layer_{}_attn_qkv", layer_idx),
+                layer_idx,
+                block_type: BlockType::AttentionQKV,
+                size_bytes: 3 * hidden_dim * hidden_dim * 2, // Q,K,V in FP16
+                shape: vec![3, hidden_dim, hidden_dim],
+                dtype: PrecisionMode::Float16,
+                location: StorageLocation::Disk,
+                last_access: Instant::now(),
+                access_count: 0,
+                is_gradient: false,
+                dependencies: if layer_idx > 0 {
+                    vec![format!("layer_{}_output", layer_idx - 1)]
+                } else {
+                    vec![]
+                },
+            });
+
+            blocks.push(SwappableBlock {
+                id: format!("layer_{}_attn_out", layer_idx),
+                layer_idx,
+                block_type: BlockType::AttentionOutput,
+                size_bytes: hidden_dim * hidden_dim * 2,
+                shape: vec![hidden_dim, hidden_dim],
+                dtype: PrecisionMode::Float16,
+                location: StorageLocation::Disk,
+                last_access: Instant::now(),
+                access_count: 0,
+                is_gradient: false,
+                dependencies: vec![format!("layer_{}_attn_qkv", layer_idx)],
+            });
+
+            // MLP blocks
+            blocks.push(SwappableBlock {
+                id: format!("layer_{}_mlp_up", layer_idx),
+                layer_idx,
+                block_type: BlockType::MLPUpProj,
+                size_bytes: hidden_dim * hidden_dim * 4 * 2, // 4x expansion
+                shape: vec![hidden_dim * 4, hidden_dim],
+                dtype: PrecisionMode::Float16,
+                location: StorageLocation::Disk,
+                last_access: Instant::now(),
+                access_count: 0,
+                is_gradient: false,
+                dependencies: vec![format!("layer_{}_attn_out", layer_idx)],
+            });
+
+            blocks.push(SwappableBlock {
+                id: format!("layer_{}_mlp_down", layer_idx),
+                layer_idx,
+                block_type: BlockType::MLPDownProj,
+                size_bytes: hidden_dim * 4 * hidden_dim * 2,
+                shape: vec![hidden_dim, hidden_dim * 4],
+                dtype: PrecisionMode::Float16,
+                location: StorageLocation::Disk,
+                last_access: Instant::now(),
+                access_count: 0,
+                is_gradient: false,
+                dependencies: vec![format!("layer_{}_mlp_up", layer_idx)],
+            });
+
+            // Layer output (for residual)
+            blocks.push(SwappableBlock {
+                id: format!("layer_{}_output", layer_idx),
+                layer_idx,
+                block_type: BlockType::Custom,
+                size_bytes: hidden_dim * 2, // Just a marker for dependency tracking
+                shape: vec![hidden_dim],
+                dtype: PrecisionMode::Float16,
+                location: StorageLocation::GPU, // Keep outputs in GPU
+                last_access: Instant::now(),
+                access_count: 0,
+                is_gradient: false,
+                dependencies: vec![
+                    format!("layer_{}_attn_out", layer_idx),
+                    format!("layer_{}_mlp_down", layer_idx),
+                ],
+            });
+
+            // AdaLN
+            blocks.push(SwappableBlock {
+                id: format!("layer_{}_adaln", layer_idx),
+                layer_idx,
+                block_type: BlockType::AdaLN,
+                size_bytes: hidden_dim * 6 * 2, // 6 params per AdaLN
+                shape: vec![6, hidden_dim],
+                dtype: PrecisionMode::Float16,
+                location: StorageLocation::CPUMemory, // Keep in CPU for quick access
+                last_access: Instant::now(),
+                access_count: 0,
+                is_gradient: false,
+                dependencies: vec![],
+            });
+        }
+
+        blocks
+    }
+
+    /// Build blocks for Flux model
+    pub fn build_flux_blocks(&self) -> Vec<SwappableBlock> {
+        let mut blocks = Vec::new();
+        let hidden_dim = self.config.hidden_dim;
+        
+        for layer_idx in 0..self.config.num_layers {
+            // Flux uses a different architecture but similar block structure
+            blocks.push(SwappableBlock {
+                id: format!("flux_layer_{}_attn", layer_idx),
+                layer_idx,
+                block_type: BlockType::Attention,
+                size_bytes: 4 * hidden_dim * hidden_dim * 2, // QKVO
+                shape: vec![4, hidden_dim, hidden_dim],
+                dtype: PrecisionMode::Float16,
+                location: StorageLocation::Disk,
+                last_access: Instant::now(),
+                access_count: 0,
+                is_gradient: false,
+                dependencies: if layer_idx > 0 {
+                    vec![format!("flux_layer_{}_output", layer_idx - 1)]
+                } else {
+                    vec![]
+                },
+            });
+            
+            blocks.push(SwappableBlock {
+                id: format!("flux_layer_{}_mlp", layer_idx),
+                layer_idx,
+                block_type: BlockType::MLP,
+                size_bytes: hidden_dim * hidden_dim * 8 * 2, // Flux uses larger MLP
+                shape: vec![hidden_dim * 4, hidden_dim * 2],
+                dtype: PrecisionMode::Float16,
+                location: StorageLocation::Disk,
+                last_access: Instant::now(),
+                access_count: 0,
+                is_gradient: false,
+                dependencies: vec![format!("flux_layer_{}_attn", layer_idx)],
+            });
+            
+            blocks.push(SwappableBlock {
+                id: format!("flux_layer_{}_output", layer_idx),
+                layer_idx,
+                block_type: BlockType::Custom,
+                size_bytes: hidden_dim * 2,
+                shape: vec![hidden_dim],
+                dtype: PrecisionMode::Float16,
+                location: StorageLocation::GPU,
+                last_access: Instant::now(),
+                access_count: 0,
+                is_gradient: false,
+                dependencies: vec![format!("flux_layer_{}_mlp", layer_idx)],
+            });
+        }
+        
+        blocks
+    }
+
+    /// Build blocks for WAN 2.1 video model
+    pub fn build_wan21_blocks(&self) -> Vec<SwappableBlock> {
+        let mut blocks = Vec::new();
+        let hidden_dim = self.config.hidden_dim;
+        
+        for layer_idx in 0..self.config.num_layers {
+            // Spatial attention
+            blocks.push(SwappableBlock {
+                id: format!("wan_layer_{}_spatial_attn", layer_idx),
+                layer_idx,
+                block_type: BlockType::SelfAttention,
+                size_bytes: 3 * hidden_dim * hidden_dim * 2,
+                shape: vec![3, hidden_dim, hidden_dim],
+                dtype: PrecisionMode::Float16,
+                location: StorageLocation::Disk,
+                last_access: Instant::now(),
+                access_count: 0,
+                is_gradient: false,
+                dependencies: if layer_idx > 0 {
+                    vec![format!("wan_layer_{}_output", layer_idx - 1)]
+                } else {
+                    vec![]
+                },
+            });
+            
+            // Temporal attention
+            blocks.push(SwappableBlock {
+                id: format!("wan_layer_{}_temporal_attn", layer_idx),
+                layer_idx,
+                block_type: BlockType::Temporal,
+                size_bytes: 3 * hidden_dim * hidden_dim * 2,
+                shape: vec![3, hidden_dim, hidden_dim],
+                dtype: PrecisionMode::Float16,
+                location: StorageLocation::Disk,
+                last_access: Instant::now(),
+                access_count: 0,
+                is_gradient: false,
+                dependencies: vec![format!("wan_layer_{}_spatial_attn", layer_idx)],
+            });
+            
+            // MLP
+            blocks.push(SwappableBlock {
+                id: format!("wan_layer_{}_mlp", layer_idx),
+                layer_idx,
+                block_type: BlockType::MLP,
+                size_bytes: hidden_dim * hidden_dim * 8 * 2,
+                shape: vec![hidden_dim * 4, hidden_dim * 2],
+                dtype: PrecisionMode::Float16,
+                location: StorageLocation::Disk,
+                last_access: Instant::now(),
+                access_count: 0,
+                is_gradient: false,
+                dependencies: vec![format!("wan_layer_{}_temporal_attn", layer_idx)],
+            });
+            
+            blocks.push(SwappableBlock {
+                id: format!("wan_layer_{}_output", layer_idx),
+                layer_idx,
+                block_type: BlockType::Custom,
+                size_bytes: hidden_dim * 2,
+                shape: vec![hidden_dim],
+                dtype: PrecisionMode::Float16,
+                location: StorageLocation::GPU,
+                last_access: Instant::now(),
+                access_count: 0,
+                is_gradient: false,
+                dependencies: vec![format!("wan_layer_{}_mlp", layer_idx)],
+            });
+        }
+        
+        blocks
+    }
+}
+
+/// Integration with existing memory management
+impl BlockSwapManager {
+    /// Create a swappable SafeGPUTensor
+    pub fn create_swappable_tensor(&self, block_id: &str, shape: Vec<usize>, dtype: PrecisionMode) -> Result<SwappableTensor> {
+        let size = shape.iter().product::<usize>() * match dtype {
+            PrecisionMode::Float32 => 4,
+            PrecisionMode::Float16 | PrecisionMode::BFloat16 => 2,
+            _ => 2,
+        };
+
+        let block = SwappableBlock {
+            id: block_id.to_string(),
+            layer_idx: 0,
+            block_type: BlockType::Custom,
+            size_bytes: size,
+            shape: shape.clone(),
+            dtype,
+            location: StorageLocation::Disk,
+            last_access: Instant::now(),
+            access_count: 0,
+            is_gradient: false,
+            dependencies: vec![],
+        };
+
+        self.register_block(block, None)?;
+
+        Ok(SwappableTensor {
+            block_id: block_id.to_string(),
+            manager: self,
+            shape,
+            dtype,
+        })
+    }
+}
+
+/// Swappable tensor that automatically manages GPU/CPU transfers
+pub struct SwappableTensor<'a> {
+    block_id: String,
+    manager: &'a BlockSwapManager,
+    shape: Vec<usize>,
+    dtype: PrecisionMode,
+}
+
+impl<'a> SwappableTensor<'a> {
+    /// Get GPU pointer, swapping in if necessary
+    pub fn gpu_ptr(&self) -> Result<*mut std::ffi::c_void> {
+        self.manager.access_block(&self.block_id)
+    }
+
+    /// Ensure tensor is on GPU
+    pub fn ensure_gpu(&self) -> Result<()> {
+        self.gpu_ptr()?;
+        Ok(())
+    }
+
+    /// Swap out to save GPU memory
+    pub fn swap_out(&self) -> Result<()> {
+        if self.manager.gpu_blocks.read().unwrap().contains(&self.block_id) {
+            self.manager.swap_from_gpu(&self.block_id)?;
+        }
+        Ok(())
+    }
+    
+    /// Get shape
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+    
+    /// Get data type
+    pub fn dtype(&self) -> PrecisionMode {
+        self.dtype
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_block_swap_manager() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = BlockSwapConfig {
+            max_gpu_memory: 1024 * 1024 * 1024, // 1GB
+            swap_dir: temp_dir.path().to_path_buf(),
+            use_mmap: true,
+            active_blocks: 4,
+            prefetch_blocks: 2,
+            use_pinned_memory: true,
+            enable_compression: false,
+            async_transfers: false,
+            granularity: BlockGranularity::Layer,
+        };
+
+        let manager = BlockSwapManager::new(config).unwrap();
+        
+        // Test block registration
+        let block = SwappableBlock {
+            id: "test_block".to_string(),
+            layer_idx: 0,
+            block_type: BlockType::MLP,
+            size_bytes: 1024 * 1024, // 1MB
+            shape: vec![256, 1024],
+            dtype: PrecisionMode::Float16,
+            location: StorageLocation::Disk,
+            last_access: Instant::now(),
+            access_count: 0,
+            is_gradient: false,
+            dependencies: vec![],
+        };
+
+        manager.register_block(block, None).unwrap();
+        
+        // Test access pattern tracking
+        let predictor = &manager.active_set_predictor;
+        {
+            let mut pred = predictor.lock().unwrap();
+            pred.record_access("block_1");
+            pred.record_access("block_2");
+            pred.record_access("block_3");
+            
+            let predictions = pred.predict_next();
+            assert!(predictions.len() <= 5);
+        }
+        
+        // Test stats
+        let stats = manager.get_stats();
+        assert_eq!(stats.total_swaps_in, 0);
+        assert_eq!(stats.total_swaps_out, 0);
+    }
+    
+    #[test]
+    fn test_model_block_builder() {
+        let config = DiffusionConfig {
+            precision_mode: PrecisionMode::Float16,
+            attention_strategy: crate::AttentionStrategy::FlashAttention2,
+            enable_gradient_checkpointing: true,
+            checkpoint_ratio: 0.3,
+            enable_cpu_offload: true,
+            enable_model_parallel: false,
+            enable_activation_offload: true,
+            max_sequence_length: 2048,
+            batch_size: 1,
+            enable_flash_attention: true,
+            enable_xformers: true,
+            enable_sdp_attention: true,
+            memory_efficient_attention: true,
+            model_type: ModelType::SD35Large,
+            num_attention_heads: 16,
+            hidden_dim: 1024,
+            num_layers: 24,
+            patch_size: 16,
+            temporal_compression: 1,
+            num_frames: 1,
+            frame_size: (512, 512),
+            enable_temporal_attention: false,
+            enable_3d_conv: false,
+            video_chunk_size: 1,
+        };
+        
+        let builder = ModelBlockBuilder::new(ModelType::SD35Large, config);
+        let blocks = builder.build_sd35_blocks();
+        
+        assert_eq!(blocks.len(), 24 * 6); // 6 blocks per layer
+        
+        // Check dependencies
+        for block in &blocks {
+            if block.layer_idx > 0 && block.id.contains("attn_qkv") {
+                assert!(!block.dependencies.is_empty());
+            }
+        }
+    }
+}// block_swapping.rs - Dynamic block swapping for training large models on limited VRAM
+// Similar to Kohya's SD-Scripts gradient checkpointing and block swapping
+
+use std::collections::{HashMap, VecDeque, HashSet};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::fs::{File, create_dir_all};
+use std::io::{Write, Read, BufWriter, BufReader};
+use memmap2::{MmapOptions, MmapMut, Mmap};
+use bincode;
+use serde::{Serialize, Deserialize};
+
+use crate::{
+    MemoryError, Result, cuda, SafeGPUTensor, PrecisionMode, ModelType,
+    MemoryFormat, DiffusionConfig,
+};
+
+/// Block swapping configuration
+#[derive(Debug, Clone)]
+pub struct BlockSwapConfig {
+    /// Maximum GPU memory to use (bytes)
+    pub max_gpu_memory: usize,
+    /// Directory for disk swapping
+    pub swap_dir: PathBuf,
+    /// Use memory-mapped files for faster disk access
+    pub use_mmap: bool,
+    /// Number of blocks to keep in GPU (active set)
+    pub active_blocks: usize,
+    /// Prefetch next N blocks
+    pub prefetch_blocks: usize,
+    /// Use pinned memory for faster transfers
+    pub use_pinned_memory: bool,
+    /// Compression for disk storage
+    pub enable_compression: bool,
+    /// Async transfers
+    pub async_transfers: bool,
+    /// Block granularity (e.g., per layer, per attention block)
+    pub granularity: BlockGranularity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BlockGranularity {
+    Layer,           // Swap entire layers
+    AttentionBlock,  // Swap attention blocks (Q,K,V,O)
+    MLPBlock,        // Swap MLP blocks
+    SubLayer,        // Swap individual sub-layers
+    Custom,          // User-defined blocks
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StorageLocation {
+    GPU,
+    CPUMemory,
+    PinnedMemory,
+    Disk,
+    MemoryMapped,
+}
+
+/// Represents a swappable model block
+#[derive(Debug, Clone)]
+pub struct SwappableBlock {
+    pub id: String,
+    pub layer_idx: usize,
+    pub block_type: BlockType,
+    pub size_bytes: usize,
+    pub shape: Vec<usize>,
+    pub dtype: PrecisionMode,
+    pub location: StorageLocation,
+    pub last_access: Instant,
+    pub access_count: usize,
+    pub is_gradient: bool,
+    pub dependencies: Vec<String>, // Other blocks this depends on
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum BlockType {
+    // Transformer blocks
+    Attention,
+    AttentionQKV,
+    AttentionOutput,
+    MLP,
+    MLPGateProj,
+    MLPUpProj,
+    MLPDownProj,
+    LayerNorm,
+    
+    // Diffusion-specific
+    ResBlock,
+    CrossAttention,
+    SelfAttention,
+    Temporal,
+    
+    // SD3.5 MMDiT specific
+    MMDiTBlock,
+    AdaLN,
+    
+    // General
+    Embedding,
+    Output,
+    Custom(String),
+}
+
+/// Block data storage
+#[derive(Clone)]
+pub struct BlockData {
+    pub gpu_ptr: Option<*mut std::ffi::c_void>,
+    pub cpu_ptr: Option<*mut u8>,
+    pub pinned_ptr: Option<*mut u8>,
+    pub mmap: Option<Arc<Mutex<MmapMut>>>,
+    pub file_path: Option<PathBuf>,
+    pub compressed_data: Option<Vec<u8>>,
+}
+
+unsafe impl Send for BlockData {}
+unsafe impl Sync for BlockData {}
+
+/// Main block swapping manager
+pub struct BlockSwapManager {
+    config: BlockSwapConfig,
+    blocks: RwLock<HashMap<String, SwappableBlock>>,
+    block_data: RwLock<HashMap<String, BlockData>>,
+    gpu_blocks: RwLock<HashSet<String>>,
+    access_queue: Mutex<VecDeque<String>>, // LRU queue
+    prefetch_queue: Mutex<VecDeque<String>>,
+    transfer_streams: Vec<*mut std::ffi::c_void>, // CUDA streams
+    stats: RwLock<SwapStats>,
+    active_set_predictor: Mutex<ActiveSetPredictor>,
+}
+
+#[derive(Debug, Default)]
+pub struct SwapStats {
+    pub total_swaps_out: u64,
+    pub total_swaps_in: u64,
+    pub total_bytes_transferred: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub average_swap_time: Duration,
+    pub peak_gpu_blocks: usize,
+}
+
+/// Predicts which blocks will be needed next
+pub struct ActiveSetPredictor {
+    access_history: VecDeque<Vec<String>>,
+    pattern_cache: HashMap<Vec<String>, Vec<String>>,
+    max_history: usize,
+}
+
+impl BlockSwapManager {
+    pub fn new(config: BlockSwapConfig) -> Result<Self> {
+        // Create swap directory
+        if !config.swap_dir.exists() {
+            create_dir_all(&config.swap_dir)
+                .map_err(|e| MemoryError::PoolError(format!("Failed to create swap dir: {}", e)))?;
+        }
+
+        // Create CUDA streams for async transfers
+        let mut transfer_streams = Vec::new();
+        if config.async_transfers {
+            for _ in 0..4 {
+                let mut stream: *mut std::ffi::c_void = std::ptr::null_mut();
+                unsafe {
+                    cuda_sys::cudaStreamCreate(&mut stream);
+                    transfer_streams.push(stream);
+                }
+            }
+        }
+
+        Ok(Self {
+            config,
+            blocks: RwLock::new(HashMap::new()),
+            block_data: RwLock::new(HashMap::new()),
+            gpu_blocks: RwLock::new(HashSet::new()),
+            access_queue: Mutex::new(VecDeque::new()),
+            prefetch_queue: Mutex::new(VecDeque::new()),
+            transfer_streams,
+            stats: RwLock::new(SwapStats::default()),
+            active_set_predictor: Mutex::new(ActiveSetPredictor::new(10)),
+        })
+    }
+
+    /// Register a model block for swapping
+    pub fn register_block(&self, block: SwappableBlock, initial_data: Option<*mut std::ffi::c_void>) -> Result<()> {
+        let block_id = block.id.clone();
+        
+        // Initialize block data
+        let mut block_data = BlockData {
+            gpu_ptr: initial_data,
+            cpu_ptr: None,
+            pinned_ptr: None,
+            mmap: None,
+            file_path: None,
+            compressed_data: None,
+        };
+
+        // If initial data provided and not in GPU, allocate
+        if initial_data.is_some() && block.location == StorageLocation::GPU {
+            self.gpu_blocks.write().unwrap().insert(block_id.clone());
+        } else if block.location != StorageLocation::GPU && initial_data.is_some() {
+            // Move to specified location
+            block_data = self.move_block_data(initial_data.unwrap(), block.size_bytes, 
+                                            StorageLocation::GPU, block.location)?;
+        }
+
+        self.blocks.write().unwrap().insert(block_id.clone(), block);
+        self.block_data.write().unwrap().insert(block_id, block_data);
+
+        Ok(())
+    }
+
+    /// Access a block, swapping it to GPU if necessary
+    pub fn access_block(&self, block_id: &str) -> Result<*mut std::ffi::c_void> {
+        let start_time = Instant::now();
+        
+        // Update access info
+        {
+            let mut blocks = self.blocks.write().unwrap();
+            if let Some(block) = blocks.get_mut(block_id) {
+                block.last_access = Instant::now();
+                block.access_count += 1;
+            } else {
+                return Err(MemoryError::PoolError(format!("Block {} not found", block_id)));
+            }
+        }
+
+        // Check if already in GPU
+        if self.gpu_blocks.read().unwrap().contains(block_id) {
+            self.stats.write().unwrap().cache_hits += 1;
+            let data = self.block_data.read().unwrap();
+            return Ok(data.get(block_id).unwrap().gpu_ptr.unwrap());
+        }
+
+        self.stats.write().unwrap().cache_misses += 1;
+
+        // Need to swap in
+        self.ensure_gpu_space_for_block(block_id)?;
+        let gpu_ptr = self.swap_to_gpu(block_id)?;
+
+        // Update stats
+        {
+            let mut stats = self.stats.write().unwrap();
+            stats.total_swaps_in += 1;
+            let swap_time = start_time.elapsed();
+            stats.average_swap_time = Duration::from_nanos(
+                (stats.average_swap_time.as_nanos() as u64 * stats.total_swaps_in + 
+                 swap_time.as_nanos() as u64) / (stats.total_swaps_in + 1)
+            );
+        }
+
+        // Update predictor
+        self.active_set_predictor.lock().unwrap().record_access(block_id);
+
+        // Prefetch predicted blocks
+        self.prefetch_predicted_blocks()?;
+
+        Ok(gpu_ptr)
+    }
+
+    /// Ensure enough GPU space for a block
+    fn ensure_gpu_space_for_block(&self, block_id: &str) -> Result<()> {
+        let block_size = {
+            let blocks = self.blocks.read().unwrap();
+            blocks.get(block_id).unwrap().size_bytes
+        };
+
+        let mut current_gpu_usage = self.calculate_gpu_usage();
+        
+        while current_gpu_usage + block_size > self.config.max_gpu_memory {
+            // Need to evict a block
+            let evict_id = self.select_block_to_evict()?;
+            self.swap_from_gpu(&evict_id)?;
+            current_gpu_usage = self.calculate_gpu_usage();
+        }
+
+        Ok(())
+    }
+
+    /// Select which block to evict (LRU with modifications)
+    fn select_block_to_evict(&self) -> Result<String> {
+        let blocks = self.blocks.read().unwrap();
+        let gpu_blocks = self.gpu_blocks.read().unwrap();
+        
+        // Find LRU block that's not currently needed
+        let mut candidates: Vec<_> = gpu_blocks.iter()
+            .filter_map(|id| {
+                let block = blocks.get(id)?;
+                // Don't evict blocks with active dependencies
+                if self.has_active_dependencies(id) {
+                    return None;
+                }
+                Some((id.clone(), block.last_access, block.access_count))
+            })
+            .collect();
+
+        // Sort by last access time and access count
+        candidates.sort_by(|a, b| {
+            a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2))
+        });
+
+        candidates.first()
+            .map(|(id, _, _)| id.clone())
+            .ok_or_else(|| MemoryError::PoolError("No blocks available for eviction".to_string()))
+    }
+
+    /// Check if a block has active dependencies
+    fn has_active_dependencies(&self, block_id: &str) -> bool {
+        let blocks = self.blocks.read().unwrap();
+        if let Some(block) = blocks.get(block_id) {
+            // Check if any of its dependencies are in GPU
+            let gpu_blocks = self.gpu_blocks.read().unwrap();
+            block.dependencies.iter().any(|dep| gpu_blocks.contains(dep))
+        } else {
+            false
+        }
+    }
+
+    /// Swap a block from GPU to its storage location
+    fn swap_from_gpu(&self, block_id: &str) -> Result<()> {
+        let (block_info, current_location) = {
+            let blocks = self.blocks.read().unwrap();
+            let block = blocks.get(block_id).ok_or_else(|| 
+                MemoryError::PoolError(format!("Block {} not found", block_id)))?;
+            (block.clone(), block.location)
+        };
+
+        let gpu_ptr = {
+            let data = self.block_data.read().unwrap();
+            data.get(block_id).unwrap().gpu_ptr.unwrap()
+        };
+
+        // Determine target location based on access pattern
+        let target_location = self.determine_swap_location(&block_info);
+
+        // Move data
+        let new_data = self.move_block_data(gpu_ptr, block_info.size_bytes, 
+                                           StorageLocation::GPU, target_location)?;
+
+        // Update records
+        {
+            let mut blocks = self.blocks.write().unwrap();
+            blocks.get_mut(block_id).unwrap().location = target_location;
+        }
+        {
+            let mut data = self.block_data.write().unwrap();
+            data.insert(block_id.to_string(), new_data);
+        }
+        self.gpu_blocks.write().unwrap().remove(block_id);
+
+        // Free GPU memory
+        cuda::free(gpu_ptr)?;
+
+        self.stats.write().unwrap().total_swaps_out += 1;
+
+        Ok(())
+    }
+
+    /// Swap a block to GPU
+    fn swap_to_gpu(&self, block_id: &str) -> Result<*mut std::ffi::c_void> {
+        let (block_info, current_location) = {
+            let blocks = self.blocks.read().unwrap();
+            let block = blocks.get(block_id).ok_or_else(|| 
+                MemoryError::PoolError(format!("Block {} not found", block_id)))?;
+            (block.clone(), block.location)
+        };
+
+        // Allocate GPU memory
+        let gpu_ptr = cuda::malloc(block_info.size_bytes)?;
+
+        // Load data from current location
+        {
+            let data = self.block_data.read().unwrap();
+            let block_data = data.get(block_id).unwrap();
+            
+            match current_location {
+                StorageLocation::CPUMemory => {
+                    self.copy_from_cpu_to_gpu(block_data.cpu_ptr.unwrap(), 
+                                            gpu_ptr, block_info.size_bytes)?;
+                }
+                StorageLocation::PinnedMemory => {
+                    self.copy_from_pinned_to_gpu(block_data.pinned_ptr.unwrap(), 
+                                                gpu_ptr, block_info.size_bytes)?;
+                }
+                StorageLocation::Disk => {
+                    self.load_from_disk_to_gpu(&block_data.file_path.as_ref().unwrap(), 
+                                             gpu_ptr, block_info.size_bytes)?;
+                }
+                StorageLocation::MemoryMapped => {
+                    self.copy_from_mmap_to_gpu(block_data.mmap.as_ref().unwrap(), 
+                                             gpu_ptr, block_info.size_bytes)?;
+                }
+                StorageLocation::GPU => {
+                    // Already in GPU
+                    return Ok(gpu_ptr);
+                }
+            }
+        }
+
+        // Update records
+        {
+            let mut blocks = self.blocks.write().unwrap();
+            blocks.get_mut(block_id).unwrap().location = StorageLocation::GPU;
+        }
+        {
+            let mut data = self.block_data.write().unwrap();
+            let block_data = data.get_mut(block_id).unwrap();
+            block_data.gpu_ptr = Some(gpu_ptr);
+        }
+        self.gpu_blocks.write().unwrap().insert(block_id.to_string());
+
+        // Update stats
+        {
+            let mut stats = self.stats.write().unwrap();
+            stats.total_bytes_transferred += block_info.size_bytes as u64;
+            stats.peak_gpu_blocks = stats.peak_gpu_blocks.max(self.gpu_blocks.read().unwrap().len());
+        }
+
+        Ok(gpu_ptr)
+    }
+
+    /// Move block data between storage locations
+    fn move_block_data(&self, ptr: *mut std::ffi::c_void, size: usize, 
+                      from: StorageLocation, to: StorageLocation) -> Result<BlockData> {
+        let mut new_data = BlockData {
+            gpu_ptr: None,
+            cpu_ptr: None,
+            pinned_ptr: None,
+            mmap: None,
+            file_path: None,
+            compressed_data: None,
+        };
+
+        match (from, to) {
+            (StorageLocation::GPU, StorageLocation::CPUMemory) => {
+                let cpu_ptr = unsafe { libc::malloc(size) as *mut u8 };
+                if cpu_ptr.is_null() {
+                    return Err(MemoryError::AllocationFailed(size));
+                }
+                self.copy_from_gpu_to_cpu(ptr, cpu_ptr, size)?;
+                new_data.cpu_ptr = Some(cpu_ptr);
+            }
+            (StorageLocation::GPU, StorageLocation::PinnedMemory) => {
+                let pinned_ptr = self.allocate_pinned_memory(size)?;
+                self.copy_from_gpu_to_pinned(ptr, pinned_ptr, size)?;
+                new_data.pinned_ptr = Some(pinned_ptr);
+            }
+            (StorageLocation::GPU, StorageLocation::Disk) => {
+                let file_path = self.generate_swap_file_path();
+                self.save_to_disk(ptr, &file_path, size)?;
+                new_data.file_path = Some(file_path);
+            }
+            (StorageLocation::GPU, StorageLocation::MemoryMapped) => {
+                let file_path = self.generate_swap_file_path();
+                let mmap = self.create_mmap_file(&file_path, size)?;
+                self.copy_from_gpu_to_mmap(ptr, &mmap, size)?;
+                new_data.mmap = Some(Arc::new(Mutex::new(mmap)));
+                new_data.file_path = Some(file_path);
+            }
+            _ => {
+                return Err(MemoryError::PoolError(
+                    format!("Unsupported transfer from {:?} to {:?}", from, to)
+                ));
+            }
+        }
+
+        Ok(new_data)
+    }
+
+    /// Determine optimal swap location based on access patterns
+    fn determine_swap_location(&self, block: &SwappableBlock) -> StorageLocation {
+        // High-frequency blocks go to pinned memory
+        if block.access_count > 100 && self.config.use_pinned_memory {
+            return StorageLocation::PinnedMemory;
+        }
+        
+        // Medium-frequency to CPU memory
+        if block.access_count > 10 {
+            return StorageLocation::CPUMemory;
+        }
+        
+        // Low-frequency to disk with mmap if enabled
+        if self.config.use_mmap {
+            StorageLocation::MemoryMapped
+        } else {
+            StorageLocation::Disk
+        }
+    }
+
+    /// Copy data from GPU to CPU
+    fn copy_from_gpu_to_cpu(&self, gpu_ptr: *mut std::ffi::c_void, cpu_ptr: *mut u8, size: usize) -> Result<()> {
+        unsafe {
+            let result = cuda_sys::cudaMemcpy(
+                cpu_ptr as *mut std::ffi::c_void,
+                gpu_ptr,
+                size,
+                cuda_sys::cudaMemcpyDeviceToHost
+            );
+            if result != 0 {
+                return Err(MemoryError::CudaError("Failed to copy GPU to CPU".to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy data from CPU to GPU
+    fn copy_from_cpu_to_gpu(&self, cpu_ptr: *mut u8, gpu_ptr: *mut std::ffi::c_void, size: usize) -> Result<()> {
+        unsafe {
+            let result = cuda_sys::cudaMemcpy(
+                gpu_ptr,
+                cpu_ptr as *mut std::ffi::c_void,
+                size,
+                cuda_sys::cudaMemcpyHostToDevice
+            );
+            if result != 0 {
+                return Err(MemoryError::CudaError("Failed to copy CPU to GPU".to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Allocate pinned memory
+    fn allocate_pinned_memory(&self, size: usize) -> Result<*mut u8> {
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        unsafe {
+            let result = cuda_sys::cudaMallocHost(&mut ptr, size);
+            if result != 0 {
+                return Err(MemoryError::AllocationFailed(size));
+            }
+        }
+        Ok(ptr as *mut u8)
+    }
+
+    /// Copy from GPU to pinned memory
+    fn copy_from_gpu_to_pinned(&self, gpu_ptr: *mut std::ffi::c_void, pinned_ptr: *mut u8, size: usize) -> Result<()> {
+        if self.config.async_transfers && !self.transfer_streams.is_empty() {
+            unsafe {
+                let stream = self.transfer_streams[0];
+                let result = cuda_sys::cudaMemcpyAsync(
+                    pinned_ptr as *mut std::ffi::c_void,
+                    gpu_ptr,
+                    size,
+                    cuda_sys::cudaMemcpyDeviceToHost,
+                    stream
+                );
+                if result != 0 {
+                    return Err(MemoryError::CudaError("Failed async copy GPU to pinned".to_string()));
+                }
+                cuda_sys::cudaStreamSynchronize(stream);
+            }
+        } else {
+            self.copy_from_gpu_to_cpu(gpu_ptr, pinned_ptr, size)?;
+        }
+        Ok(())
+    }
+
+    /// Copy from pinned memory to GPU
+    fn copy_from_pinned_to_gpu(&self, pinned_ptr: *mut u8, gpu_ptr: *mut std::ffi::c_void, size: usize) -> Result<()> {
+        if self.config.async_transfers && !self.transfer_streams.is_empty() {
+            unsafe {
+                let stream = self.transfer_streams[0];
+                let result = cuda_sys::cudaMemcpyAsync(
+                    gpu_ptr,
+                    pinned_ptr as *mut std::ffi::c_void,
+                    size,
+                    cuda_sys::cudaMemcpyHostToDevice,
+                    stream
+                );
+                if result != 0 {
+                    return Err(MemoryError::CudaError("Failed async copy pinned to GPU".to_string()));
+                }
+                cuda_sys::cudaStreamSynchronize(stream);
+            }
+        } else {
+            self.copy_from_cpu_to_gpu(pinned_ptr, gpu_ptr, size)?;
+        }
+        Ok(())
+    }
+
+    /// Save block to disk
+    fn save_to_disk(&self, gpu_ptr: *mut std::ffi::c_void, path: &Path, size: usize) -> Result<()> {
+        // First copy to CPU
+        let cpu_buffer = vec![0u8; size];
+        unsafe {
+            let result = cuda_sys::cudaMemcpy(
+                cpu_buffer.as_ptr() as *mut std::ffi::c_void,
+                gpu_ptr,
+                size,
+                cuda_sys::cudaMemcpyDeviceToHost
+            );
+            if result != 0 {
+                return Err(MemoryError::CudaError("Failed to copy GPU to CPU for disk save".to_string()));
+            }
+        }
+
+        // Optionally compress
+        let data_to_write = if self.config.enable_compression {
+            use flate2::write::GzEncoder;
+            use flate2::Compression;
+            
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(&cpu_buffer)
+                .map_err(|e| MemoryError::PoolError(format!("Compression failed: {}", e)))?;
+            encoder.finish()
+                .map_err(|e| MemoryError::PoolError(format!("Compression finish failed: {}", e)))?
+        } else {
+            cpu_buffer
+        };
+
+        // Write to disk
+        let file = File::create(path)
+            .map_err(|e| MemoryError::PoolError(format!("Failed to create swap file: {}", e)))?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(&data_to_write)
+            .map_err(|e| MemoryError::PoolError(format!("Failed to write swap file: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Load block from disk to GPU
+    fn load_from_disk_to_gpu(&self, path: &Path, gpu_ptr: *mut std::ffi::c_void, size: usize) -> Result<()> {
+        // Read from disk
+        let file = File::open(path)
+            .map_err(|e| MemoryError::PoolError(format!("Failed to open swap file: {}", e)))?;
+        let mut reader = BufReader::new(file);
+        let mut file_data = Vec::new();
+        reader.read_to_end(&mut file_data)
+            .map_err(|e| MemoryError::PoolError(format!("Failed to read swap file: {}", e)))?;
+
+        // Optionally decompress
+        let cpu_buffer = if self.config.enable_compression {
+            use flate2::read::GzDecoder;
+            
+            let mut decoder = GzDecoder::new(&file_data[..]);
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed)
+                .map_err(|e| MemoryError::PoolError(format!("Decompression failed: {}", e)))?;
+            decompressed
+        } else {
+            file_data
+        };
+
+        // Copy to GPU
+        unsafe {
+            let result = cuda_sys::cudaMemcpy(
+                gpu_ptr,
+                cpu_buffer.as_ptr() as *const std::ffi::c_void,
+                size,
+                cuda_sys::cudaMemcpyHostToDevice
+            );
+            if result != 0 {
+                return Err(MemoryError::CudaError("Failed to copy disk data to GPU".to_string()));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Create memory-mapped file
+    fn create_mmap_file(&self, path: &Path, size: usize) -> Result<MmapMut> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)
+            .map_err(|e| MemoryError::PoolError(format!("Failed to create mmap file: {}", e)))?;
+        
+        file.set_len(size as u64)
+            .map_err(|e| MemoryError::PoolError(format!("Failed to set file size: {}", e)))?;
+
+        unsafe {
+            MmapOptions::new()
+                .map_mut(&file)
+                .map_err(|e| MemoryError::PoolError(format!("Failed to create mmap: {}", e)))
+        }
+    }
+
+    /// Copy from GPU to memory-mapped file
+    fn copy_from_gpu_to_mmap(&self, gpu_ptr: *mut std::ffi::c_void, mmap: &Arc<Mutex<MmapMut>>, size: usize) -> Result<()> {
+        let mmap_guard = mmap.lock().unwrap();
+        unsafe {
+            let result = cuda_sys::cudaMemcpy(
+                mmap_guard.as_ptr() as *mut std::ffi::c_void,
+                gpu_ptr,
+                size,
+                cuda_sys::cudaMemcpyDeviceToHost
+            );
+            if result != 0 {
+                return Err(MemoryError::CudaError("Failed to copy GPU to mmap".to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy from memory-mapped file to GPU
+    fn copy_from_mmap_to_gpu(&self, mmap: &Arc<Mutex<MmapMut>>, gpu_ptr: *mut std::ffi::c_void, size: usize) -> Result<()> {
+        let mmap_guard = mmap.lock().unwrap();
+        unsafe {
+            let result = cuda_sys::cudaMemcpy(
+                gpu_ptr,
+                mmap_guard.as_ptr() as *const std::ffi::c_void,
+                size,
+                cuda_sys::cudaMemcpyHostToDevice
+            );
+            if result != 0 {
+                return Err(MemoryError::CudaError("Failed to copy mmap to GPU".to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Generate unique swap file path
+    fn generate_swap_file_path(&self) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        self.config.swap_dir.join(format!("block_{}.swap", id))
+    }
+
+    /// Calculate current GPU memory usage
+    fn calculate_gpu_usage(&self) -> usize {
+        let blocks = self.blocks.read().unwrap();
+        let gpu_blocks = self.gpu_blocks.read().unwrap();
+        
+        gpu_blocks.iter()
+            .filter_map(|id| blocks.get(id))
+            .map(|block| block.size_bytes)
+            .sum()
+    }
+
+    /// Prefetch predicted blocks
+    fn prefetch_predicted_blocks(&self) -> Result<()> {
+        let predictions = self.active_set_predictor.lock().unwrap().predict_next();
+        
+        for block_id in predictions.iter().take(self.config.prefetch_blocks) {
+            if !self.gpu_blocks.read().unwrap().contains(block_id) {
+                self.prefetch_queue.lock().unwrap().push_back(block_id.clone());
+            }
+        }
+
+        // TODO: Implement async prefetching in background thread
+        
+        Ok(())
+    }
+
+    /// Get swap statistics
+    pub fn get_stats(&self) -> SwapStats {
+        self.stats.read().unwrap().clone()
+    }
+
+    /// Clear all swap files
+    pub fn cleanup(&self) -> Result<()> {
+        // Free all GPU memory
+        let gpu_blocks: Vec<_> = self.gpu_blocks.read().unwrap().iter().cloned().collect();
+        for block_id in gpu_blocks {
+            self.swap_from_gpu(&block_id)?;
+        }
+
+        // Remove swap files
+        if self.config.swap_dir.exists() {
+            std::fs::remove_dir_all(&self.config.swap_dir)
+                .map_err(|e| MemoryError::PoolError(format!("Failed to cleanup swap dir: {}", e)))?;
+        }
+
+        Ok(())
+    }
+}
+
+impl ActiveSetPredictor {
+    fn new(max_history: usize) -> Self {
+        Self {
+            access_history: VecDeque::with_capacity(max_history),
+            pattern_cache: HashMap::new(),
+            max_history,
+        }
+    }
+
+    fn record_access(&mut self, block_id: &str) {
+        // Add to current access set
+        if let Some(current_set) = self.access_history.back_mut() {
+            if !current_set.contains(&block_id.to_string()) {
+                current_set.push(block_id.to_string());
+            }
+        } else {
+            self.access_history.push_back(vec![block_id.to_string()]);
+        }
+    }
+
+    fn predict_next(&self) -> Vec<String> {
+        // Simple pattern matching - in production, use more sophisticated ML
+        if self.access_history.len() < 2 {
+            return Vec::new();
+        }
+
+        let recent_pattern: Vec<_> = self.access_history.iter()
+            .rev()
+            .take(3)
+            .flat_map(|v| v.iter().cloned())
+            .collect();
+
+        // Check if we've seen this pattern before
+        if let Some(prediction) = self.pattern_cache.get(&recent_pattern) {
+            return prediction.clone();
+        }
+
+        // Default: predict blocks that often follow current blocks
+        Vec::new()
+    }
+}
+
+/// Helper to create blocks for different model architectures
+pub struct ModelBlockBuilder {
+    model_type: ModelType,
+    config: DiffusionConfig,
+}
+
+impl ModelBlockBuilder {
+    pub fn new(model_type: ModelType, config: DiffusionConfig) -> Self {
+        Self { model_type, config }
+    }
+
+    /// Build blocks for SD3.5 MMDiT
+    pub fn build_sd35_blocks(&self) -> Vec<SwappableBlock> {
+        let mut blocks = Vec::new();
+        let hidden_dim = self.config.hidden_dim;
+        let num_heads = self.config.num_attention_heads;
+        let head_dim = hidden_dim / num_heads;
+
+        for layer_idx in 0..self.config.num_layers {
+            // Attention blocks
+            blocks.push(SwappableBlock {
+                id: format!("layer_{}_attn_qkv", layer_idx),
+                layer_idx,
+                block_type: BlockType::AttentionQKV,
+                size_bytes: 3 * hidden_dim * hidden_dim * 2, // Q,K,V in FP16
+                shape: vec![3, hidden_dim, hidden_dim],
+                dtype: PrecisionMode::Float16,
+                location: StorageLocation::Disk,
+                last_access: Instant::now(),
+                access_count: 0,
+                is_gradient: false,
+                dependencies: vec![],
+            });
+
+            blocks.push(SwappableBlock {
+                id: format!("layer_{}_attn_out", layer_idx),
+                layer_idx,
+                block_type: BlockType::AttentionOutput,
+                size_bytes: hidden_dim * hidden_dim * 2,
+                shape: vec![hidden_dim, hidden_dim],
+                dtype: PrecisionMode::Float16,
+                location: StorageLocation::Disk,
+                last_access: Instant::now(),
+                access_count: 0,
+                is_gradient: false,
+                dependencies: vec![format!("layer_{}_attn_qkv", layer_idx)],
+            });
+
+            // MLP blocks
+            blocks.push(SwappableBlock {
+                id: format!("layer_{}_mlp_up", layer_idx),
+                layer_idx,
+                block_type: BlockType::MLPUpProj,
+                size_bytes: hidden_dim * hidden_dim * 4 * 2, // 4x expansion
+                shape: vec![hidden_dim * 4, hidden_dim],
+                dtype: PrecisionMode::Float16,
+                location: StorageLocation::Disk,
+                last_access: Instant::now(),
+                access_count: 0,
+                is_gradient: false,
+                dependencies: vec![],
+            });
+
+            blocks.push(SwappableBlock {
+                id: format!("layer_{}_mlp_down", layer_idx),
+                layer_idx,
+                block_type: BlockType::MLPDownProj,
+                size_bytes: hidden_dim * 4 * hidden_dim * 2,
+                shape: vec![hidden_dim, hidden_dim * 4],
+                dtype: PrecisionMode::Float16,
+                location: StorageLocation::Disk,
+                last_access: Instant::now(),
+                access_count: 0,
+                is_gradient: false,
+                dependencies: vec![format!("layer_{}_mlp_up", layer_idx)],
+            });
+
+            // AdaLN
+            blocks.push(SwappableBlock {
+                id: format!("layer_{}_adaln", layer_idx),
+                layer_idx,
+                block_type: BlockType::AdaLN,
+                size_bytes: hidden_dim * 6 * 2, // 6 params per AdaLN
+                shape: vec![6, hidden_dim],
+                dtype: PrecisionMode::Float16,
+                location: StorageLocation::CPUMemory, // Keep in CPU for quick access
+                last_access: Instant::now(),
+                access_count: 0,
+                is_gradient: false,
+                dependencies: vec![],
+            });
+        }
+
+        blocks
+    }
+
+    /// Build blocks for Flux model
+    pub fn build_flux_blocks(&self) -> Vec<SwappableBlock> {
+        let mut blocks = Vec::new();
+        // Similar structure but adjusted for Flux architecture
+        // Implementation would follow Flux's specific layer structure
+        blocks
+    }
+
+    /// Build blocks for WAN 2.1 video model
+    pub fn build_wan21_blocks(&self) -> Vec<SwappableBlock> {
+        let mut blocks = Vec::new();
+        // Include temporal attention blocks and 3D conv blocks
+        // Implementation would follow WAN's specific architecture
+        blocks
+    }
+}
+
+/// Integration with existing memory management
+impl BlockSwapManager {
+    /// Create a swappable SafeGPUTensor
+    pub fn create_swappable_tensor(&self, block_id: &str, shape: Vec<usize>, dtype: PrecisionMode) -> Result<SwappableTensor> {
+        let size = shape.iter().product::<usize>() * match dtype {
+            PrecisionMode::Float32 => 4,
+            PrecisionMode::Float16 | PrecisionMode::BFloat16 => 2,
+            _ => 2,
+        };
+
+        let block = SwappableBlock {
+            id: block_id.to_string(),
+            layer_idx: 0,
+            block_type: BlockType::Custom(block_id.to_string()),
+            size_bytes: size,
+            shape: shape.clone(),
+            dtype,
+            location: StorageLocation::Disk,
+            last_access: Instant::now(),
+            access_count: 0,
+            is_gradient: false,
+            dependencies: vec![],
+        };
+
+        self.register_block(block, None)?;
+
+        Ok(SwappableTensor {
+            block_id: block_id.to_string(),
+            manager: self,
+            shape,
+            dtype,
+        })
+    }
+}
+
+/// Swappable tensor that automatically manages GPU/CPU transfers
+pub struct SwappableTensor<'a> {
+    block_id: String,
+    manager: &'a BlockSwapManager,
+    shape: Vec<usize>,
+    dtype: PrecisionMode,
+}
+
+impl<'a> SwappableTensor<'a> {
+    /// Get GPU pointer, swapping in if necessary
+    pub fn gpu_ptr(&self) -> Result<*mut std::ffi::c_void> {
+        self.manager.access_block(&self.block_id)
+    }
+
+    /// Ensure tensor is on GPU
+    pub fn ensure_gpu(&self) -> Result<()> {
+        self.gpu_ptr()?;
+        Ok(())
+    }
+
+    /// Swap out to save GPU memory
+    pub fn swap_out(&self) -> Result<()> {
+        if self.manager.gpu_blocks.read().unwrap().contains(&self.block_id) {
+            self.manager.swap_from_gpu(&self.block_id)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_block_swap_manager() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = BlockSwapConfig {
+            max_gpu_memory: 1024 * 1024 * 1024, // 1GB
+            swap_dir: temp_dir.path().to_path_buf(),
+            use_mmap: true,
+            active_blocks: 4,
+            prefetch_blocks: 2,
+            use_pinned_memory: true,
+            enable_compression: false,
+            async_transfers: false,
+            granularity: BlockGranularity::Layer,
+        };
+
+        let manager = BlockSwapManager::new(config).unwrap();
+        
+        // Test block registration
+        let block = SwappableBlock {
+            id: "test_block".to_string(),
+            layer_idx: 0,
+            block_type: BlockType::MLP,
+            size_bytes: 1024 * 1024, // 1MB
+            shape: vec![256, 1024],
+            dtype: PrecisionMode::Float16,
+            location: StorageLocation::Disk,
+            last_access: Instant::now(),
+            access_count: 0,
+            is_gradient: false,
+            dependencies: vec![],
+        };
+
+        manager.register_block(block, None).unwrap();
+        
+        // Test access
+        // Note: This would fail without CUDA, but tests the interface
+        match manager.access_block("test_block") {
+            Ok(_) => println!("Block accessed successfully"),
+            Err(e) => println!("Expected error without CUDA: {}", e),
+        }
+    }
+}

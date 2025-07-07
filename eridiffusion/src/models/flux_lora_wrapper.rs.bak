@@ -1,0 +1,224 @@
+//! LoRA wrapper for candle-transformers Flux model
+//! 
+//! This wraps the candle-transformers Flux model with LoRA adapters
+
+use candle_core::{Tensor, Module, Result, Device, DType, Var, D};
+use candle_nn::{VarBuilder, VarMap, Linear, linear};
+use candle_transformers::models::flux;
+use std::collections::HashMap;
+
+/// LoRA configuration
+#[derive(Debug, Clone)]
+pub struct LoRAConfig {
+    pub rank: usize,
+    pub alpha: f64,
+    pub dropout: f64,
+    pub target_modules: Vec<String>,
+}
+
+impl Default for LoRAConfig {
+    fn default() -> Self {
+        Self {
+            rank: 16,
+            alpha: 16.0,
+            dropout: 0.0,
+            target_modules: vec![
+                "img_attn.qkv".to_string(),
+                "img_attn.proj".to_string(),
+                "txt_attn.qkv".to_string(),
+                "txt_attn.proj".to_string(),
+                "img_mlp.0".to_string(),
+                "img_mlp.2".to_string(),
+                "txt_mlp.0".to_string(),
+                "txt_mlp.2".to_string(),
+            ],
+        }
+    }
+}
+
+/// LoRA layer that wraps a linear layer
+#[derive(Debug)]
+pub struct LoRALinear {
+    base: Linear,
+    lora_a: Option<Var>,
+    lora_b: Option<Var>,
+    rank: usize,
+    alpha: f64,
+    scale: f64,
+}
+
+impl LoRALinear {
+    pub fn new(
+        base: Linear,
+        rank: usize,
+        alpha: f64,
+        device: &Device,
+        dtype: DType,
+        var_map: &VarMap,
+        name: &str,
+    ) -> Result<Self> {
+        let in_features = base.weight().dim(1)?;
+        let out_features = base.weight().dim(0)?;
+        
+        // Create LoRA A and B matrices as Variables for training
+        let lora_a = var_map.get(
+            (rank, in_features),
+            &format!("{}.lora_a", name),
+            candle_nn::init::DEFAULT_KAIMING_NORMAL,
+            dtype,
+            device,
+        )?;
+        
+        let lora_b = var_map.get(
+            (out_features, rank),
+            &format!("{}.lora_b", name),
+            candle_nn::init::ZERO,
+            dtype,
+            device,
+        )?;
+        
+        let scale = alpha / rank as f64;
+        
+        Ok(Self {
+            base,
+            lora_a: Some(lora_a),
+            lora_b: Some(lora_b),
+            rank,
+            alpha,
+            scale,
+        })
+    }
+    
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let base_out = self.base.forward(x)?;
+        
+        if let (Some(lora_a), Some(lora_b)) = (&self.lora_a, &self.lora_b) {
+            // LoRA path: x @ A @ B * scale
+            let lora_out = x.matmul(&lora_a.as_tensor().t()?)?
+                .matmul(&lora_b.as_tensor().t()?)?;
+            let lora_out = (lora_out * self.scale)?;
+            Ok((base_out + lora_out)?)
+        } else {
+            Ok(base_out)
+        }
+    }
+    
+    pub fn trainable_params(&self) -> Vec<&Var> {
+        let mut params = Vec::new();
+        if let Some(ref a) = self.lora_a {
+            params.push(a);
+        }
+        if let Some(ref b) = self.lora_b {
+            params.push(b);
+        }
+        params
+    }
+}
+
+/// Flux model with LoRA adapters
+pub struct FluxWithLoRA {
+    base_model: flux::model::Flux,
+    lora_layers: HashMap<String, LoRALinear>,
+    var_map: VarMap,
+}
+
+impl FluxWithLoRA {
+    pub fn new(
+        config: &flux::model::Config,
+        lora_config: &LoRAConfig,
+        vb: VarBuilder,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        // Create base model
+        let base_model = flux::model::Flux::new(config, vb)?;
+        
+        // Create VarMap for LoRA parameters
+        let var_map = VarMap::new();
+        let lora_layers: HashMap<String, LoRALinear> = HashMap::new();
+        
+        // Note: We would need to intercept the linear layers during forward pass
+        // This is a simplified version - full implementation would require
+        // modifying the forward pass or using hooks
+        
+        Ok(Self {
+            base_model,
+            lora_layers,
+            var_map,
+        })
+    }
+    
+    pub fn forward(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        y: &Tensor,
+        guidance: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        // For now, just use the base model
+        // Full implementation would intercept linear layers and apply LoRA
+        flux::WithForward::forward(
+            &self.base_model,
+            img,
+            img_ids,
+            txt,
+            txt_ids,
+            timesteps,
+            y,
+            guidance,
+        )
+    }
+    
+    pub fn trainable_parameters(&self) -> Vec<&Var> {
+        let mut params = Vec::new();
+        for (_, lora) in &self.lora_layers {
+            params.extend(lora.trainable_params());
+        }
+        params
+    }
+}
+
+/// Helper to inject LoRA into existing Flux model
+/// This is a more practical approach - we'll create a custom forward implementation
+pub struct FluxLoRATrainer {
+    // Base components from Flux
+    img_in: Linear,
+    txt_in: Linear,
+    time_in: flux::model::MlpEmbedder,
+    vector_in: flux::model::MlpEmbedder,
+    guidance_in: Option<flux::model::MlpEmbedder>,
+    pe_embedder: flux::model::EmbedNd,
+    double_blocks: Vec<flux::model::DoubleStreamBlock>,
+    single_blocks: Vec<flux::model::SingleStreamBlock>,
+    final_layer: flux::model::LastLayer,
+    
+    // LoRA layers
+    lora_layers: HashMap<String, LoRALinear>,
+    var_map: VarMap,
+}
+
+impl FluxLoRATrainer {
+    /// Create from a pre-loaded Flux model by wrapping key layers with LoRA
+    pub fn from_base_model(
+        base_model: flux::model::Flux,
+        lora_config: &LoRAConfig,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        let var_map = VarMap::new();
+        let lora_layers: HashMap<String, LoRALinear> = HashMap::new();
+        
+        // Note: This is a simplified version
+        // Full implementation would need to properly extract and wrap
+        // the linear layers from the base model
+        
+        // For now, return an error indicating we need a different approach
+        Err(candle_core::Error::Msg(
+            "Direct LoRA injection into candle-transformers Flux requires a different approach. \
+             Consider using a custom Flux implementation with LoRA built-in.".to_string()
+        ))
+    }
+}

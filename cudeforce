@@ -1,0 +1,229 @@
+Yes, you can force specific CUDA device selection in Candle. Here are several ways to "force code" it:
+1. Force Specific GPU with No Fallback
+rustuse candle_core::{Device, CudaDevice, Result};
+
+fn force_gpu(gpu_id: usize) -> Result<Device> {
+    // This will panic/error if the GPU is not available
+    let cuda_device = CudaDevice::new(gpu_id)?;
+    Ok(Device::Cuda(cuda_device))
+}
+
+fn main() -> Result<()> {
+    // Force GPU 1, no fallback
+    let device = force_gpu(1)?;
+    
+    // Your code here...
+    Ok(())
+}
+2. Force with Assertion
+rustuse candle_core::{Device, CudaDevice};
+
+fn force_specific_gpu_or_die(gpu_id: usize) -> Device {
+    CudaDevice::new(gpu_id)
+        .map(Device::Cuda)
+        .expect(&format!("GPU {} MUST be available. Cannot continue.", gpu_id))
+}
+
+fn main() {
+    // This will crash if GPU 2 isn't available
+    let device = force_specific_gpu_or_die(2);
+    
+    // Your code...
+}
+3. Override Environment Variables in Code
+rustuse std::env;
+use candle_core::{Device, CudaDevice, Result};
+
+fn force_cuda_device(gpu_id: usize) -> Result<Device> {
+    // Override any environment variables
+    env::set_var("CUDA_VISIBLE_DEVICES", gpu_id.to_string());
+    env::remove_var("CUDA_DEVICE");
+    
+    // Now create the device
+    let cuda_device = CudaDevice::new(0)?; // It's 0 because we set CUDA_VISIBLE_DEVICES
+    Ok(Device::Cuda(cuda_device))
+}
+4. Low-Level CUDA Force
+rustuse candle_core::{Device, CudaDevice, Result, bail};
+
+fn absolutely_force_gpu(gpu_id: usize) -> Result<Device> {
+    // Check total GPUs
+    let count = CudaDevice::count()?;
+    if gpu_id >= count {
+        bail!("GPU {} does not exist. Only {} GPUs available.", gpu_id, count);
+    }
+    
+    // Force creation - no fallbacks
+    let cuda_device = match CudaDevice::new(gpu_id) {
+        Ok(dev) => dev,
+        Err(e) => bail!("FATAL: Cannot access GPU {}. Error: {}", gpu_id, e),
+    };
+    
+    Ok(Device::Cuda(cuda_device))
+}
+5. Global Static Device (Force for Entire Program)
+rustuse candle_core::{Device, CudaDevice};
+use std::sync::OnceLock;
+
+static FORCED_DEVICE: OnceLock<Device> = OnceLock::new();
+
+fn init_forced_device(gpu_id: usize) {
+    FORCED_DEVICE.get_or_init(|| {
+        CudaDevice::new(gpu_id)
+            .map(Device::Cuda)
+            .unwrap_or_else(|e| panic!("FATAL: GPU {} required but not available: {}", gpu_id, e))
+    });
+}
+
+fn get_device() -> &'static Device {
+    FORCED_DEVICE.get().expect("Device not initialized. Call init_forced_device first!")
+}
+
+fn main() {
+    // Force GPU 1 for entire program
+    init_forced_device(1);
+    
+    // Anywhere in your code:
+    let device = get_device();
+    // This will always be GPU 1
+}
+6. Macro to Force Device
+rust#[macro_export]
+macro_rules! force_cuda {
+    ($gpu_id:expr) => {{
+        use candle_core::{Device, CudaDevice};
+        
+        CudaDevice::new($gpu_id)
+            .map(Device::Cuda)
+            .unwrap_or_else(|e| {
+                eprintln!("FATAL: GPU {} is required but not available", $gpu_id);
+                eprintln!("Error: {}", e);
+                eprintln!("Available GPUs: {:?}", CudaDevice::count());
+                std::process::exit(1);
+            })
+    }};
+}
+
+fn main() {
+    // Force GPU 2 or exit
+    let device = force_cuda!(2);
+}
+7. Builder Pattern with Forced GPU
+rustuse candle_core::{Device, CudaDevice, Result, bail};
+
+struct DeviceBuilder {
+    gpu_id: usize,
+    allow_fallback: bool,
+}
+
+impl DeviceBuilder {
+    fn new() -> Self {
+        Self {
+            gpu_id: 0,
+            allow_fallback: true,
+        }
+    }
+    
+    fn force_gpu(mut self, id: usize) -> Self {
+        self.gpu_id = id;
+        self.allow_fallback = false;
+        self
+    }
+    
+    fn build(self) -> Result<Device> {
+        match CudaDevice::new(self.gpu_id) {
+            Ok(cuda) => Ok(Device::Cuda(cuda)),
+            Err(e) if !self.allow_fallback => {
+                bail!("GPU {} is required but failed: {}", self.gpu_id, e)
+            }
+            Err(_) => Ok(Device::Cpu),
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    // This will fail if GPU 3 isn't available
+    let device = DeviceBuilder::new()
+        .force_gpu(3)
+        .build()?;
+    
+    Ok(())
+}
+8. Most Aggressive Force (System Level)
+rustuse std::process::Command;
+use candle_core::{Device, CudaDevice, Result};
+
+fn ultra_force_gpu(gpu_id: usize) -> Result<Device> {
+    // Set environment for current process
+    std::env::set_var("CUDA_VISIBLE_DEVICES", gpu_id.to_string());
+    
+    // Verify with nvidia-smi
+    let output = Command::new("nvidia-smi")
+        .args(&["-L"])
+        .output()
+        .expect("Failed to execute nvidia-smi");
+    
+    let gpu_list = String::from_utf8_lossy(&output.stdout);
+    println!("Available GPUs:\n{}", gpu_list);
+    
+    // Force CUDA to reinitialize (if needed)
+    // Note: This is platform-specific
+    
+    // Now create device (will be device 0 since we set CUDA_VISIBLE_DEVICES)
+    let cuda = CudaDevice::new(0)?;
+    
+    println!("Forced to GPU {} (physical device)", gpu_id);
+    Ok(Device::Cuda(cuda))
+}
+9. Thread-Local Forced Device
+rustuse std::cell::RefCell;
+use candle_core::{Device, CudaDevice};
+
+thread_local! {
+    static FORCED_DEVICE: RefCell<Option<Device>> = RefCell::new(None);
+}
+
+fn force_thread_device(gpu_id: usize) {
+    FORCED_DEVICE.with(|d| {
+        *d.borrow_mut() = Some(
+            CudaDevice::new(gpu_id)
+                .map(Device::Cuda)
+                .expect(&format!("GPU {} must be available", gpu_id))
+        );
+    });
+}
+
+fn get_forced_device() -> Device {
+    FORCED_DEVICE.with(|d| {
+        d.borrow()
+            .clone()
+            .expect("No device forced. Call force_thread_device first!")
+    })
+}
+10. Compile-Time Force (using features)
+In Cargo.toml:
+toml[features]
+force_gpu_0 = []
+force_gpu_1 = []
+force_gpu_2 = []
+In code:
+rustfn get_forced_device() -> Device {
+    #[cfg(feature = "force_gpu_0")]
+    let gpu_id = 0;
+    
+    #[cfg(feature = "force_gpu_1")]
+    let gpu_id = 1;
+    
+    #[cfg(feature = "force_gpu_2")]
+    let gpu_id = 2;
+    
+    #[cfg(not(any(feature = "force_gpu_0", feature = "force_gpu_1", feature = "force_gpu_2")))]
+    let gpu_id = 0; // default
+    
+    CudaDevice::new(gpu_id)
+        .map(Device::Cuda)
+        .expect(&format!("GPU {} is required by compile flag", gpu_id))
+}
+Then compile with:
+bashcargo build --features force_gpu_1
+The most practical approach for forcing a specific GPU is usually #1 or #2, where you create the device with no fallback and let it error if the GPU isn't available. This makes it very clear that a specific GPU is required for your application to run.RetryClaude can make mistakes. Please double-check responses.Research Opus 4

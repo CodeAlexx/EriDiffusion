@@ -1,0 +1,73 @@
+Option 1: Raw Safetensors Surgery
+rustuse safetensors::SafeTensors;
+use candle_core::{Tensor, Device};
+
+// Load safetensors directly, bypass VarBuilder entirely
+let data = std::fs::read("flux1-dev.safetensors")?;
+let tensors = SafeTensors::deserialize(&data)?;
+
+// Manually create your model tensors
+let linear1_weight = tensors.tensor("double_blocks.0.img_mlp.0.weight")?;
+let my_tensor = Tensor::from_slice(
+    linear1_weight.data(),
+    linear1_weight.shape(),
+    &Device::Cuda(0)
+)?;
+Option 2: Fork and Fix Candle-Transformers
+
+Clone candle-transformers repo
+Modify their Flux model to match YOUR checkpoint structure
+Add a custom from_checkpoint method that handles the weird linear1/linear2 split
+PR it back or maintain your fork
+
+Option 3: Write a Tensor Remapper
+ruststruct TensorRemapper {
+    checkpoint: HashMap<String, Tensor>,
+    mappings: HashMap<String, String>,
+}
+
+impl TensorRemapper {
+    fn load_with_fallbacks(&self, model_path: &str) -> Result<Tensor> {
+        // Try original path, then mappings, then synthesize
+        self.checkpoint.get(model_path)
+            .or_else(|| self.mappings.get(model_path)
+                .and_then(|p| self.checkpoint.get(p)))
+            .or_else(|| self.synthesize_tensor(model_path))
+            .ok_or_else(|| anyhow!("No tensor for {}", model_path))
+    }
+}
+Option 4: GGUF Format Converter
+Convert the safetensors checkpoint to GGUF format (used by llama.cpp):
+
+More flexible tensor storage
+Supports metadata for architecture mismatches
+Can include conversion logic in the format itself
+Candle has GGUF support
+
+Option 5: Custom Model Wrapper
+ruststruct FluxWrapper {
+    // Store the raw checkpoint tensors
+    blocks: Vec<BlockTensors>,
+}
+
+struct BlockTensors {
+    // Just the tensors that actually exist
+    linear1: Tensor,  // The combined 21504 tensor
+    linear2: Tensor,
+}
+
+impl FluxWrapper {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // Implement forward pass using the actual checkpoint structure
+        // Split linear1 output on-the-fly during forward pass
+    }
+}
+Option 6: Safetensors Preprocessor
+Write a one-time converter that:
+
+Loads the flux1-dev checkpoint
+Splits the combined tensors into expected structure
+Saves a new "candle-compatible" checkpoint
+Use normal VarBuilder with the converted checkpoint
+
+

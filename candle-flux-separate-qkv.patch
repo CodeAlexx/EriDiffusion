@@ -1,0 +1,55 @@
+diff --git a/candle-transformers/src/models/flux/model.rs b/candle-transformers/src/models/flux/model.rs
+index 1234567..abcdefg 100644
+--- a/candle-transformers/src/models/flux/model.rs
++++ b/candle-transformers/src/models/flux/model.rs
+@@ -293,30 +293,39 @@ impl QkNorm {
+ 
+ #[derive(Debug, Clone)]
+ pub struct SelfAttention {
+-    qkv: Linear,
++    to_q: Linear,
++    to_k: Linear,
++    to_v: Linear,
+     norm: QkNorm,
+     proj: Linear,
+     num_heads: usize,
+ }
+ 
+ impl SelfAttention {
+     fn new(dim: usize, num_heads: usize, qkv_bias: bool, vb: VarBuilder) -> Result<Self> {
+         let head_dim = dim / num_heads;
+-        let qkv = candle_nn::linear_b(dim, dim * 3, qkv_bias, vb.pp("qkv"))?;
++        // Use separate Q, K, V layers to match AI-Toolkit format
++        let to_q = candle_nn::linear_b(dim, dim, qkv_bias, vb.pp("to_q"))?;
++        let to_k = candle_nn::linear_b(dim, dim, qkv_bias, vb.pp("to_k"))?;
++        let to_v = candle_nn::linear_b(dim, dim, qkv_bias, vb.pp("to_v"))?;
+         let norm = QkNorm::new(head_dim, vb.pp("norm"))?;
+-        let proj = candle_nn::linear(dim, dim, vb.pp("proj"))?;
++        // Note: AI-Toolkit uses "to_out.0" instead of "proj"
++        let proj = candle_nn::linear(dim, dim, vb.pp("to_out.0"))?;
+         Ok(Self {
+-            qkv,
++            to_q,
++            to_k,
++            to_v,
+             norm,
+             proj,
+             num_heads,
+         })
+     }
+ 
+     fn qkv(&self, xs: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+-        let qkv = xs.apply(&self.qkv)?;
+         let (b, l, _khd) = qkv.dims3()?;
+-        let qkv = qkv.reshape((b, l, 3, self.num_heads, ()))?;
+-        let q = qkv.i((.., .., 0))?.transpose(1, 2)?;
+-        let k = qkv.i((.., .., 1))?.transpose(1, 2)?;
+-        let v = qkv.i((.., .., 2))?.transpose(1, 2)?;
++        // Apply separate projections
++        let q = xs.apply(&self.to_q)?.reshape((b, l, self.num_heads, ()))?.transpose(1, 2)?;
++        let k = xs.apply(&self.to_k)?.reshape((b, l, self.num_heads, ()))?.transpose(1, 2)?;
++        let v = xs.apply(&self.to_v)?.reshape((b, l, self.num_heads, ()))?.transpose(1, 2)?;
++        // Apply normalization
+         let q = q.apply(&self.norm.query_norm)?;
+         let k = k.apply(&self.norm.key_norm)?;
+         Ok((q, k, v))

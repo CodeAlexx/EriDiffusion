@@ -1,0 +1,54 @@
+job: extension
+config:
+  name: "flux_lora_test"
+  process:
+    - type: 'sd_trainer'
+      device: cuda:0
+      trigger_word: "zwx"
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16.0
+      save:
+        dtype: float16
+        save_every: 50
+        max_step_saves_to_keep: 2
+      datasets:
+        - folder_path: "/home/alex/diffusers-rs/datasets/40_woman"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          shuffle_tokens: false
+          cache_latents_to_disk: true
+          resolution: [512, 512]  # Lower resolution for testing
+      train:
+        batch_size: 1
+        steps: 5  # Just 5 steps for testing
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        dtype: bf16
+        bypass_guidance_embedding: true  # Required for Flux
+      model:
+        name_or_path: "/home/alex/SwarmUI/Models/diffusion_models/flux1-dev.safetensors"
+        is_flux: true
+        quantize: false
+        max_grad_norm: 1.0
+        # Text encoder paths - use correct paths
+        t5_path: "/home/alex/SwarmUI/Models/clip/t5xxl_fp16.safetensors"
+        clip_l_path: "/home/alex/SwarmUI/Models/clip/clip_l.safetensors"
+        vae_path: "/home/alex/SwarmUI/Models/VAE/ae.safetensors"
+      sample:
+        sampler: "euler"
+        sample_every: 2
+        width: 512
+        height: 512
+        prompts:
+          - "zwx style, a test image"
+        neg: ""
+        seed: 42
+        guidance_scale: 3.5
+        sample_steps: 4

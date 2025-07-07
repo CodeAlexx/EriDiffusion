@@ -1,0 +1,56 @@
+job: extension
+config:
+  name: "flux_lora_test"
+  process:
+    - type: 'sd_trainer'
+      device: cuda:0
+      trigger_word: "ohwx"
+      network:
+        type: "lora"
+        linear: 32
+        linear_alpha: 32
+      save:
+        dtype: float16
+        save_every: 500
+        max_step_saves_to_keep: 4
+      datasets:
+        - folder_path: "/home/alex/training_data/test_dataset"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.1
+          shuffle_tokens: false
+          cache_latents_to_disk: true
+          resolution: [1024, 1024, 768, 1024, 1024, 768, 512, 512]
+      train:
+        batch_size: 1
+        steps: 1000
+        gradient_accumulation: 4
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        dtype: bf16
+        bypass_guidance_embedding: true
+      model:
+        name_or_path: "/home/alex/SwarmUI/Models/unet/flux1-dev.safetensors"
+        is_flux: true
+        quantize: true
+        max_grad_norm: 1.0
+        # Text encoder paths
+        clip_l_path: "/home/alex/SwarmUI/Models/text_encoders/clip_l.safetensors"
+        clip_g_path: "/home/alex/SwarmUI/Models/text_encoders/ViT-L-14-BEST-smooth-GmP-ft.safetensors"
+        t5_path: "/home/alex/SwarmUI/Models/text_encoders/google_t5-v1_1-xxl_encoderonly-fp16.safetensors"
+      sample:
+        sampler: "euler"
+        sample_every: 100
+        width: 1024
+        height: 1024
+        prompts:
+          - "a photo of ohwx person"
+          - "ohwx person in a garden"
+          - "portrait of ohwx"
+        neg: ""
+        seed: 42
+        guidance_scale: 3.5
+        sample_steps: 20

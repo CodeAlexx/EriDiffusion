@@ -1,0 +1,686 @@
+# Rust Vision ML Framework - Deep Dive: Internals
+
+## 1. Tensor System Internals
+
+### Storage Architecture
+
+```rust
+// Generic storage trait for different backends
+pub trait Storage<T: DType>: Send + Sync {
+    fn as_ptr(&self) -> *const T;
+    fn as_mut_ptr(&mut self) -> *mut T;
+    fn len(&self) -> usize;
+    fn device(&self) -> &dyn Device;
+}
+
+// Concrete storage implementations
+pub struct CudaStorage<T: DType> {
+    ptr: cuda::DevicePointer<T>,
+    size: usize,
+    device_id: u32,
+    // Reference counted for efficient cloning
+    ref_count: Arc<AtomicUsize>,
+}
+
+pub struct CpuStorage<T: DType> {
+    // Aligned allocation for SIMD operations
+    data: Arc<AlignedVec<T, 64>>,
+}
+
+// The actual tensor structure
+pub struct VisionTensor<T: DType = f32, D: Device = Cpu> {
+    // Storage is reference counted for cheap clones
+    storage: Arc<dyn Storage<T>>,
+    
+    // View information - allows multiple tensors to share storage
+    offset: usize,
+    shape: Shape,
+    strides: Strides,
+    layout: Layout,
+    
+    // Gradient tracking for autograd
+    grad_fn: Option<Arc<dyn GradFn>>,
+    requires_grad: bool,
+    
+    // Metadata for optimizations
+    is_contiguous: bool,
+    is_view: bool,
+}
+```
+
+### Shape and Stride System
+
+```rust
+#[derive(Clone, Debug)]
+pub struct Shape {
+    dims: SmallVec<[usize; 6]>, // Optimize for common cases (up to 6D)
+}
+
+#[derive(Clone, Debug)]
+pub struct Strides {
+    values: SmallVec<[isize; 6]>, // Signed for reverse iteration
+}
+
+impl Shape {
+    // Broadcast shapes for element-wise operations
+    pub fn broadcast_with(&self, other: &Shape) -> Result<(Shape, Strides, Strides)> {
+        let mut result_shape = SmallVec::new();
+        let mut self_strides = SmallVec::new();
+        let mut other_strides = SmallVec::new();
+        
+        let ndim = self.dims.len().max(other.dims.len());
+        
+        for i in 0..ndim {
+            let self_dim = self.dims.get(self.dims.len() - ndim + i).copied().unwrap_or(1);
+            let other_dim = other.dims.get(other.dims.len() - ndim + i).copied().unwrap_or(1);
+            
+            match (self_dim, other_dim) {
+                (a, b) if a == b => {
+                    result_shape.push(a);
+                    self_strides.push(self.strides[i]);
+                    other_strides.push(other.strides[i]);
+                }
+                (1, b) => {
+                    result_shape.push(b);
+                    self_strides.push(0); // Broadcast dimension
+                    other_strides.push(other.strides[i]);
+                }
+                (a, 1) => {
+                    result_shape.push(a);
+                    self_strides.push(self.strides[i]);
+                    other_strides.push(0); // Broadcast dimension
+                }
+                _ => return Err(Error::IncompatibleShapes),
+            }
+        }
+        
+        Ok((Shape::from(result_shape), 
+            Strides::from(self_strides), 
+            Strides::from(other_strides)))
+    }
+}
+```
+
+### Memory Layout Optimization
+
+```rust
+impl<T: DType, D: Device> VisionTensor<T, D> {
+    // Check if tensor is contiguous in memory
+    pub fn is_contiguous(&self) -> bool {
+        self.is_contiguous_in_layout(self.layout)
+    }
+    
+    // Make tensor contiguous if it isn't already
+    pub fn contiguous(&self) -> Result<Self> {
+        if self.is_contiguous() {
+            return Ok(self.clone()); // Cheap Arc clone
+        }
+        
+        // Allocate new storage and copy data
+        let new_storage = self.storage.device().allocate::<T>(self.shape.numel())?;
+        
+        // Optimized copy based on layout
+        match self.layout {
+            Layout::NCHW => self.copy_nchw_optimized(&new_storage)?,
+            Layout::NHWC => self.copy_nhwc_optimized(&new_storage)?,
+            // ...
+        }
+        
+        Ok(VisionTensor {
+            storage: Arc::new(new_storage),
+            offset: 0,
+            shape: self.shape.clone(),
+            strides: self.shape.default_strides(),
+            layout: self.layout,
+            grad_fn: None,
+            requires_grad: false,
+            is_contiguous: true,
+            is_view: false,
+        })
+    }
+    
+    // Zero-copy transpose for specific axes
+    pub fn transpose(&self, dim0: usize, dim1: usize) -> Result<Self> {
+        let mut new_shape = self.shape.clone();
+        new_shape.dims.swap(dim0, dim1);
+        
+        let mut new_strides = self.strides.clone();
+        new_strides.values.swap(dim0, dim1);
+        
+        Ok(VisionTensor {
+            storage: self.storage.clone(), // Just increment Arc
+            offset: self.offset,
+            shape: new_shape,
+            strides: new_strides,
+            layout: self.layout.transposed(dim0, dim1),
+            grad_fn: self.grad_fn.clone(),
+            requires_grad: self.requires_grad,
+            is_contiguous: false,
+            is_view: true,
+        })
+    }
+}
+```
+
+### Efficient Indexing and Slicing
+
+```rust
+pub struct TensorIterator<'a, T: DType> {
+    tensor: &'a VisionTensor<T>,
+    position: Vec<usize>,
+    finished: bool,
+}
+
+impl<'a, T: DType> Iterator for TensorIterator<'a, T> {
+    type Item = T;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        
+        // Calculate linear index from position and strides
+        let index = self.position.iter()
+            .zip(&self.tensor.strides.values)
+            .map(|(&pos, &stride)| pos as isize * stride)
+            .sum::<isize>() as usize + self.tensor.offset;
+        
+        // Get value
+        let value = unsafe {
+            *self.tensor.storage.as_ptr().add(index)
+        };
+        
+        // Advance position
+        for i in (0..self.position.len()).rev() {
+            self.position[i] += 1;
+            if self.position[i] < self.tensor.shape.dims[i] {
+                break;
+            }
+            if i == 0 {
+                self.finished = true;
+                break;
+            }
+            self.position[i] = 0;
+        }
+        
+        Some(value)
+    }
+}
+```
+
+## 2. Automatic Differentiation Approach
+
+### Gradient Function Trait
+
+```rust
+pub trait GradFn: Send + Sync {
+    // Forward pass saves necessary information
+    fn forward(&self, inputs: &[&VisionTensor]) -> Result<VisionTensor>;
+    
+    // Backward pass computes gradients
+    fn backward(&self, grad_output: &VisionTensor) -> Result<Vec<Option<VisionTensor>>>;
+    
+    // Name for debugging
+    fn name(&self) -> &'static str;
+}
+
+// Example: Matrix multiplication gradient function
+pub struct MatMulBackward {
+    lhs_shape: Shape,
+    rhs_shape: Shape,
+    lhs: Option<WeakTensor>, // Weak reference to avoid cycles
+    rhs: Option<WeakTensor>,
+}
+
+impl GradFn for MatMulBackward {
+    fn backward(&self, grad_output: &VisionTensor) -> Result<Vec<Option<VisionTensor>>> {
+        let mut grads = vec![None, None];
+        
+        // Gradient w.r.t. left operand: grad_output @ rhs.T
+        if let Some(rhs_weak) = &self.rhs {
+            if let Some(rhs) = rhs_weak.upgrade() {
+                grads[0] = Some(grad_output.matmul(&rhs.transpose(-2, -1)?)?);
+            }
+        }
+        
+        // Gradient w.r.t. right operand: lhs.T @ grad_output
+        if let Some(lhs_weak) = &self.lhs {
+            if let Some(lhs) = lhs_weak.upgrade() {
+                grads[1] = Some(lhs.transpose(-2, -1)?.matmul(grad_output)?);
+            }
+        }
+        
+        Ok(grads)
+    }
+    
+    fn name(&self) -> &'static str {
+        "MatMulBackward"
+    }
+}
+```
+
+### Computation Graph
+
+```rust
+pub struct ComputationGraph {
+    // Topologically sorted nodes for efficient backward pass
+    nodes: Vec<Arc<dyn GradFn>>,
+    
+    // Track which tensors need gradients
+    leaf_tensors: Vec<WeakTensor>,
+    
+    // Gradient accumulation for each tensor
+    gradients: HashMap<TensorId, VisionTensor>,
+}
+
+impl ComputationGraph {
+    pub fn backward(&mut self, loss: &VisionTensor) -> Result<()> {
+        // Initialize gradient of loss to 1
+        let mut grad = VisionTensor::ones_like(loss)?;
+        
+        // Traverse computation graph in reverse topological order
+        for node in self.nodes.iter().rev() {
+            let input_grads = node.backward(&grad)?;
+            
+            // Accumulate gradients for each input
+            for (input_tensor, input_grad) in node.inputs().zip(input_grads) {
+                if let Some(grad) = input_grad {
+                    self.accumulate_gradient(input_tensor.id(), grad)?;
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn accumulate_gradient(&mut self, tensor_id: TensorId, grad: VisionTensor) -> Result<()> {
+        match self.gradients.entry(tensor_id) {
+            Entry::Occupied(mut entry) => {
+                // Accumulate gradients from multiple paths
+                *entry.get_mut() = entry.get().add(&grad)?;
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(grad);
+            }
+        }
+        Ok(())
+    }
+}
+```
+
+### Efficient Gradient Checkpointing
+
+```rust
+pub struct CheckpointedBlock {
+    forward_fn: Box<dyn Fn(&VisionTensor) -> Result<VisionTensor>>,
+    // Don't store intermediate activations
+    input: Option<WeakTensor>,
+}
+
+impl GradFn for CheckpointedBlock {
+    fn forward(&self, inputs: &[&VisionTensor]) -> Result<VisionTensor> {
+        // Just run forward, don't save activations
+        (self.forward_fn)(&inputs[0])
+    }
+    
+    fn backward(&self, grad_output: &VisionTensor) -> Result<Vec<Option<VisionTensor>>> {
+        // Recompute forward pass to get activations
+        let input = self.input.as_ref()
+            .and_then(|w| w.upgrade())
+            .ok_or(Error::TensorDropped)?;
+        
+        // Enable gradient tracking for recomputation
+        let output = input.with_grad(|x| (self.forward_fn)(x))?;
+        
+        // Now compute gradients
+        output.backward_with_grad(grad_output)
+    }
+}
+```
+
+### Custom Autograd Functions
+
+```rust
+// Allow users to define custom operations with gradients
+pub trait AutogradFunction {
+    type Context;
+    
+    fn forward(ctx: &mut Self::Context, inputs: &[&VisionTensor]) -> Result<VisionTensor>;
+    fn backward(ctx: &Self::Context, grad_output: &VisionTensor) -> Result<Vec<Option<VisionTensor>>>;
+}
+
+// Example: Custom ReLU with gradient clipping
+pub struct ClippedReLU;
+
+impl AutogradFunction for ClippedReLU {
+    type Context = VisionTensor; // Save input for backward
+    
+    fn forward(ctx: &mut Self::Context, inputs: &[&VisionTensor]) -> Result<VisionTensor> {
+        let input = &inputs[0];
+        *ctx = input.clone();
+        input.maximum(&VisionTensor::zeros_like(input)?)
+    }
+    
+    fn backward(ctx: &Self::Context, grad_output: &VisionTensor) -> Result<Vec<Option<VisionTensor>>> {
+        // Gradient is 1 where input > 0, else 0
+        let grad_input = grad_output.mul(&ctx.gt(&0.0)?.cast(grad_output.dtype())?)?;
+        
+        // Clip large gradients
+        let clipped = grad_input.clamp(-1.0, 1.0)?;
+        
+        Ok(vec![Some(clipped)])
+    }
+}
+```
+
+## 3. Kernel Fusion Strategy
+
+### Pattern Matching System
+
+```rust
+pub trait FusionPattern: Send + Sync {
+    // Check if this pattern matches a subgraph
+    fn matches(&self, graph: &ComputationGraph, start_node: NodeId) -> Option<FusionMatch>;
+    
+    // Generate fused kernel
+    fn generate_kernel(&self, match_info: &FusionMatch) -> Result<FusedKernel>;
+    
+    // Priority for overlapping patterns
+    fn priority(&self) -> i32;
+}
+
+// Common pattern: Conv -> BatchNorm -> ReLU
+pub struct ConvBNReLUPattern;
+
+impl FusionPattern for ConvBNReLUPattern {
+    fn matches(&self, graph: &ComputationGraph, start_node: NodeId) -> Option<FusionMatch> {
+        let conv = graph.get_node(start_node)?;
+        if conv.op_type() != OpType::Conv2d {
+            return None;
+        }
+        
+        let bn = graph.get_single_consumer(start_node)?;
+        if bn.op_type() != OpType::BatchNorm {
+            return None;
+        }
+        
+        let relu = graph.get_single_consumer(bn.id())?;
+        if relu.op_type() != OpType::ReLU {
+            return None;
+        }
+        
+        Some(FusionMatch {
+            nodes: vec![conv.id(), bn.id(), relu.id()],
+            pattern_name: "ConvBNReLU",
+        })
+    }
+    
+    fn generate_kernel(&self, match_info: &FusionMatch) -> Result<FusedKernel> {
+        // Generate optimized CUDA/Metal kernel
+        match match_info.device_type() {
+            DeviceType::Cuda => self.generate_cuda_kernel(match_info),
+            DeviceType::Metal => self.generate_metal_kernel(match_info),
+            _ => Err(Error::FusionNotSupported),
+        }
+    }
+}
+```
+
+### CUDA Kernel Generation
+
+```rust
+impl ConvBNReLUPattern {
+    fn generate_cuda_kernel(&self, match_info: &FusionMatch) -> Result<FusedKernel> {
+        let kernel_code = r#"
+        extern "C" __global__ void conv_bn_relu_fused(
+            const float* __restrict__ input,
+            const float* __restrict__ weight,
+            const float* __restrict__ bias,
+            const float* __restrict__ bn_weight,
+            const float* __restrict__ bn_bias,
+            const float* __restrict__ running_mean,
+            const float* __restrict__ running_var,
+            float* __restrict__ output,
+            ConvParams params,
+            BatchNormParams bn_params
+        ) {
+            // Shared memory for filter caching
+            extern __shared__ float shared_mem[];
+            float* filter_cache = shared_mem;
+            
+            const int tid = threadIdx.x + blockIdx.x * blockDim.x;
+            const int stride = blockDim.x * gridDim.x;
+            
+            // Compute convolution output position
+            for (int idx = tid; idx < params.output_size; idx += stride) {
+                int n = idx / (params.out_h * params.out_w * params.out_c);
+                int c = (idx / (params.out_h * params.out_w)) % params.out_c;
+                int h = (idx / params.out_w) % params.out_h;
+                int w = idx % params.out_w;
+                
+                // Accumulate convolution
+                float sum = bias[c];
+                
+                for (int kh = 0; kh < params.kernel_h; ++kh) {
+                    for (int kw = 0; kw < params.kernel_w; ++kw) {
+                        for (int ic = 0; ic < params.in_c; ++ic) {
+                            int in_h = h * params.stride_h + kh - params.pad_h;
+                            int in_w = w * params.stride_w + kw - params.pad_w;
+                            
+                            if (in_h >= 0 && in_h < params.in_h && 
+                                in_w >= 0 && in_w < params.in_w) {
+                                
+                                int input_idx = ((n * params.in_c + ic) * params.in_h + in_h) * params.in_w + in_w;
+                                int weight_idx = ((c * params.in_c + ic) * params.kernel_h + kh) * params.kernel_w + kw;
+                                
+                                sum += input[input_idx] * weight[weight_idx];
+                            }
+                        }
+                    }
+                }
+                
+                // Apply batch normalization
+                float normalized = (sum - running_mean[c]) / sqrtf(running_var[c] + bn_params.eps);
+                float bn_output = normalized * bn_weight[c] + bn_bias[c];
+                
+                // Apply ReLU and write output
+                output[idx] = fmaxf(0.0f, bn_output);
+            }
+        }
+        "#;
+        
+        Ok(FusedKernel {
+            name: "conv_bn_relu_fused",
+            code: kernel_code.to_string(),
+            block_size: 256,
+            grid_size: |output_size| (output_size + 255) / 256,
+            shared_mem_bytes: 0,
+        })
+    }
+}
+```
+
+### Fusion Optimizer
+
+```rust
+pub struct FusionOptimizer {
+    patterns: Vec<Box<dyn FusionPattern>>,
+    cache: HashMap<GraphHash, Vec<FusedKernel>>,
+}
+
+impl FusionOptimizer {
+    pub fn optimize(&mut self, graph: &mut ComputationGraph) -> Result<()> {
+        // Sort patterns by priority
+        self.patterns.sort_by_key(|p| -p.priority());
+        
+        let mut fused_nodes = HashSet::new();
+        let mut replacements = Vec::new();
+        
+        // Find all fusion opportunities
+        for node_id in graph.topological_order() {
+            if fused_nodes.contains(&node_id) {
+                continue;
+            }
+            
+            for pattern in &self.patterns {
+                if let Some(fusion_match) = pattern.matches(graph, node_id) {
+                    // Check if any matched nodes are already fused
+                    if fusion_match.nodes.iter().any(|n| fused_nodes.contains(n)) {
+                        continue;
+                    }
+                    
+                    // Generate fused kernel
+                    let kernel = pattern.generate_kernel(&fusion_match)?;
+                    
+                    // Mark nodes as fused
+                    for node in &fusion_match.nodes {
+                        fused_nodes.insert(*node);
+                    }
+                    
+                    replacements.push((fusion_match, kernel));
+                    break;
+                }
+            }
+        }
+        
+        // Replace subgraphs with fused operations
+        for (fusion_match, kernel) in replacements {
+            graph.replace_subgraph(fusion_match.nodes, FusedOp::new(kernel))?;
+        }
+        
+        Ok(())
+    }
+}
+```
+
+### Memory Access Optimization
+
+```rust
+// Optimize memory access patterns for vision workloads
+pub struct MemoryAccessOptimizer {
+    pub fn optimize_conv_memory_layout(&self, conv: &Conv2d) -> Result<MemoryLayout> {
+        let input_shape = conv.input_shape();
+        let filter_shape = conv.weight_shape();
+        
+        // Analyze memory access pattern
+        let access_pattern = self.analyze_access_pattern(input_shape, filter_shape);
+        
+        match access_pattern {
+            AccessPattern::ChannelsLast => {
+                // NHWC layout is better for depthwise/grouped convolutions
+                Ok(MemoryLayout::NHWC)
+            }
+            AccessPattern::ChannelsFirst => {
+                // NCHW layout is better for standard convolutions
+                Ok(MemoryLayout::NCHW)
+            }
+            AccessPattern::Winograd => {
+                // Special layout for Winograd convolution
+                Ok(MemoryLayout::WinogradNHWC)
+            }
+        }
+    }
+    
+    pub fn optimize_attention_layout(&self, attention: &MultiHeadAttention) -> Result<MemoryLayout> {
+        // For attention, we want sequences to be contiguous
+        // This enables efficient matrix multiplications
+        Ok(MemoryLayout::Custom {
+            axes: vec!["batch", "heads", "sequence", "head_dim"],
+            strides: self.compute_optimal_strides(attention.shape()),
+        })
+    }
+}
+```
+
+### Pattern Library
+
+```rust
+pub fn register_common_patterns(optimizer: &mut FusionOptimizer) {
+    // Vision-specific patterns
+    optimizer.register(ConvBNReLUPattern);
+    optimizer.register(LayerNormGeLUPattern);
+    optimizer.register(MultiHeadAttentionPattern);
+    
+    // Transformer patterns
+    optimizer.register(QKVProjectionPattern);
+    optimizer.register(FFNPattern); // Linear -> Activation -> Linear
+    
+    // Diffusion model patterns
+    optimizer.register(ResBlockPattern);
+    optimizer.register(CrossAttentionPattern);
+    optimizer.register(TimestepEmbeddingPattern);
+    
+    // Element-wise fusion patterns
+    optimizer.register(BinaryOpChainPattern); // a + b * c
+    optimizer.register(UnaryOpChainPattern);  // tanh(sigmoid(x))
+}
+```
+
+## Performance Monitoring
+
+```rust
+pub struct PerformanceMonitor {
+    kernel_timings: HashMap<String, Vec<Duration>>,
+    memory_usage: MemoryStats,
+    fusion_stats: FusionStats,
+}
+
+impl PerformanceMonitor {
+    pub fn profile_execution<F>(&mut self, name: &str, f: F) -> Result<()> 
+    where 
+        F: FnOnce() -> Result<()>
+    {
+        let start = Instant::now();
+        let start_memory = self.current_memory_usage();
+        
+        f()?;
+        
+        let duration = start.elapsed();
+        let memory_delta = self.current_memory_usage() - start_memory;
+        
+        self.kernel_timings.entry(name.to_string())
+            .or_default()
+            .push(duration);
+            
+        self.memory_usage.record_peak(memory_delta);
+        
+        Ok(())
+    }
+    
+    pub fn suggest_optimizations(&self) -> Vec<OptimizationSuggestion> {
+        let mut suggestions = Vec::new();
+        
+        // Analyze kernel timings
+        for (kernel, timings) in &self.kernel_timings {
+            let avg_time = timings.iter().sum::<Duration>() / timings.len() as u32;
+            
+            if avg_time > Duration::from_millis(10) {
+                suggestions.push(OptimizationSuggestion {
+                    target: kernel.clone(),
+                    suggestion: "Consider kernel fusion or better memory layout",
+                    expected_speedup: 1.5,
+                });
+            }
+        }
+        
+        // Check memory usage patterns
+        if self.memory_usage.fragmentation_ratio() > 0.3 {
+            suggestions.push(OptimizationSuggestion {
+                target: "Memory Allocator".to_string(),
+                suggestion: "High fragmentation detected, consider memory pooling",
+                expected_speedup: 1.2,
+            });
+        }
+        
+        suggestions
+    }
+}
+```
+
+This comprehensive design provides:
+
+1. **Efficient Tensor Storage**: Reference-counted storage with zero-copy views, optimized memory layouts for vision workloads
+2. **Flexible Autograd**: Clean gradient function interface with support for checkpointing and custom operations
+3. **Aggressive Kernel Fusion**: Pattern-based optimization that can fuse entire blocks (Conv+BN+ReLU) into single kernels
+
+The framework is designed to make common operations fast by default while providing escape hatches for custom optimizations when needed.

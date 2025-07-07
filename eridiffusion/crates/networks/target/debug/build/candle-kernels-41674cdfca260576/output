@@ -1,0 +1,24 @@
+cargo:rerun-if-changed=build.rs
+cargo:rerun-if-changed=src/compatibility.cuh
+cargo:rerun-if-changed=src/cuda_utils.cuh
+cargo:rerun-if-changed=src/binary_op_macros.cuh
+cargo:info=["/usr", "/usr/local/cuda", "/opt/cuda", "/usr/lib/cuda", "C:/Program Files/NVIDIA GPU Computing Toolkit", "C:/CUDA"]
+cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP
+cargo:rustc-env=CUDA_COMPUTE_CAP=86
+cargo:info=Builder { cuda_root: Some("/usr/local/cuda"), kernel_paths: ["src/affine.cu", "src/binary.cu", "src/cast.cu", "src/conv.cu", "src/fill.cu", "src/indexing.cu", "src/quantized.cu", "src/reduce.cu", "src/sort.cu", "src/ternary.cu", "src/unary.cu"], watch: [], include_paths: ["src/binary_op_macros.cuh", "src/compatibility.cuh", "src/cuda_utils.cuh"], compute_cap: Some(86), out_dir: "/home/alex/diffusers-rs/eridiffusion/crates/networks/target/debug/build/candle-kernels-41674cdfca260576/out", extra_args: [] }
+cargo:rustc-env=CUDA_INCLUDE_DIR=/usr/local/cuda/include
+cargo:rerun-if-changed=src/binary_op_macros.cuh
+cargo:rerun-if-changed=src/compatibility.cuh
+cargo:rerun-if-changed=src/cuda_utils.cuh
+cargo:rerun-if-env-changed=NVCC_CCBIN
+cargo:rerun-if-changed=src/affine.cu
+cargo:rerun-if-changed=src/binary.cu
+cargo:rerun-if-changed=src/cast.cu
+cargo:rerun-if-changed=src/indexing.cu
+cargo:rerun-if-changed=src/sort.cu
+cargo:rerun-if-changed=src/quantized.cu
+cargo:rerun-if-changed=src/ternary.cu
+cargo:rerun-if-changed=src/unary.cu
+cargo:rerun-if-changed=src/conv.cu
+cargo:rerun-if-changed=src/fill.cu
+cargo:rerun-if-changed=src/reduce.cu
