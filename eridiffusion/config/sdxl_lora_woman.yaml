@@ -1,10 +1,10 @@
 job: extension
 config:
-  name: "sdxl_lora_test"
+  name: "sdxl_lora_woman_test"
   process:
     - type: 'sd_trainer'
       device: cuda:0
-      trigger_word: ""
+      trigger_word: "40woman"  # Add trigger word for this dataset
       
       network:
         type: "lora"
@@ -13,8 +13,8 @@ config:
       
       save:
         dtype: float16
-        save_every: 500
-        max_step_saves_to_keep: 4
+        save_every: 100      # Save more frequently for testing
+        max_step_saves_to_keep: 2
         
       datasets:
         - folder_path: "/home/alex/diffusers-rs/datasets/40_woman"
@@ -26,31 +26,30 @@ config:
           
       train:
         batch_size: 1
-        steps: 1000
-        gradient_accumulation: 4
+        steps: 200           # Reduced for testing
+        gradient_accumulation: 2
         train_unet: true
-        train_text_encoder: false  # Dual CLIP encoders not trained by default
+        train_text_encoder: false
         gradient_checkpointing: true
         noise_scheduler: "ddpm"
         optimizer: "adamw8bit"
-        lr: 1e-4
+        lr: 5e-5            # Conservative learning rate
         dtype: fp16
         
       model:
         name_or_path: "/home/alex/SwarmUI/Models/Stable-Diffusion/OfficialStableDiffusion/sd_xl_base_1.0.safetensors"
-        arch: "sdxl"  # This tells the router to use SDXL trainer
-        vae_path: "/home/alex/SwarmUI/Models/VAE/sdxl_vae.safetensors"  # If available
-        text_encoder_path: "/home/alex/SwarmUI/Models/clip/clip_l.safetensors"  # CLIP-L
-        text_encoder_2_path: "/home/alex/SwarmUI/Models/clip/clip_g.safetensors"  # CLIP-G
+        arch: "sdxl"
         
       # SDXL-specific settings
       sample:
         sampler: "ddpm"
-        sample_every: 100
+        sample_every: 50
         width: 1024
         height: 1024
         prompts: 
-          - "a test image"
+          - "40woman, portrait photo"
+          - "40woman, wearing elegant dress"
+          - "40woman, professional headshot"
         seed: 42
         guidance_scale: 7.5
-        sample_steps: 50
+        sample_steps: 30    # Reduced for faster sampling
