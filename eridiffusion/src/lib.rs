@@ -9,6 +9,7 @@ pub mod trainers;
 pub mod memory;
 pub mod networks;
 pub mod loaders;
+pub mod inference;
 
 #[cfg(feature = "cuda")]
 pub mod kernels;

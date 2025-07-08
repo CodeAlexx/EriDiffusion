@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use candle_core::{Device, DType, Module, Tensor, D};
-use candle_nn::{Init, VarBuilder, VarMap};
+use candle_nn::VarBuilder;
 use std::collections::HashMap;
 
 /// Adapter types for Stable Diffusion

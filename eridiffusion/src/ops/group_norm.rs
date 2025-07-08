@@ -92,8 +92,15 @@ impl GroupNorm {
         // Call appropriate kernel based on device and dtype
         match (device, dtype) {
             (Device::Cuda(_), DType::F32) => {
-                self.cuda_forward_f32(&x, weight, bias, &output, &mean, &rstd, 
-                                     batch_size, num_channels, spatial_size)?;
+                #[cfg(feature = "cuda")]
+                {
+                    self.cuda_forward_f32(&x, weight, bias, &output, &mean, &rstd, 
+                                         batch_size, num_channels, spatial_size)?;
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    return Err(candle_core::Error::Msg("CUDA support not compiled".to_string()));
+                }
             }
             (Device::Cuda(_), DType::BF16) => {
                 // Convert to f32, compute, convert back
@@ -102,9 +109,16 @@ impl GroupNorm {
                 let weight_f32 = weight.map(|w| w.to_dtype(DType::F32)).transpose()?;
                 let bias_f32 = bias.map(|b| b.to_dtype(DType::F32)).transpose()?;
                 
-                self.cuda_forward_f32(&x_f32, weight_f32.as_ref(), bias_f32.as_ref(), 
-                                     &output_f32, &mean, &rstd,
-                                     batch_size, num_channels, spatial_size)?;
+                #[cfg(feature = "cuda")]
+                {
+                    self.cuda_forward_f32(&x_f32, weight_f32.as_ref(), bias_f32.as_ref(), 
+                                         &output_f32, &mean, &rstd,
+                                         batch_size, num_channels, spatial_size)?;
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    return Err(candle_core::Error::Msg("CUDA support not compiled".to_string()));
+                }
                 
                 let output = output_f32.to_dtype(DType::BF16)?;
                 return Ok((output.reshape(&original_shape)?, mean, rstd));

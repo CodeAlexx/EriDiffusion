@@ -130,24 +130,43 @@ impl RotaryEmbedding {
             positions.contiguous()?
         };
 
-        let output = match (device, dtype) {
+        match (device, dtype) {
             (Device::Cuda(_), DType::F32) => {
-                self.cuda_forward_f32(&x, &positions, batch_size, seq_len, num_heads, head_dim, is_2d)?
+                #[cfg(feature = "cuda")]
+                {
+                    let output = self.cuda_forward_f32(&x, &positions, batch_size, seq_len, num_heads, head_dim, is_2d)?;
+                    // Reshape back if needed
+                    if x_dims.len() == 3 {
+                        output.reshape(x_dims)
+                    } else {
+                        Ok(output)
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    Err(candle_core::Error::Msg("CUDA support not compiled".to_string()).into())
+                }
             }
             (Device::Cuda(_), DType::BF16) => {
-                // Convert to F32, apply RoPE, convert back
-                let x_f32 = x.to_dtype(DType::F32)?;
-                let output_f32 = self.cuda_forward_f32(&x_f32, &positions, batch_size, seq_len, num_heads, head_dim, is_2d)?;
-                output_f32.to_dtype(DType::BF16)?
+                #[cfg(feature = "cuda")]
+                {
+                    // Convert to F32, apply RoPE, convert back
+                    let x_f32 = x.to_dtype(DType::F32)?;
+                    let output_f32 = self.cuda_forward_f32(&x_f32, &positions, batch_size, seq_len, num_heads, head_dim, is_2d)?;
+                    let output = output_f32.to_dtype(DType::BF16)?;
+                    // Reshape back if needed
+                    if x_dims.len() == 3 {
+                        output.reshape(x_dims)
+                    } else {
+                        Ok(output)
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    Err(candle_core::Error::Msg("CUDA support not compiled".to_string()).into())
+                }
             }
             _ => candle_core::bail!("RoPE only supports CUDA device with F32/BF16"),
-        };
-
-        // Reshape back if needed
-        if x_dims.len() == 3 {
-            output.reshape(x_dims)
-        } else {
-            Ok(output)
         }
     }
 

@@ -8,16 +8,16 @@ use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
 // Import the sampling module we'll create
-mod sampling;
-use sampling::euler_sample;
+// Use inline sampling module defined below
+use self::sampling::euler_sample;
 
 // Import the text encoder module we'll create  
-mod text_encoders;
-use text_encoders::StableDiffusion3TripleClipWithTokenizer;
+// Use inline text_encoders module defined below
+use self::text_encoders::StableDiffusion3TripleClipWithTokenizer;
 
 // Import VAE
-mod vae;
-use vae::{build_sd3_vae_autoencoder, sd3_vae_vb_rename};
+// Use inline vae module defined at the bottom of this file
+use self::vae::{build_sd3_vae_autoencoder, sd3_vae_vb_rename};
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();

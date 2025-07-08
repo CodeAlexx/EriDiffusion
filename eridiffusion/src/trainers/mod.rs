@@ -42,6 +42,7 @@ pub mod flux_layerwise_offload;
 pub mod gradient_checkpointing;
 pub mod optimizer_cpu_offload;
 pub mod flux_lora_only_loader;
+pub mod sdxl_lora_simple;
 
 // Export function is defined below, no need to re-export
 
@@ -152,7 +153,19 @@ enum ModelType {
 }
 
 fn detect_model_type(config: &ProcessConfig) -> Result<ModelType> {
-    // First check explicit flags
+    // First check explicit arch field
+    if let Some(arch) = &config.model.arch {
+        match arch.to_lowercase().as_str() {
+            "sd35" | "sd3.5" | "sd_3.5" => return Ok(ModelType::SD35),
+            "sdxl" | "sd_xl" => return Ok(ModelType::SDXL),
+            "flux" => return Ok(ModelType::Flux),
+            "sd15" | "sd1.5" | "sd_1.5" => return Ok(ModelType::SD15),
+            "sd21" | "sd2.1" | "sd_2.1" => return Ok(ModelType::SD21),
+            _ => {} // Continue to other checks
+        }
+    }
+    
+    // Then check explicit flags
     if config.model.is_v3.unwrap_or(false) {
         return Ok(ModelType::SD35);
     }
@@ -245,10 +258,13 @@ pub fn train_from_config(config_path: PathBuf) -> Result<()> {
         ModelType::SDXL => {
             println!("\nStarting SDXL training...");
             match process_config.network.network_type.as_str() {
-                "lora" | "lokr" | "lokr_full_rank" => {
-                    // Use SD3.5 trainer for SDXL temporarily
-                    println!("Note: Using SD3.5 LoKr implementation for SDXL");
-                    sd35_lokr::train_sd35_lokr(&config, process_config)?;
+                "lora" => {
+                    sdxl_lora_simple::train_sdxl_lora(&config, process_config)?;
+                }
+                "lokr" | "lokr_full_rank" => {
+                    // Use simplified trainer for now
+                    println!("Note: LoKr not yet implemented for SDXL, using LoRA instead");
+                    sdxl_lora_simple::train_sdxl_lora(&config, process_config)?;
                 }
                 _ => {
                     return Err(anyhow::anyhow!(
