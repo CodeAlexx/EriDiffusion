@@ -1,6 +1,21 @@
 # EriDiffusion Review Summary
 
-This local repository contains the fixed SDXL LoRA trainer implementation ready for review.
+This local repository contains the complete multi-model diffusion trainer implementation ready for review.
+
+## Supported Models
+
+- **SDXL** - Stable Diffusion XL with U-Net architecture
+- **SD 3.5** - Stable Diffusion 3.5 with MMDiT architecture  
+- **Flux** - Black Forest Labs Flux with hybrid architecture
+
+## Critical Dependency
+
+**This project requires the Trainable-Candle fork from https://github.com/CodeAlexx/Trainable-Candle**
+
+The fork provides essential training capabilities that standard Candle lacks:
+- GPU-accelerated LoRA backward pass
+- Direct Var creation for gradient tracking
+- Bypasses VarBuilder's inference-only limitations
 
 ## What's Been Fixed
 
@@ -49,7 +64,9 @@ This local repository contains the fixed SDXL LoRA trainer implementation ready 
 ## Files Included
 
 ### Core Training:
-- `src/trainers/sdxl_lora_trainer_fixed.rs` - Main trainer implementation
+- `src/trainers/sdxl_lora_trainer_fixed.rs` - SDXL LoRA trainer
+- `src/trainers/sd35_lora.rs` - SD 3.5 LoRA trainer
+- `src/trainers/flux_lora.rs` - Flux LoRA trainer
 - `src/trainers/sdxl_sampling_complete.rs` - Sampling/inference
 - `src/trainers/sdxl_forward_with_lora.rs` - Forward pass with LoRA
 - `src/trainers/sdxl_vae_native.rs` - VAE implementation
@@ -67,28 +84,40 @@ This local repository contains the fixed SDXL LoRA trainer implementation ready 
 - `src/loaders/sdxl_full_remapper.rs` - Full model remapping
 
 ### Configuration:
-- `config/sdxl_lora_24gb_optimized.yaml` - Optimized settings for 24GB GPUs
+- `config/sdxl_lora_24gb_optimized.yaml` - SDXL optimized for 24GB GPUs
+- `config/sd35_lora_training.yaml` - SD 3.5 training configuration
+- `config/flux_lora_24gb.yaml` - Flux optimized for 24GB GPUs
 - `config/example_sdxl_lora.yaml` - Simple example config
 
-### Binary:
-- `src/bin/train_sdxl_lora.rs` - Training entry point
+### Binaries:
+- `src/bin/train_sdxl_lora.rs` - SDXL training entry point
+- `src/bin/train_sd35_lora.rs` - SD 3.5 training entry point
+- `src/bin/train_flux_lora.rs` - Flux training entry point
 
 ## Building and Running
 
 ```bash
-# Build
-cargo build --release
+# First ensure Trainable-Candle is cloned alongside EriDiffusion
+cd ..
+git clone https://github.com/CodeAlexx/Trainable-Candle.git
+cd EriDiffusion
 
-# Run training
-cargo run --release --bin train_sdxl_lora -- config/example_sdxl_lora.yaml
+# Build with GPU support
+cargo build --release --features cuda-backward
+
+# Run training for different models
+cargo run --release --bin train_sdxl_lora -- config/sdxl_lora_24gb_optimized.yaml
+cargo run --release --bin train_sd35_lora -- config/sd35_lora_training.yaml
+cargo run --release --bin train_flux_lora -- config/flux_lora_24gb.yaml
 ```
 
 ## Notes
 
-- This is a minimal subset focused on SDXL LoRA training
-- Additional forward pass implementations can be added as needed
-- The candle-fork with GPU support is still referenced via path
-- All files have been verified to work together
+- Supports SDXL, SD 3.5, and Flux LoRA training
+- All models use GPU-accelerated training (no CPU fallback)
+- Requires the Trainable-Candle fork for training support
+- Each model has its own optimized configuration
+- All trainers produce ComfyUI-compatible LoRA files
 
 ## Next Steps
 

@@ -1,5 +1,7 @@
 pub mod sdxl_lora_trainer_fixed;
 pub mod sdxl_sampling_complete;
+pub mod sd35_lora;
+pub mod flux_lora;
 pub mod text_encoders;
 pub mod adam8bit;
 pub mod ddpm_scheduler;
@@ -10,6 +12,8 @@ pub mod memory_utils;
 
 // Re-export key types
 pub use sdxl_lora_trainer_fixed::SDXLLoRATrainerFixed;
+pub use sd35_lora::SD35LoRATrainer;
+pub use flux_lora::FluxLoRATrainer;
 pub use sdxl_sampling_complete::{SDXLSampler, TrainingSampler, SDXLSamplingConfig, SchedulerType};
 pub use text_encoders::TextEncoders;
 pub use adam8bit::Adam8bit;

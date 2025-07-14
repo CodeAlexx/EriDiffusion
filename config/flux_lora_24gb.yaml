@@ -1,0 +1,42 @@
+job: extension
+config:
+  name: "flux_lora_test" 
+  process:
+    - type: 'sd_trainer'
+      device: cuda:0
+      low_vram: true
+      trigger_word: "eri"
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+      save:
+        dtype: float16
+        save_every: 250
+        max_step_saves_to_keep: 4
+      datasets:
+        - folder_path: "/home/alex/diffusers-rs/datasets/40_woman"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.0
+          shuffle_tokens: false
+          cache_latents_to_disk: true
+          resolution: [1024]
+      train:
+        batch_size: 1
+        steps: 1000
+        gradient_accumulation: 4
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        optimizer: "adamw"
+        lr: 1e-5
+        dtype: bf16
+        linear_timesteps: true
+        bypass_guidance_embedding: true
+      model:
+        name_or_path: "/home/alex/SwarmUI/Models/diffusion_models/flux1-dev.safetensors"
+        is_flux: true
+        vae_path: "/home/alex/SwarmUI/Models/VAE/ae.safetensors"
+        clip_path: "/home/alex/SwarmUI/Models/clip"
+        t5_path: "/home/alex/SwarmUI/Models/clip/t5xxl_fp16.safetensors"

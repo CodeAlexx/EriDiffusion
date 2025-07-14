@@ -7,10 +7,10 @@ description = "Pure Rust trainer for modern diffusion models"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-# Core dependencies
-candle-core = { path = "../candle-fork/candle-core", features = ["cuda", "cuda-backward"] }
-candle-nn = { path = "../candle-fork/candle-nn" }
-candle-transformers = { path = "../candle-fork/candle-transformers" }
+# Core dependencies - Requires Trainable-Candle fork
+candle-core = { path = "../Trainable-Candle/candle-core", features = ["cuda", "cuda-backward"] }
+candle-nn = { path = "../Trainable-Candle/candle-nn" }
+candle-transformers = { path = "../Trainable-Candle/candle-transformers" }
 
 # Utilities
 anyhow = "1.0"
@@ -50,6 +50,14 @@ async = ["tokio"]
 [[bin]]
 name = "train_sdxl_lora"
 path = "src/bin/train_sdxl_lora.rs"
+
+[[bin]]
+name = "train_sd35_lora"
+path = "src/bin/train_sd35_lora.rs"
+
+[[bin]]
+name = "train_flux_lora"
+path = "src/bin/train_flux_lora.rs"
 
 [profile.release]
 opt-level = 3

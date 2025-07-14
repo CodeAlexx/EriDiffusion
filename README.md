@@ -1,6 +1,12 @@
-# EriDiffusion - SDXL LoRA Trainer
+# EriDiffusion - Multi-Model Diffusion Trainer
 
-Pure Rust implementation of SDXL LoRA training with GPU acceleration.
+Pure Rust implementation for training modern diffusion models with GPU acceleration.
+
+## Supported Models
+
+- **SDXL** - Stable Diffusion XL 1.0
+- **SD 3.5** - Stable Diffusion 3.5 (Medium/Large/Large-Turbo)  
+- **Flux** - Black Forest Labs Flux (Dev/Schnell)
 
 ## Features
 
@@ -18,31 +24,62 @@ Pure Rust implementation of SDXL LoRA training with GPU acceleration.
 - 24GB+ VRAM recommended
 - CUDA 11.0 or higher
 - Rust 1.70+
+- **Trainable-Candle fork** (required for training support)
+
+### Important: Trainable-Candle Fork
+
+This project requires the Trainable-Candle fork from https://github.com/CodeAlexx/Trainable-Candle which provides:
+- GPU-accelerated LoRA backward pass with cuBLAS
+- Direct Var creation for training (bypasses VarBuilder limitations)
+- Training-enabled Candle without the inference-only restrictions
 
 ## Setup
 
-1. Clone the repository:
+1. Clone both repositories:
 ```bash
+# Clone Trainable-Candle fork (required)
+git clone https://github.com/CodeAlexx/Trainable-Candle.git
+
+# Clone EriDiffusion
 git clone https://github.com/CodeAlexx/EriDiffusion.git
 cd EriDiffusion
 ```
 
-2. Build the project:
+2. Update Cargo.toml to point to your local Trainable-Candle:
+```toml
+[dependencies]
+candle-core = { path = "../Trainable-Candle/candle-core", features = ["cuda", "cuda-backward"] }
+candle-nn = { path = "../Trainable-Candle/candle-nn" }
+candle-transformers = { path = "../Trainable-Candle/candle-transformers" }
+```
+
+3. Build the project:
 ```bash
-cargo build --release
+cargo build --release --features cuda-backward
 ```
 
 ## Usage
 
-### Basic Training
+### Training Different Models
 
+#### SDXL LoRA
 ```bash
 cargo run --release --bin train_sdxl_lora -- config/sdxl_lora_24gb_optimized.yaml
 ```
 
+#### SD 3.5 LoRA
+```bash
+cargo run --release --bin train_sd35_lora -- config/sd35_lora_training.yaml
+```
+
+#### Flux LoRA
+```bash
+cargo run --release --bin train_flux_lora -- config/flux_lora_24gb.yaml
+```
+
 ### Configuration
 
-Edit `config/sdxl_lora_24gb_optimized.yaml` to customize:
+Each model has its own config file with model-specific settings:
 - Model paths (must be local .safetensors files)
 - Dataset location
 - Training parameters
@@ -85,10 +122,23 @@ With default settings on 24GB GPU:
 
 ## Technical Details
 
-This implementation uses a custom Candle fork that enables training by:
-1. Bypassing VarBuilder to create trainable Var parameters
-2. Using GPU-accelerated LoRA backward pass with cuBLAS
-3. Direct safetensors loading without inference-only limitations
+### Model Architectures
+
+- **SDXL**: U-Net based with dual text encoders (CLIP-L + CLIP-G)
+- **SD 3.5**: MMDiT (Multimodal Diffusion Transformer) with triple text encoding
+- **Flux**: Hybrid architecture with double/single stream blocks
+
+### Training Approach
+
+All models use the Trainable-Candle fork which enables:
+1. Direct `Var::from_tensor()` for trainable parameters (no VarBuilder)
+2. GPU-accelerated LoRA backward pass with cuBLAS
+3. Gradient tracking throughout the entire model
+4. Direct safetensors loading without inference-only limitations
+
+### Key Differences from Standard Candle
+
+Standard Candle's VarBuilder returns immutable `Tensor` objects, making training impossible. The Trainable-Candle fork bypasses this entirely, allowing us to create trainable `Var` objects directly and implement proper backpropagation.
 
 ## License
 
