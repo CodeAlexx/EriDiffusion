@@ -105,10 +105,13 @@ cd EriDiffusion
 # Build with GPU support
 cargo build --release --features cuda-backward
 
-# Run training for different models
-cargo run --release --bin train_sdxl_lora -- config/sdxl_lora_24gb_optimized.yaml
-cargo run --release --bin train_sd35_lora -- config/sd35_lora_training.yaml
-cargo run --release --bin train_flux_lora -- config/flux_lora_24gb.yaml
+# Run training with automatic model detection
+./target/release/trainer config/sdxl_lora_24gb_optimized.yaml
+./target/release/trainer config/sd35_lora_training.yaml
+./target/release/trainer config/flux_lora_24gb.yaml
+
+# Or after installing to PATH:
+trainer /path/to/config.yaml
 ```
 
 ## Notes
