@@ -4,12 +4,29 @@ Pure Rust implementation for training modern diffusion models with GPU accelerat
 
 ## Supported Models
 
+### Currently Implemented
 - **SDXL** - Stable Diffusion XL 1.0
 - **SD 3.5** - Stable Diffusion 3.5 (Medium/Large/Large-Turbo)  
 - **Flux** - Black Forest Labs Flux (Dev/Schnell)
 
+### Planned Models
+**Image Models:**
+- **Flex** - Next-gen architecture
+- **OmniGen 2** - Multi-modal generation
+- **HiDream** - High-resolution synthesis
+- **Chroma** - Advanced color model
+- **Sana** - Efficient transformer
+- **Kolors** - Bilingual diffusion model
+
+**Video Models:**
+- **Wan Vace 2.1** - Video generation
+- **LTX** - Long-form video synthesis
+- **Hunyuan** - Multi-modal video model
+
 ## Features
 
+### Current Features
+- ✅ **LoRA Training**: Low-rank adaptation for all supported models
 - ✅ **Var-based Training**: Direct gradient tracking without VarBuilder limitations
 - ✅ **GPU-Only**: Industry-standard GPU requirement (no CPU fallback)
 - ✅ **ComfyUI Compatible**: Saves LoRA weights in ComfyUI format
@@ -17,6 +34,14 @@ Pure Rust implementation for training modern diffusion models with GPU accelerat
 - ✅ **Integrated Sampling**: Generate samples during training to monitor progress
 - ✅ **8-bit Adam**: Memory-efficient optimizer
 - ✅ **Mixed Precision**: BF16/FP16 training support
+
+### Planned Features
+- 🚧 **Full Finetune**: Complete model fine-tuning (not just LoRA)
+- 🚧 **DoRA**: Weight-Decomposed Low-Rank Adaptation
+- 🚧 **LoKr**: Low-rank Kronecker product adaptation
+- 🚧 **Multi-GPU**: Distributed training support
+- 🚧 **FSDP**: Fully Sharded Data Parallel training
+- 🚧 **Flash Attention 3**: Latest attention optimizations
 
 ## Requirements
 
@@ -147,6 +172,25 @@ All models use the Trainable-Candle fork which enables:
 ### Key Differences from Standard Candle
 
 Standard Candle's VarBuilder returns immutable `Tensor` objects, making training impossible. The Trainable-Candle fork bypasses this entirely, allowing us to create trainable `Var` objects directly and implement proper backpropagation.
+
+## Roadmap
+
+### Phase 1 (Current)
+- ✅ LoRA training for SDXL, SD 3.5, Flux
+- ✅ Basic sampling during training
+- ✅ Memory optimizations for 24GB GPUs
+
+### Phase 2 (In Progress)
+- 🚧 Full model fine-tuning support
+- 🚧 Complete sampling for all models
+- 🚧 Additional model architectures
+
+### Phase 3 (Planned)
+- 📋 Video model support (Wan Vace 2.1, LTX, Hunyuan)
+- 📋 Multi-GPU distributed training
+- 📋 Advanced adaptation methods (DoRA, LoKr)
+
+See CLAUDE.md for detailed development guidelines and model specifications.
 
 ## License
 
