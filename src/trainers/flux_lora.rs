@@ -1980,9 +1980,9 @@ pub fn train_flux_lora(config: &Config, process_config: &ProcessConfig) -> Resul
             // 4. Unload VAE
             // 5. Reload Flux model
             
-            // TODO: Implement model swapping for sampling
-            println!("Sampling temporarily disabled for memory-efficient mode");
-            println!("To enable sampling, implement model swapping or use a separate process");
+            // Log sampling placeholder
+            use crate::trainers::sampling_utils::log_sampling_placeholder;
+            log_sampling_placeholder("Flux", "Memory-efficient mode requires model swapping (not yet implemented)");
         }
         
         step += 1;
