@@ -1,0 +1,53 @@
+job: extension
+config:
+  name: "example_sdxl_lora"
+  process:
+    - type: 'sd_trainer'
+      device: cuda:0
+      trigger_word: "my_trigger"
+      
+      model:
+        name_or_path: "/path/to/your/sdxl_model.safetensors"
+        is_sdxl: true
+        
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+        
+      save:
+        dtype: float16
+        save_every: 500
+        max_step_saves_to_keep: 2
+        
+      datasets:
+        - folder_path: "/path/to/your/images"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          shuffle_tokens: false
+          cache_latents_to_disk: true
+          resolution: [1024]
+          
+      train:
+        batch_size: 1
+        steps: 1000
+        gradient_accumulation: 4
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "ddpm"
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        dtype: bf16
+        
+      sample:
+        sampler: "ddim"
+        sample_every: 250
+        sample_steps: 30
+        guidance_scale: 7.5
+        prompts:
+          - "a photo of {trigger_word}"
+          - "{trigger_word} in a garden"
+        neg: "low quality, blurry"
+        width: 1024
+        height: 1024

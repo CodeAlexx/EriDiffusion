@@ -1,0 +1,107 @@
+job: extension
+config:
+  name: "sdxl_lora_24gb_optimized"
+  process:
+    - type: 'sd_trainer'
+      device: cuda:0
+      low_vram: true
+      trigger_word: "trigger_word"
+      
+      # Model configuration
+      model:
+        name_or_path: "/home/alex/SwarmUI/Models/Stable-Diffusion/sd_xl_base_1.0.safetensors"
+        is_sdxl: true
+        is_flux: false
+        is_v3: false
+        vae_path: null  # Will use VAE from main model
+        text_encoder_path: null  # Will use from SwarmUI
+        text_encoder_2_path: null
+        snr_gamma: 5.0
+        
+      network:
+        type: "lora"
+        linear: 16  # Rank
+        linear_alpha: 16
+        conv: null
+        conv_alpha: null
+        
+      save:
+        dtype: float16
+        save_every: 250
+        max_step_saves_to_keep: 4
+        push_to_hub: false
+        hf_repo_id: null
+        hf_private: false
+        
+      datasets:
+        - folder_path: "/home/alex/datasets/training_images"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          shuffle_tokens: false
+          cache_latents_to_disk: true
+          resolution: [768, 1024]  # Support multiple resolutions
+          
+      train:
+        batch_size: 1  # Keep low for 24GB
+        steps: 2000
+        gradient_accumulation: 4  # Effective batch size of 4
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true  # Required for 24GB
+        noise_scheduler: "ddpm"  # or "flowmatch" for newer models
+        optimizer: "adamw8bit"  # Memory efficient optimizer
+        lr: 1e-4
+        lr_scheduler: "cosine"
+        lr_scheduler_num_cycles: 1
+        lr_warmup_steps: 100
+        dtype: bf16  # or fp16
+        xformers: false  # We use efficient attention instead
+        min_snr_gamma: 5
+        max_grad_norm: 1.0
+        seed: 42
+        
+        # CPU offloading for very large batches or resolutions
+        cpu_offload: false  # Enable if needed for 1024x1024
+        
+      sample:
+        sampler: "ddim"
+        sample_every: 250
+        sample_steps: 30
+        guidance_scale: 7.5
+        prompts:
+          - "a photo of {trigger_word} riding a bicycle"
+          - "a painting of {trigger_word} in the style of Van Gogh"
+          - "{trigger_word} as a superhero, detailed, high quality"
+        neg: "low quality, blurry, distorted"
+        width: 1024
+        height: 1024
+        
+      logging:
+        log_every: 10
+        log_grad_norm: true
+        use_wandb: false
+        wandb_project: null
+        wandb_run_name: null
+        
+      advanced:
+        # VAE tiling for high resolution training
+        vae_tiling: true
+        vae_tile_size: 512
+        
+        # Mixed precision settings
+        mixed_precision: "bf16"
+        
+        # Memory optimization
+        empty_cache_steps: 50  # Clear CUDA cache every N steps
+        
+        # LoRA specific
+        lora_bias: "none"
+        lora_dropout: 0.0
+        
+        # Attention settings
+        attention_mode: "xformers"  # or "flash", "efficient"
+        
+meta:
+  author: "EriDiffusion"
+  version: "1.0"
+  description: "Optimized SDXL LoRA training for 24GB GPUs"

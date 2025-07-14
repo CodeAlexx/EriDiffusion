@@ -1,0 +1,46 @@
+# Rust
+target/
+Cargo.lock
+**/*.rs.bk
+
+# Output directories
+output/
+checkpoints/
+samples/
+logs/
+
+# Model files (too large for git)
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+
+# Dataset files
+*.jpg
+*.jpeg
+*.png
+*.webp
+datasets/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python (if any scripts)
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+venv/
+
+# Temp files
+*.tmp
+*.temp
+*.log
