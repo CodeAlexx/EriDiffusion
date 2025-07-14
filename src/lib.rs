@@ -1,5 +1,7 @@
 pub mod trainers;
 pub mod loaders;
+pub mod models;
+pub mod memory;
 
 // Re-export common types
 pub use trainers::{Config, ProcessConfig, load_config};

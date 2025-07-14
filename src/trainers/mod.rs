@@ -3,6 +3,8 @@ pub mod sdxl_sampling_complete;
 pub mod sd35_lora;
 pub mod flux_lora;
 pub mod flux_sampling;
+pub mod flux_data_loader;
+pub mod device_debug;
 pub mod text_encoders;
 pub mod adam8bit;
 pub mod ddpm_scheduler;
