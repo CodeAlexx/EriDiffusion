@@ -22,6 +22,7 @@ use anyhow::{Result, Context};
 use serde::{Serialize, Deserialize};
 use std::path::PathBuf;
 use std::fs;
+use candle_core;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
@@ -176,4 +177,125 @@ pub fn load_config(path: &PathBuf) -> Result<Config> {
         .with_context(|| "Failed to parse YAML config")?;
     
     Ok(config)
+}
+
+#[derive(Debug)]
+enum ModelType {
+    SDXL,
+    SD35,
+    Flux,
+}
+
+fn detect_model_type(process_config: &ProcessConfig) -> Result<ModelType> {
+    // Check explicit flags first
+    if process_config.model.is_sdxl.unwrap_or(false) {
+        return Ok(ModelType::SDXL);
+    }
+    if process_config.model.is_v3.unwrap_or(false) {
+        return Ok(ModelType::SD35);
+    }
+    if process_config.model.is_flux.unwrap_or(false) {
+        return Ok(ModelType::Flux);
+    }
+    
+    // Check by model path/name
+    let model_path = process_config.model.name_or_path.to_lowercase();
+    if model_path.contains("sdxl") || model_path.contains("sd_xl") {
+        return Ok(ModelType::SDXL);
+    }
+    if model_path.contains("sd3") || model_path.contains("sd35") || model_path.contains("sd_3") {
+        return Ok(ModelType::SD35);
+    }
+    if model_path.contains("flux") {
+        return Ok(ModelType::Flux);
+    }
+    
+    // Default to SDXL
+    println!("Warning: Could not determine model type from config, defaulting to SDXL");
+    Ok(ModelType::SDXL)
+}
+
+pub fn train_from_config(config_path: PathBuf) -> Result<()> {
+    // Check for GPU requirement first
+    let device = candle_core::Device::cuda_if_available(0)?;
+    if !device.is_cuda() {
+        eprintln!("ERROR: GPU is required for training. No CUDA device found.");
+        eprintln!("This trainer follows industry standards and requires a CUDA-capable GPU.");
+        eprintln!("CPU training is not supported.");
+        return Err(anyhow::anyhow!("Training requires a CUDA GPU. CPU training is not supported."));
+    }
+    println!("GPU detected and verified for training");
+    
+    // Load YAML configuration
+    let config_str = fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
+    
+    let config: Config = serde_yaml::from_str(&config_str)
+        .with_context(|| "Failed to parse YAML config")?;
+    
+    // Find the sd_trainer process config
+    let process_config = config.config.process
+        .iter()
+        .find(|p| p.process_type == Some("sd_trainer".to_string()))
+        .ok_or_else(|| anyhow::anyhow!("No 'sd_trainer' process found in config"))?;
+    
+    // Detect model type
+    let model_type = detect_model_type(process_config)?;
+    
+    println!("\nDetected model type: {:?}", model_type);
+    println!("Model path: {}", process_config.model.name_or_path);
+    println!("Network type: {}", process_config.network.type_);
+    
+    // Route to appropriate trainer
+    match model_type {
+        ModelType::SDXL => {
+            println!("\nStarting SDXL training...");
+            match process_config.network.type_.as_str() {
+                "lora" => {
+                    let mut trainer = SDXLLoRATrainerFixed::new(&config, process_config)?;
+                    trainer.load_models()?;
+                    trainer.train()?;
+                }
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "Unsupported network type '{}' for SDXL", 
+                        process_config.network.type_
+                    ));
+                }
+            }
+        }
+        ModelType::SD35 => {
+            println!("\nStarting SD 3.5 training...");
+            match process_config.network.type_.as_str() {
+                "lora" => {
+                    let mut trainer = SD35LoRATrainer::new(&config, process_config)?;
+                    trainer.train()?;
+                }
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "Unsupported network type '{}' for SD 3.5", 
+                        process_config.network.type_
+                    ));
+                }
+            }
+        }
+        ModelType::Flux => {
+            println!("\nStarting Flux training...");
+            match process_config.network.type_.as_str() {
+                "lora" => {
+                    let mut trainer = FluxLoRATrainer::new(&config, process_config)?;
+                    trainer.train()?;
+                }
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "Unsupported network type '{}' for Flux", 
+                        process_config.network.type_
+                    ));
+                }
+            }
+        }
+    }
+    
+    println!("\nTraining completed successfully!");
+    Ok(())
 }

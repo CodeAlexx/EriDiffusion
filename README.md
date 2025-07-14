@@ -58,24 +58,32 @@ candle-transformers = { path = "../Trainable-Candle/candle-transformers" }
 cargo build --release --features cuda-backward
 ```
 
+4. The executable will be at `target/release/trainer`. Copy it to your PATH or project root:
+```bash
+# Option 1: Copy to project root
+cp target/release/trainer .
+
+# Option 2: Install to system (requires sudo)
+sudo cp target/release/trainer /usr/local/bin/
+```
+
 ## Usage
 
 ### Training Different Models
 
-#### SDXL LoRA
+EriDiffusion uses a single `trainer` binary that automatically detects the model type from your YAML configuration:
+
 ```bash
-cargo run --release --bin train_sdxl_lora -- config/sdxl_lora_24gb_optimized.yaml
+# After building, run from project root:
+./trainer config/sdxl_lora_24gb_optimized.yaml
+./trainer config/sd35_lora_training.yaml  
+./trainer config/flux_lora_24gb.yaml
+
+# Or with full path:
+trainer /path/to/config/sdxl_lora_24gb_optimized.yaml
 ```
 
-#### SD 3.5 LoRA
-```bash
-cargo run --release --bin train_sd35_lora -- config/sd35_lora_training.yaml
-```
-
-#### Flux LoRA
-```bash
-cargo run --release --bin train_flux_lora -- config/flux_lora_24gb.yaml
-```
+The trainer reads the model architecture from the YAML and automatically routes to the correct training pipeline.
 
 ### Configuration
 

@@ -48,6 +48,11 @@ progress-bar = ["indicatif"]
 async = ["tokio"]
 
 [[bin]]
+name = "trainer"
+path = "src/bin/trainer.rs"
+
+# Individual trainers (for direct access if needed)
+[[bin]]
 name = "train_sdxl_lora"
 path = "src/bin/train_sdxl_lora.rs"
 
