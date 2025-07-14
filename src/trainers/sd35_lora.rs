@@ -460,6 +460,10 @@ impl SD35LoRATrainer {
             // Save checkpoint
             if step > 0 && step % self.save_every == 0 {
                 self.save_lora(step)?;
+                
+                // Sampling placeholder
+                use crate::trainers::sampling_utils::log_sampling_placeholder;
+                log_sampling_placeholder("SD 3.5", "Sampling implementation pending");
             }
         }
         

@@ -508,7 +508,7 @@ impl SDXLSampler {
         added_cond_kwargs: Option<&HashMap<String, Tensor>>,
     ) -> Result<Tensor> {
         // Use the existing forward pass from the trainer
-        use crate::trainers::sdxl_forward_with_lora::forward_sdxl_with_lora;
+        use crate::trainers::sdxl_forward_sampling::forward_sdxl_sampling;
         
         // Extract additional conditioning
         let pooled_proj = added_cond_kwargs
@@ -518,16 +518,15 @@ impl SDXLSampler {
             .and_then(|kwargs| kwargs.get("time_ids"))
             .context("Missing time_ids in added_cond_kwargs")?;
         
-        // Forward pass with LoRA
-        // Note: The current forward_sdxl_with_lora doesn't handle pooled_proj and time_ids
-        // For now, we'll use the basic version without additional conditioning
-        // TODO: Implement full SDXL conditioning support in forward pass
-        forward_sdxl_with_lora(
+        // Forward pass with LoRA and additional conditioning
+        forward_sdxl_sampling(
             sample,
             timestep,
             encoder_hidden_states,
             unet_weights,
             lora_collection,
+            pooled_proj,
+            time_ids,
         )
     }
 
