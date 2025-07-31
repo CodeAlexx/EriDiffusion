@@ -8,9 +8,8 @@
 
 
 use anyhow::{Result, Context};
-use candle_core::{Tensor, DType, Var, D};
-// use eridiffusion_core::Device; // Using candle_core::Device instead
-use candle_nn::{VarBuilder, VarMap, AdamW, ParamsAdamW, Optimizer};
+use flame::{Tensor, DType, Var, D, Device};
+use flame::nn::{VarBuilder, VarMap, AdamW, ParamsAdamW, Optimizer};
 // Remove old VAE import - we'll use our Flux-specific VAE
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

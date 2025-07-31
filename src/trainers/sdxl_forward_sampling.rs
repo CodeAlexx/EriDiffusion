@@ -2,7 +2,7 @@
 //! This provides a minimal working forward pass specifically for inference/sampling
 
 use anyhow::{Result, anyhow};
-use candle_core::{Device, DType, Tensor, Module, D};
+use flame::{Device, DType, Tensor, Module, D};
 use std::collections::HashMap;
 use super::sdxl_lora_trainer_fixed::LoRACollection;
 
@@ -118,7 +118,7 @@ fn forward_sdxl_basic(
     Ok(output)
 }
 
-/// Simplified block application
+/// Simplified block application with LoRA injection
 fn apply_basic_blocks(
     hidden_states: &Tensor,
     time_emb: &Tensor,
@@ -127,17 +127,48 @@ fn apply_basic_blocks(
     lora: &LoRACollection,
     block_type: &str,
 ) -> Result<Tensor> {
-    // For sampling, we can use a simplified approach
-    // Just apply some basic transformations to get it working
     let mut h = hidden_states.clone();
+    let device = h.device();
     
-    // Apply a simple residual connection with time embedding
-    if let Some(weight) = weights.get(&format!("{}.resnets.0.conv1.weight", block_type)) {
-        // Simple convolution as a placeholder
-        h = h.conv2d(weight, 1, 1, 1, 1)?;
+    // For down_blocks and up_blocks, apply attention with LoRA
+    if block_type.contains("blocks") {
+        // Find attention layers in this block
+        for key in weights.keys() {
+            if key.starts_with(block_type) && key.contains("attentions") {
+                // Extract block and attention indices
+                // Format: "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.weight"
+                if key.contains(".to_q.weight") {
+                    let base_key = key.trim_end_matches(".weight");
+                    
+                    // Apply attention with LoRA if available
+                    if let Some(q_weight) = weights.get(key) {
+                        // Check for LoRA weights
+                        let lora_key = format!("lora_unet_{}", base_key.replace('.', "_"));
+                        
+                        if let (Some(lora_down), Some(lora_up)) = (
+                            lora.lora_down.get(&lora_key),
+                            lora.lora_up.get(&lora_key)
+                        ) {
+                            // Apply base linear
+                            let q = h.matmul(&q_weight.t()?)?;
+                            
+                            // Apply LoRA: output = base + scale * (input @ down @ up)
+                            let lora_out = h.matmul(&lora_down.t()?)?
+                                .matmul(&lora_up.t()?)?;
+                            let scale = lora.scale.unwrap_or(1.0);
+                            
+                            h = (q + (lora_out * scale)?)?;
+                        } else {
+                            // No LoRA, just apply base weight
+                            h = h.matmul(&q_weight.t()?)?;
+                        }
+                    }
+                }
+            }
+        }
     }
     
-    // Add residual
+    // Apply residual connection
     h = (h + hidden_states)?;
     
     Ok(h)

@@ -4,7 +4,7 @@
 //! progress and generate validation images.
 
 use anyhow::{Result, Context};
-use candle_core::{Tensor, Device, DType, D};
+use flame::{Tensor, Device, DType, D};
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
 use image::{DynamicImage, ImageBuffer, Rgb};
 use std::path::{Path, PathBuf};
