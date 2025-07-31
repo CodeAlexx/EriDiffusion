@@ -27,7 +27,7 @@ Pure Rust implementation for training modern diffusion models with GPU accelerat
 
 ### Current Features
 - ✅ **LoRA Training**: Low-rank adaptation for all supported models
-- ✅ **Var-based Training**: Direct gradient tracking without VarBuilder limitations
+- ✅ **FLAME Framework**: Pure Rust tensor framework with automatic differentiation
 - ✅ **GPU-Only**: Industry-standard GPU requirement (no CPU fallback)
 - ✅ **ComfyUI Compatible**: Saves LoRA weights in ComfyUI format
 - ✅ **Memory Optimized**: Designed for 24GB VRAM with gradient checkpointing
@@ -49,38 +49,29 @@ Pure Rust implementation for training modern diffusion models with GPU accelerat
 - 24GB+ VRAM recommended
 - CUDA 11.0 or higher
 - Rust 1.70+
-- **Trainable-Candle fork** (required for training support)
+- **FLAME Framework** (included as local dependency)
 
-### Important: Trainable-Candle Fork
+### Important: FLAME Framework
 
-This project requires the Trainable-Candle fork from https://github.com/CodeAlexx/Trainable-Candle which provides:
-- GPU-accelerated LoRA backward pass with cuBLAS
-- Direct Var creation for training (bypasses VarBuilder limitations)
-- Training-enabled Candle without the inference-only restrictions
+This project uses FLAME (Flexible Learning and Adaptive Memory Engine), a pure Rust tensor framework with:
+- GPU-accelerated automatic differentiation
+- Conv2D forward and backward passes with CUDA kernels
+- Advanced gradient modifications (clipping, normalization, noise injection)
+- Native Rust implementation without Python dependencies
 
 ## Setup
 
-1. Clone both repositories:
+1. Clone the repository:
 ```bash
-# Clone Trainable-Candle fork (required)
-git clone https://github.com/CodeAlexx/Trainable-Candle.git
-
-# Clone EriDiffusion
 git clone https://github.com/CodeAlexx/EriDiffusion.git
 cd EriDiffusion
 ```
 
-2. Update Cargo.toml to point to your local Trainable-Candle:
-```toml
-[dependencies]
-candle-core = { path = "../Trainable-Candle/candle-core", features = ["cuda", "cuda-backward"] }
-candle-nn = { path = "../Trainable-Candle/candle-nn" }
-candle-transformers = { path = "../Trainable-Candle/candle-transformers" }
-```
+2. The project includes FLAME as a local dependency in the `flame/` directory.
 
 3. Build the project:
 ```bash
-cargo build --release --features cuda-backward
+cargo build --release
 ```
 
 4. The executable will be at `target/release/trainer`. Copy it to your PATH or project root:
@@ -163,15 +154,15 @@ With default settings on 24GB GPU:
 
 ### Training Approach
 
-All models use the Trainable-Candle fork which enables:
-1. Direct `Var::from_tensor()` for trainable parameters (no VarBuilder)
-2. GPU-accelerated LoRA backward pass with cuBLAS
-3. Gradient tracking throughout the entire model
-4. Direct safetensors loading without inference-only limitations
+All models use the FLAME framework which provides:
+1. Automatic differentiation with gradient tracking
+2. GPU-accelerated tensor operations with CUDA kernels
+3. Advanced gradient modifications (clipping, normalization, noise)
+4. Direct safetensors loading and weight management
 
-### Key Differences from Standard Candle
+### FLAME Integration
 
-Standard Candle's VarBuilder returns immutable `Tensor` objects, making training impossible. The Trainable-Candle fork bypasses this entirely, allowing us to create trainable `Var` objects directly and implement proper backpropagation.
+FLAME (Flexible Learning and Adaptive Memory Engine) is our pure Rust tensor framework that replaces Candle entirely. It provides native automatic differentiation and GPU acceleration without any Python dependencies.
 
 ## Roadmap
 
