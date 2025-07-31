@@ -190,7 +190,7 @@ Standard Candle's VarBuilder returns immutable `Tensor` objects, making training
 - 📋 Multi-GPU distributed training
 - 📋 Advanced adaptation methods (DoRA, LoKr)
 
-See CLAUDE.md for detailed development guidelines and model specifications.
+See the documentation for detailed development guidelines and model specifications.
 
 ## License
 

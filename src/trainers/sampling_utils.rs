@@ -1,83 +1,145 @@
-//! Common sampling utilities for all diffusion models
-//! Provides a simple interface for generating samples during training
+//! Common utilities for sampling/inference across all models
+//! Provides image saving, tensor conversion, and directory management
 
-use anyhow::Result;
-use candle_core::{Device, DType, Tensor};
-use std::path::PathBuf;
-use std::fs;
-use image::{ImageBuffer, Rgb};
+use anyhow::{Context, Result};
+use candle_core::{DType, Device, Tensor};
+use std::path::{Path, PathBuf};
 
-/// Save a tensor as an image
-pub fn save_tensor_as_image(tensor: &Tensor, path: &PathBuf) -> Result<()> {
-    // Ensure directory exists
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+/// Save a tensor as an image file (JPG or PNG)
+/// 
+/// # Arguments
+/// * `tensor` - Image tensor in shape [C, H, W] with values in [-1, 1]
+/// * `path` - Output path for the image
+/// * `format` - Image format ("jpg" or "png")
+pub fn save_tensor_as_image(
+    tensor: &Tensor,
+    path: &Path,
+    format: &str,
+) -> Result<()> {
+    // Convert from [-1, 1] to [0, 255]
+    let tensor = ((tensor.clamp(-1.0, 1.0)? + 1.0)? * 127.5)?;
+    let tensor = tensor.to_dtype(DType::U8)?;
+    
+    // Get dimensions and convert CHW to HWC
+    let (channels, height, width) = tensor.dims3()
+        .context("Expected tensor with 3 dimensions [C, H, W]")?;
+    
+    if channels != 3 {
+        anyhow::bail!("Expected 3 channels (RGB), got {}", channels);
     }
     
-    // Convert tensor to image format
-    // Assume tensor is in shape [C, H, W] with values in [-1, 1]
-    let (c, h, w) = tensor.dims3()?;
-    
-    // Move to CPU if needed
-    let tensor = if tensor.device().is_cuda() {
-        tensor.to_device(&Device::Cpu)?
-    } else {
-        tensor.clone()
-    };
-    
-    // Denormalize from [-1, 1] to [0, 255]
-    let tensor = ((tensor + 1.0)? * 127.5)?;
-    let tensor = tensor.clamp(0.0, 255.0)?;
-    
-    // Convert to u8
-    let data: Vec<f32> = tensor.flatten_all()?.to_vec1()?;
-    let data: Vec<u8> = data.iter().map(|&x| x as u8).collect();
+    // Permute from CHW to HWC and flatten
+    let tensor = tensor.permute((1, 2, 0))?; // CHW -> HWC
+    let pixels = tensor.flatten_all()?.to_vec1::<u8>()?;
     
     // Create image buffer
-    if c == 3 {
-        // RGB image
-        let img = ImageBuffer::<Rgb<u8>, _>::from_raw(w as u32, h as u32, data)
-            .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer"))?;
-        img.save(path)?;
-    } else if c == 1 {
-        // Grayscale - convert to RGB
-        let mut rgb_data = Vec::with_capacity((w * h * 3) as usize);
-        for i in 0..((w * h) as usize) {
-            rgb_data.push(data[i]);
-            rgb_data.push(data[i]);
-            rgb_data.push(data[i]);
+    let img = image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::from_raw(
+        width as u32,
+        height as u32,
+        pixels,
+    ).context("Failed to create image buffer")?;
+    
+    // Save based on format
+    match format.to_lowercase().as_str() {
+        "jpg" | "jpeg" => {
+            img.save_with_format(path, image::ImageFormat::Jpeg)
+                .context("Failed to save as JPEG")?;
         }
-        let img = ImageBuffer::<Rgb<u8>, _>::from_raw(w as u32, h as u32, rgb_data)
-            .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer"))?;
-        img.save(path)?;
-    } else {
-        return Err(anyhow::anyhow!("Unsupported number of channels: {}", c));
+        "png" => {
+            img.save_with_format(path, image::ImageFormat::Png)
+                .context("Failed to save as PNG")?;
+        }
+        _ => anyhow::bail!("Unsupported format: {}. Use 'jpg' or 'png'", format),
     }
     
     Ok(())
 }
 
-/// Create a sample directory structure
-pub fn create_sample_directory(base_dir: &PathBuf, step: usize) -> Result<PathBuf> {
-    let sample_dir = base_dir.join("samples").join(format!("step_{:06}", step));
-    fs::create_dir_all(&sample_dir)?;
-    Ok(sample_dir)
+/// Create the standard output directory structure
+/// Returns the samples directory path
+pub fn create_output_directory(lora_name: &str) -> Result<PathBuf> {
+    let output_dir = PathBuf::from("/outputs").join(lora_name).join("samples");
+    std::fs::create_dir_all(&output_dir)
+        .with_context(|| format!("Failed to create output directory: {:?}", output_dir))?;
+    Ok(output_dir)
 }
 
-/// Log sampling information
-pub fn log_sampling_start(model_type: &str, step: usize, num_samples: usize) {
-    println!("\n=== {} Sampling at Step {} ===", model_type, step);
-    println!("Generating {} samples...", num_samples);
+/// Generate a sample filename with step number and index
+pub fn generate_sample_filename(
+    step: usize,
+    index: usize,
+    format: &str,
+) -> String {
+    format!("sample_step{:06}_idx{:02}.{}", step, index, format)
 }
 
-/// Log sampling completion
-pub fn log_sampling_complete(model_type: &str, step: usize, sample_dir: &PathBuf) {
-    println!("✓ {} sampling complete at step {}", model_type, step);
-    println!("  Samples saved to: {}", sample_dir.display());
+/// Save generation metadata alongside the image
+pub fn save_metadata(
+    path: &Path,
+    prompt: &str,
+    negative_prompt: Option<&str>,
+    step: usize,
+    cfg_scale: f32,
+    seed: u64,
+) -> Result<()> {
+    let metadata_path = path.with_extension("txt");
+    let mut content = format!(
+        "Prompt: {}\n\
+         Step: {}\n\
+         CFG Scale: {}\n\
+         Seed: {}\n",
+        prompt, step, cfg_scale, seed
+    );
+    
+    if let Some(neg) = negative_prompt {
+        content.push_str(&format!("Negative Prompt: {}\n", neg));
+    }
+    
+    std::fs::write(&metadata_path, content)
+        .with_context(|| format!("Failed to write metadata to {:?}", metadata_path))?;
+    
+    Ok(())
 }
 
-/// Simple sampling message for models without full implementation
-pub fn log_sampling_placeholder(model_type: &str, reason: &str) {
-    println!("\n⚠️  {} sampling not available: {}", model_type, reason);
-    println!("   Training continues without sample generation");
+/// Decode VAE latents to image tensor
+/// Handles different VAE scaling factors for different models
+pub fn decode_latents(
+    vae: &impl VaeDecoder,
+    latents: &Tensor,
+    vae_scale: f32,
+) -> Result<Tensor> {
+    // Scale latents
+    let scaled_latents = (latents / vae_scale)?;
+    
+    // Decode through VAE
+    let images = vae.decode(&scaled_latents)?;
+    
+    // Ensure we have the right shape
+    match images.dims() {
+        Ok(dims) if dims.len() == 4 => Ok(images),
+        Ok(dims) => anyhow::bail!("Expected 4D tensor from VAE, got {:?}", dims),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Trait for VAE decoders across different models
+pub trait VaeDecoder {
+    fn decode(&self, latents: &Tensor) -> Result<Tensor>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_output_directory() {
+        let dir = create_output_directory("test_lora").unwrap();
+        assert_eq!(dir, PathBuf::from("/outputs/test_lora/samples"));
+    }
+    
+    #[test]
+    fn test_filename_generation() {
+        let filename = generate_sample_filename(1000, 0, "jpg");
+        assert_eq!(filename, "sample_step001000_idx00.jpg");
+    }
 }

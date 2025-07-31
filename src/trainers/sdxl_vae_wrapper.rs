@@ -244,7 +244,7 @@ impl SDXLVAEWrapper {
                 
                 for key in &problematic_keys {
                     if let Some(tensor) = remapped_weights.get(*key) {
-                        debug!("{}: shape = {:?}"));
+                        debug!("{}: shape = {:?}", key, tensor.shape());
                     } else {
                         info!("{}: NOT FOUND", key);
                     }
@@ -261,7 +261,7 @@ impl SDXLVAEWrapper {
                 
                 for key in &encoder_keys {
                     if let Some(tensor) = remapped_weights.get(*key) {
-                        debug!("{}: shape = {:?}"));
+                        debug!("{}: shape = {:?}", key, tensor.shape());
                     } else {
                         info!("{}: NOT FOUND", key);
                     }

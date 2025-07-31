@@ -3,7 +3,7 @@
 //! Direct weight loading and custom forward pass
 
 use log::{info, debug, warn, error};
-use anyhow::{Result, Context};
+use anyhow::{anyhow, Result, Context};
 use candle_core::{Device, DType, Tensor, Module, D, Var};
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
@@ -14,6 +14,11 @@ use serde::{Serialize, Deserialize};
 use super::{Config, ProcessConfig, SampleConfig};
 use crate::trainers::text_encoders::TextEncoders;
 use crate::loaders::sdxl_checkpoint_loader::load_text_encoders_sdxl;
+use crate::trainers::training_helpers::{
+    TiledVAE, TilingConfig, BlendMode, GradientAccumulator, SDXLGradientCheckpoint,
+    SNRWeighting, LRScheduler, EMAHelper, EMAModel, ValidationRunner, ValidationDataset,
+    ValConfig, ValidationItem, create_scheduler
+};
 use crate::loaders::sdxl_weight_remapper::remap_sdxl_weights;
 use crate::loaders::sdxl_full_remapper::remap_sdxl_unet_weights;
 use crate::trainers::sdxl_forward_with_lora::forward_sdxl_with_lora;
@@ -28,10 +33,13 @@ use crate::trainers::sdxl_forward_sampling::forward_sdxl_sampling;
 use crate::trainers::sdxl_vae_native::SDXLVAENative;
 // use crate::trainers::sdxl_proper_checkpoint::forward_sdxl_proper_checkpoint;
 use crate::trainers::ddpm_scheduler::{DDPMScheduler, compute_snr_loss_weights};
+use crate::trainers::snr_weighting;
 use crate::trainers::adam8bit::Adam8bit;
 use crate::trainers::enhanced_data_loader::{EnhancedCaptionHandler, EnhancedDataConfig, ModelType as EnhancedModelType};
 use crate::trainers::sdxl_sampling_complete::{TrainingSampler, SDXLSamplingConfig, SchedulerType, SDXLSampler};
 use crate::trainers::memory_utils;
+use crate::trainers::unified_sampling::{DiffusionSampler, SDXLSampler as UnifiedSDXLSampler, TrainingSamplerConfig};
+use crate::trainers::candle_image_utils::{save_image, create_sample_directory};
 // use crate::trainers::gradient_accumulator::GradientAccumulator;
 // use crate::trainers::gradient_checkpoint::SDXLGradientCheckpoint;
 // use crate::trainers::vae_tiling::{TiledVAE, TilingConfig, BlendMode};
@@ -799,8 +807,8 @@ impl SDXLLoRATrainerFixed {
         
         // Load text encoders (these still use the existing loader for now)
         let (clip_l, clip_g) = load_text_encoders_sdxl(&self.model_path, &self.device, self.dtype)?;
-                            if prediction_type == "epsilon" {
-                                unet_config.prediction_type = "epsilon".to_string();
+        let mut text_encoders = TextEncoders::default();
+        text_encoders.clip_l = Some(clip_l);
         text_encoders.clip_g = Some(clip_g);
         self.text_encoders = Some(text_encoders);
         
@@ -827,7 +835,7 @@ impl SDXLLoRATrainerFixed {
             panic!("Only 8-bit Adam is supported for GPU training! Set optimizer to 'adamw8bit'");
         }
         
-        info!("Models loaded in {:.2}s", start_time.elapsed().as_secs_f32());
+        info!("Models loaded in {:.2}s", start.elapsed().as_secs_f32());
         debug!("UNet weights loaded");
         debug!("VAE weights loaded");
         info!("LoRA adapters: {}", self.lora_collection.adapters.len());
@@ -1534,7 +1542,7 @@ impl SDXLLoRATrainerFixed {
     
     /// Standard parameter update
     fn update_param_standard(&self, param: &Var, grad: &Tensor, 
-                             beta1: f64, beta2: f64, eps: f64, learning_rate: f64) -> Result<()> {
+                            _beta1: f64, _beta2: f64, _eps: f64, learning_rate: f64) -> Result<()> {
         // Simple SGD for now - full Adam would need persistent state
         // Scale gradient by learning rate
         let update = grad.to_dtype(DType::F32)?;
@@ -1798,7 +1806,7 @@ impl SDXLLoRATrainerFixed {
     /// Generate validation samples during training using the new comprehensive sampler
     fn generate_samples(&mut self, step: usize) -> Result<()> {
         // Check if sampling is configured
-        if self.training_sampler.is_none() {
+        if self.sample_config.is_none() {
             return Ok(());
         }
         
@@ -1814,169 +1822,59 @@ impl SDXLLoRATrainerFixed {
             return Ok(());
         }
         
-        info!("\nGenerating samples at step {}...", step);
+        info!("\nGenerating SDXL samples at step {} with proper JPG output...", step);
         
-        // Use the training sampler to generate samples
-        if let Some(ref training_sampler) = self.training_sampler {
-            let vae_wrapper = self.vae_encoder.as_ref().unwrap();
-            let text_encoders = self.text_encoders.as_mut().unwrap();
+        // Get sample config
+        let sample_config = self.sample_config.as_ref().unwrap();
+        let prompts: Vec<&str> = sample_config.prompts.iter().map(|s| s.as_str()).collect();
+        
+        // Create output directory
+        let lora_name = self.config.name.clone().unwrap_or_else(|| "sdxl_lora".to_string());
+        let output_dir = create_sample_directory(&lora_name)?;
+        
+        // Generate samples for each prompt
+        let mut saved_paths = Vec::new();
+        for (idx, prompt) in prompts.iter().enumerate() {
+            info!("  Generating sample {} with prompt: {}", idx + 1, prompt);
             
-            // Generate samples using the training sampler
-            let saved_paths = training_sampler.generate_training_samples(
-                step,
-                &self.unet_weights,
-                &self.lora_collection,
-                vae_wrapper,
-                text_encoders,
+            // Generate latents
+            let latents = self.generate_latents_with_prompt(
+                prompt,
+                "",  // negative prompt
+                sample_config.width.unwrap_or(1024),
+                sample_config.height.unwrap_or(1024),
+                sample_config.sample_steps.unwrap_or(30),
+                sample_config.cfg_scale.unwrap_or(7.5),
+                Some(42 + idx as u64),
             )?;
             
-            info!("Generated {} samples at step {}", saved_paths.len(), step);
+            // Decode with VAE
+            let vae_wrapper = self.vae_encoder.as_ref().unwrap();
+            let images = vae_wrapper.decode(&latents)?;
+            
+            // Convert from [-1, 1] to [0, 255] and save as JPG
+            let image = images.get(0)?;
+            let filename = format!("sample_step{:06}_idx{:02}.jpg", step, idx);
+            let filepath = output_dir.join(&filename);
+            
+            save_image(&image, &filepath)?;
+            
+            // Save metadata
+            let metadata = format!(
+                "Model: SDXL\nPrompt: {}\nStep: {}\nCFG Scale: {}\nSeed: {}\nLoRA Scale: {}",
+                prompt, step, sample_config.cfg_scale.unwrap_or(7.5), 42 + idx as u64, self.lora_scale
+            );
+            std::fs::write(filepath.with_extension("txt"), metadata)?;
+            
+            saved_paths.push(filepath);
         }
         
-        Ok(())
-    }
-            }
-            
-            // Decode latents to image - use tiled decoding for high resolution
-            let images = if let Some(ref tiled_vae) = self.tiled_vae {
-                info!("Using TiledVAE for decoding");
-                tiled_vae.decode_tiled(&latents)?
-            } else {
-                vae.decode(&latents)?
-            };
-            
-            // Save image
-            let filename = format!("sample_{:02}.png", i);
-            let filepath = step_dir.join(filename);
-            
-            // Also save the prompt used
-            let prompt_file = step_dir.join(format!("sample_{:02}_prompt.txt", i));
-            fs::write(&prompt_file, if i < prompts.len() { &prompts[i] } else { "[negative prompt]" })?;
-            let image_path = output_dir.join(format!("sample_{}_step_{}.png", i, step));
-        }
-        
-        info!("Samples saved to: {:?}", output_dir);
-        
-        // Optionally generate samples from random dataset items
-        if include_dataset_samples {
-            info!("\nGenerating samples from random dataset items...");
-            
-            // Load dataset if not already loaded
-            let dataset = self.load_dataset()?;
-            if !dataset.is_empty() {
-                let mut rng = rand::thread_rng();
-                info!("\nGenerating {} dataset samples...", num_dataset_samples);
-                
-                for i in 0..num_dataset_samples {
-                    // Pick random dataset item
-                    let idx = rng.gen_range(0..dataset.len());
-                    let caption = &dataset[idx].caption;
-                    
-                    info!("  Dataset sample {}: {}", i + 1, caption);
-                    
-                    // Generate image with this caption
-                    let (prompt_embeds, pooled_embeds) = self.text_encoders.as_mut()
-                        .ok_or_else(|| anyhow::anyhow!("Text encoders not loaded"))?
-                        .encode_sdxl(&caption, 77)?;
-                    
-                    // Use same negative prompt as config
-                    let negative_prompt = config.neg.as_deref();
-                    let (neg_embeds, _neg_pooled) = if let Some(neg) = negative_prompt {
-                        self.text_encoders.as_mut().unwrap()
-                            .encode_sdxl(neg, 77)?
-                    } else {
-                        self.text_encoders.as_mut().unwrap()
-                            .encode_sdxl("", 77)?
-                    };
-                    
-                    // Generate single image
-                    let latent_shape = [1, 4, config.height / 8, config.width / 8];
-                    let mut latents = Tensor::randn(0.0f32, 1.0f32, &latent_shape, &self.device)?;
-                    latents = (latents * 14.6146)?;
-                    
-                    // Create timesteps for denoising
-                    let num_steps = config.sample_steps.unwrap_or(30);
-                    let timesteps: Vec<i64> = (0..num_steps)
-                        .map(|i| (1000 - (i + 1) * 1000 / num_steps) as i64)
-                        .rev()
-                        .collect();
-                    
-                    // Run denoising
-                    for (idx, &t) in timesteps.iter().enumerate() {
-                        let t_tensor = Tensor::new(&[t], &self.device)?.to_dtype(self.dtype)?;
-                        
-                        let latent_model_input = if config.guidance_scale.unwrap_or(7.5) > 1.0 {
-                            Tensor::cat(&[&latents, &latents], 0)?
-                        } else {
-                            latents.clone()
-                        };
-                        
-                        let encoder_hidden_states = if config.guidance_scale.unwrap_or(7.5) > 1.0 {
-                            Tensor::cat(&[&neg_embeds, &prompt_embeds], 0)?
-                        } else {
-                            prompt_embeds.clone()
-                        };
-                        
-                        let noise_pred = forward_sdxl_with_lora(
-                            &latent_model_input,
-                            &t_tensor,
-                            &encoder_hidden_states,
-                            &self.unet_weights,
-                            &self.lora_collection,
-                        )?;
-                        
-                        // Apply guidance
-                        let model_output = noise_pred;
-                        let noise_pred = if config.guidance_scale.unwrap_or(7.5) > 1.0 {
-                            let chunks = model_output.chunk(2, 0)?;
-                            let noise_pred_uncond = &chunks[0];
-                            let noise_pred_cond = &chunks[1];
-                            let guidance_scale = config.guidance_scale.unwrap_or(7.5);
-                            let diff = (noise_pred_cond - noise_pred_uncond)?;
-                            (noise_pred_uncond + (diff * guidance_scale as f64)?)?
-                        } else {
-                            model_output
-                        };
-                        
-                        // DDIM step
-                        let alpha_prod_t = ((1000 - t) as f32 / 1000.0).powi(2);
-                        let alpha_prod_t_prev = if idx < timesteps.len() - 1 {
-                            ((1000 - timesteps[idx + 1]) as f32 / 1000.0).powi(2)
-                        } else {
-                            1.0
-                        };
-                        
-                        let beta_prod_t = 1.0 - alpha_prod_t;
-                        let beta_prod_t_prev = 1.0 - alpha_prod_t_prev;
-                        
-                        let pred_x0 = ((latents.clone() - (noise_pred.clone() * beta_prod_t.sqrt())?)? / alpha_prod_t.sqrt())?;
-                        let dir_xt = (noise_pred * beta_prod_t_prev.sqrt())?;
-                        let alpha_prod_t_prev = self.alphas_cumprod[prev_t as usize];
-                        latents = ((pred_x0 * alpha_prod_t_prev.sqrt())? + dir_xt)?;
-                    }
-                    // Decode and save - use tiled decoding for high resolution
-                    let images = if let Some(ref tiled_vae) = self.tiled_vae {
-                        tiled_vae.decode_tiled(&latents)?
-                    } else {
-                        vae.decode(&latents)?
-                    };
-                    let filename = format!("dataset_sample_{:02}.png", i);
-                    let filepath = step_dir.join(filename);
-                    self.save_image_tensor(&images, &filepath)?;
-                    
-                    // Save the caption
-                    let caption_file = step_dir.join(format!("dataset_sample_{:02}_caption.txt", i));
-                    fs::write(&caption_file, caption)?;
-                }
-                
-                info!("Generated {} dataset samples", num_dataset_samples);
-            }
-        }
+        info!("Generated {} SDXL samples at step {} in outputs/{}/samples/", 
+              saved_paths.len(), step, lora_name);
         
         Ok(())
     }
     
-    /// Save image tensor to file
     /// Generate latents using SDXL with LoRA
     fn generate_latents_with_prompt(
         &mut self,
@@ -2002,7 +1900,6 @@ impl SDXLLoRATrainerFixed {
         let (neg_embeds, neg_pooled) = self.text_encoders.as_mut()
             .ok_or_else(|| anyhow::anyhow!("Text encoders not loaded"))?
             .encode_sdxl(negative_prompt, 77)?;
-        info!("\nGenerating {} inference samples...", prompts.len());
         
         // Initialize latents
         let latent_shape = [1, 4, height / 8, width / 8];
@@ -2098,7 +1995,7 @@ impl SDXLLoRATrainerFixed {
             // Compute direction
             let dir_xt = (noise_pred * (beta_prod_t_prev.sqrt() as f64))?;
             
-            let alpha_prod_t_prev = self.alphas_cumprod[prev_t as usize];
+            // Use the already computed alpha_prod_t_prev
             latents = ((pred_x0 * (alpha_prod_t_prev.sqrt() as f64))? + dir_xt)?;
         }
         
@@ -2232,7 +2129,7 @@ impl SDXLLoRATrainerFixed {
     }
     
     /// Compute validation loss for a batch
-    fn compute_validation_loss(&mut self, batch: &[super::validation::ValidationItem], cache_dir: &Option<PathBuf>) -> Result<(f32, usize)> {
+    fn compute_validation_loss(&mut self, batch: &[ValidationItem], cache_dir: &Option<PathBuf>) -> Result<(f32, usize)> {
         let mut total_loss = 0.0;
         let batch_size = batch.len();
         
@@ -2349,8 +2246,6 @@ impl SDXLLoRATrainerFixed {
                 .to_dtype(self.dtype)?)
         }
     }
-    }
-    
 } // impl SDXLLoRATrainerFixed
 
 // Dataset structures

@@ -10,10 +10,9 @@ use image::{DynamicImage, ImageBuffer, Rgb};
 use std::path::{Path, PathBuf};
 use std::fs;
 
-use crate::models::flux_lora::FluxModelWithLoRA;
-use crate::text_encoders::TextEncoders;
-use eridiffusion_core::{ModelInputs, DiffusionModel};
-use std::collections::HashMap;
+use crate::models::flux_custom::FluxModelWithLoRA;
+use crate::trainers::text_encoders::TextEncoders;
+use crate::eridiffusion_core::{ModelInputs, ModelOutput, DiffusionModel};
 
 /// Sampling configuration
 pub struct FluxSamplingConfig {
@@ -116,59 +115,133 @@ impl FluxSampler {
         batch_size: usize,
     ) -> Result<Tensor> {
         // Initialize random noise
+        // For Flux, we need to account for the 2x2 patches
+        let h = self.config.height / 8;  // VAE downscaling
+        let w = self.config.width / 8;
+        
+        // Adjust for patch size (2x2)
+        let h_patches = h / 2;
+        let w_patches = w / 2;
+        
         let shape = [
             batch_size,
             16,  // Flux uses 16 latent channels
-            self.config.height / 8,  // VAE downscaling factor
-            self.config.width / 8,
+            h,
+            w,
         ];
         
-        let mut latents = if let Some(seed) = self.config.seed {
+        let mut img = if let Some(seed) = self.config.seed {
             // For reproducibility, we'd need to set a global seed
-            // candle doesn't have randn_with_seed, so we use regular randn
             // TODO: Implement proper seeding
             Tensor::randn(0.0f32, 1.0f32, &shape, &self.device)?
         } else {
             Tensor::randn(0.0f32, 1.0f32, &shape, &self.device)?
         };
         
+        // Create position embeddings for image
+        let img_ids = self.create_img_ids(h_patches, w_patches, batch_size)?;
+        
+        // Create position embeddings for text
+        let txt_seq_len = text_embeds.dim(1)?;
+        let txt_ids = Tensor::zeros((batch_size, txt_seq_len, 3), DType::F32, &self.device)?;
+        
         // Create timestep schedule (shifted sigmoid for Flux)
         let timesteps = self.create_timestep_schedule(self.config.num_inference_steps)?;
         
+        // Create guidance tensor
+        let guidance = Tensor::new(&[self.config.guidance_scale], &self.device)?
+            .broadcast_as((batch_size,))?;
+        
         // Denoising loop
         for (i, &t) in timesteps.iter().enumerate() {
+            // Patchify the image: [B, C, H, W] -> [B, H*W/4, C*4]
+            let img_patches = self.patchify(&img)?;
+            
             // Create timestep tensor
             let timestep = Tensor::new(&[t], &self.device)?
-                .repeat((batch_size, 1))?
-                .squeeze(1)?;
+                .broadcast_as((batch_size,))?;
             
-            // Prepare model inputs
-            let inputs = ModelInputs {
-                latents: latents.clone(),
-                timestep: timestep.clone(),
-                encoder_hidden_states: Some(text_embeds.clone()),
-                pooled_projections: Some(pooled_embeds.clone()),
-                guidance_scale: Some(self.config.guidance_scale),
-                attention_mask: None,
-                additional: HashMap::new(),
-            };
+            // Model forward pass
+            let velocity_pred = model.forward(
+                &img_patches,
+                &img_ids,
+                text_embeds,
+                &txt_ids,
+                &timestep,
+                pooled_embeds,
+                Some(&guidance),
+            )?;
             
-            // Model prediction
-            let model_output = model.forward(&inputs)?;
-            let velocity_pred = model_output.sample;
-            
-            // Apply classifier-free guidance if needed
-            let velocity = if self.config.guidance_scale > 1.0 {
-                self.apply_guidance(&velocity_pred, self.config.guidance_scale)?
-            } else {
-                velocity_pred
-            };
+            // Unpatchify the velocity prediction: [B, H*W/4, C*4] -> [B, C, H, W]
+            let velocity = self.unpatchify(&velocity_pred, h, w)?;
             
             // Update latents using flow matching
-            latents = self.flow_step(&latents, &velocity, t, i, timesteps.len())?;
+            img = self.flow_step(&img, &velocity, t, i, timesteps.len())?;
         }
         
-        Ok(latents)
+        Ok(img)
+    }
+    
+    /// Patchify image tensor for Flux processing
+    fn patchify(&self, img: &Tensor) -> Result<Tensor> {
+        let (bs, c, h, w) = img.dims4()?;
+        
+        // Reshape to extract 2x2 patches
+        // [B, C, H, W] -> [B, C, H/2, 2, W/2, 2]
+        let img = img.reshape((bs, c, h / 2, 2, w / 2, 2))?;
+        
+        // Permute to group patches
+        // [B, C, H/2, 2, W/2, 2] -> [B, H/2, W/2, C, 2, 2]
+        let img = img.permute((0, 2, 4, 1, 3, 5))?;
+        
+        // Flatten patches
+        // [B, H/2, W/2, C, 2, 2] -> [B, H/2 * W/2, C * 4]
+        let img = img.reshape((bs, (h / 2) * (w / 2), c * 4))?;
+        
+        Ok(img)
+    }
+    
+    /// Unpatchify model output back to image format
+    fn unpatchify(&self, x: &Tensor, h: usize, w: usize) -> Result<Tensor> {
+        let (b, _seq_len, c_times_4) = x.dims3()?;
+        let c = c_times_4 / 4;
+        let h_patches = h / 2;
+        let w_patches = w / 2;
+        
+        // Reshape to separate spatial and patch dimensions
+        // [B, H/2 * W/2, C * 4] -> [B, H/2, W/2, C, 2, 2]
+        let x = x.reshape((b, h_patches, w_patches, c, 2, 2))?;
+        
+        // Permute to standard image format
+        // [B, H/2, W/2, C, 2, 2] -> [B, C, H/2, 2, W/2, 2]
+        let x = x.permute((0, 3, 1, 4, 2, 5))?;
+        
+        // Merge patch dimensions
+        // [B, C, H/2, 2, W/2, 2] -> [B, C, H, W]
+        let x = x.reshape((b, c, h, w))?;
+        
+        Ok(x)
+    }
+    
+    /// Create position IDs for image patches
+    fn create_img_ids(&self, h: usize, w: usize, batch_size: usize) -> Result<Tensor> {
+        // Create 3D position embeddings [batch, seq_len, 3]
+        // where 3 dimensions are [batch_idx, y_pos, x_pos]
+        
+        let mut ids = Vec::new();
+        
+        for y in 0..h {
+            for x in 0..w {
+                ids.push(vec![0u32, y as u32, x as u32]);
+            }
+        }
+        
+        let ids_tensor = Tensor::new(ids.as_slice(), &self.device)?
+            .to_dtype(DType::F32)?
+            .unsqueeze(0)?  // Add batch dimension
+            .repeat((batch_size, 1, 1))?;
+        
+        Ok(ids_tensor)
     }
 
     /// Create timestep schedule for Flux (shifted sigmoid)
@@ -189,12 +262,6 @@ impl FluxSampler {
         Ok(timesteps)
     }
 
-    /// Apply classifier-free guidance
-    fn apply_guidance(&self, velocity: &Tensor, scale: f32) -> Result<Tensor> {
-        // For proper CFG, we would need conditional and unconditional predictions
-        // For now, just scale the velocity
-        Ok(velocity.affine(scale as f64, 0.0)?)
-    }
 
     /// Flow matching step
     fn flow_step(
@@ -276,12 +343,31 @@ impl super::flux_lora::FluxLoRATrainer {
         config: Option<FluxSamplingConfig>,
     ) -> Result<Vec<PathBuf>> {
         let sampling_config = config.unwrap_or_default();
-        let candle_device = self.device().to_candle()?;
-        let sampler = FluxSampler::new(sampling_config, candle_device);
         
-        // Note: This is a simplified implementation
-        // In a real implementation, we'd need to expose these fields properly
-        println!("Sampling functionality not yet fully integrated");
-        Ok(Vec::new())
+        // Ensure models are loaded
+        let model = self.flux_model.as_ref()
+            .or(self.model.as_ref())
+            .context("No Flux model loaded for sampling")?;
+            
+        let vae = self.vae.as_ref()
+            .or(self.vae_cpu.as_ref())
+            .context("No VAE loaded for sampling")?;
+            
+        let text_encoders = self.text_encoders.as_mut()
+            .context("No text encoders loaded for sampling")?;
+        
+        // Create sampler
+        let device = candle_core::Device::cuda_if_available(0)?;
+        let sampler = FluxSampler::new(sampling_config, device);
+        
+        // Generate samples
+        let samples_dir = output_dir.join(format!("samples_step_{:06}", step));
+        sampler.generate_samples(
+            model,
+            vae,
+            text_encoders,
+            step,
+            &samples_dir,
+        )
     }
 }

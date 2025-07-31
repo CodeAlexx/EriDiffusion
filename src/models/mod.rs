@@ -7,7 +7,7 @@ pub mod flux_vae;
 pub mod flux_lora_adapter;
 // pub mod flux_lora_wrapper;  // Temporarily disabled
 pub mod flux_model_trait;
-// pub mod flux_custom; // Temporarily disabled
+pub mod flux_custom;
 pub mod flux_adaptive_loader;
 pub mod direct_var_builder;
 // pub mod flux_minimal; // Temporarily disabled - depends on flux_custom
@@ -28,6 +28,7 @@ pub mod sdxl_time_ids;
 pub mod with_tracing;
 // pub mod sdxl_lora_layer_v3;
 // pub mod lora_with_gradients;
+pub mod sd35_mmdit;
 
 // Re-export key types
 // pub use flux_lora::{FluxModelWithLoRA, FluxConfig}; // Temporarily disabled
@@ -52,3 +53,4 @@ pub use sdxl_time_ids::{TimeIdsConfig, TimeIdsGenerator, SDXLResolutions, SDXLCo
 // pub use lora_transformer::{SpatialTransformerWithLoRA, SpatialTransformerConfig};
 // pub use lora_unet_blocks::{CrossAttnDownBlock2DWithLoRA, CrossAttnUpBlock2DWithLoRA, UNetMidBlock2DCrossAttnWithLoRA};
 // pub use sdxl_lora_unet_v2::{SDXLUNetWithLoRA, SDXLUNetConfig};
+pub use sd35_mmdit::{SD35MMDiTWithLoRA, SD35Config, SD35LoRAAdapter};

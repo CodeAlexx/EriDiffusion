@@ -80,8 +80,8 @@ pub fn load_text_encoders_sdxl(
     candle_transformers::models::stable_diffusion::clip::ClipTextTransformer,
     candle_transformers::models::stable_diffusion::clip::ClipTextTransformer,
 )> {
-    use crate::loaders::sdxl_diffusers_loader::{load_clip_text_encoder, load_clip_text_encoder_2};
-    use candle_transformers::models::stable_diffusion::clip::{ClipTextTransformer, Config as ClipConfig};
+    use candle_transformers::models::stable_diffusion::clip::{self, ClipTextTransformer};
+    use candle_nn::VarBuilder;
     
     // For SDXL, use separate CLIP model files
     let clip_dir = Path::new("/home/alex/SwarmUI/Models/clip");
@@ -95,7 +95,10 @@ pub fn load_text_encoders_sdxl(
     // Load CLIP-L
     let text_encoder = if clip_l_path.exists() {
         println!("Loading CLIP-L from {:?}", clip_l_path);
-        load_clip_text_encoder(&clip_l_path, device, dtype)?
+        let tensors = candle_core::safetensors::load(&clip_l_path, device)?;
+        let vb = VarBuilder::from_tensors(tensors, dtype, device);
+        let config = clip::Config::v1_5();
+        ClipTextTransformer::new(vb, &config)?
     } else {
         anyhow::bail!("CLIP-L model not found at {:?}", clip_l_path);
     };
@@ -103,7 +106,10 @@ pub fn load_text_encoders_sdxl(
     // Load CLIP-G
     let text_encoder_2 = if clip_g_path.exists() {
         println!("Loading CLIP-G from {:?}", clip_g_path);
-        load_clip_text_encoder_2(&clip_g_path, device, dtype)?
+        let tensors = candle_core::safetensors::load(&clip_g_path, device)?;
+        let vb = VarBuilder::from_tensors(tensors, dtype, device);
+        let config = clip::Config::sdxl2();
+        ClipTextTransformer::new(vb, &config)?
     } else {
         anyhow::bail!("CLIP-G model not found at {:?}", clip_g_path);
     };

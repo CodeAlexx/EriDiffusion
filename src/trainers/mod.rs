@@ -1,8 +1,9 @@
 pub mod sdxl_lora_trainer_fixed;
 pub mod sdxl_sampling_complete;
 pub mod sd35_lora;
-pub mod flux_lora;
-pub mod flux_sampling;
+pub mod sd35_sampling;
+// pub mod flux_lora; // Temporarily disabled - missing dependencies
+// pub mod flux_sampling; // Temporarily disabled - missing dependencies
 pub mod flux_data_loader;
 pub mod device_debug;
 pub mod text_encoders;
@@ -15,11 +16,17 @@ pub mod sdxl_vae_native;
 pub mod sdxl_vae_wrapper;
 pub mod memory_utils;
 pub mod sampling_utils;
+pub mod cached_device;
+pub mod candle_image_utils;
+pub mod unified_sampling;
+pub mod training_helpers;
+pub mod snr_weighting;
+pub mod gpu_gradient_checkpoint;
 
 // Re-export key types
 pub use sdxl_lora_trainer_fixed::SDXLLoRATrainerFixed;
 pub use sd35_lora::SD35LoRATrainer;
-pub use flux_lora::FluxLoRATrainer;
+// pub use flux_lora::FluxLoRATrainer; // Temporarily disabled
 pub use sdxl_sampling_complete::{SDXLSampler, TrainingSampler, SDXLSamplingConfig, SchedulerType};
 pub use text_encoders::TextEncoders;
 pub use adam8bit::Adam8bit;
@@ -286,19 +293,23 @@ pub fn train_from_config(config_path: PathBuf) -> Result<()> {
             }
         }
         ModelType::Flux => {
-            println!("\nStarting Flux training...");
-            match process_config.network.type_.as_str() {
-                "lora" => {
-                    let mut trainer = FluxLoRATrainer::new(&config, process_config)?;
-                    trainer.train()?;
-                }
-                _ => {
-                    return Err(anyhow::anyhow!(
-                        "Unsupported network type '{}' for Flux", 
-                        process_config.network.type_
-                    ));
-                }
-            }
+            println!("\nFlux training is temporarily disabled while missing dependencies are resolved.");
+            return Err(anyhow::anyhow!(
+                "Flux training is not yet available. Please use SDXL or SD 3.5 models."
+            ));
+            // TODO: Re-enable when Flux dependencies are added
+            // match process_config.network.type_.as_str() {
+            //     "lora" => {
+            //         let mut trainer = FluxLoRATrainer::new(&config, process_config)?;
+            //         trainer.train()?;
+            //     }
+            //     _ => {
+            //         return Err(anyhow::anyhow!(
+            //             "Unsupported network type '{}' for Flux", 
+            //             process_config.network.type_
+            //         ));
+            //     }
+            // }
         }
     }
     

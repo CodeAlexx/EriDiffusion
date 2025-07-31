@@ -1,0 +1,49 @@
+job: extension
+config:
+  name: "flux_test_sampling"
+  process:
+    - type: 'sd_trainer'
+      device: cuda:0
+      low_vram: true
+      trigger_word: "test"
+      model:
+        name_or_path: "/home/alex/SwarmUI/Models/diffusion_models/flux1-dev.safetensors"
+        is_flux: true
+        vae_path: "/home/alex/SwarmUI/Models/VAE/ae.safetensors"
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+      save:
+        dtype: float16
+        save_every: 500
+        max_step_saves_to_keep: 2
+      datasets:
+        - folder_path: "/home/alex/test_dataset"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.0
+          shuffle_tokens: false
+          cache_latents_to_disk: true
+          resolution: [1024]
+      train:
+        batch_size: 1
+        steps: 100
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        dtype: bf16
+      sample:
+        sampler: "euler"
+        sample_every: 50
+        sample_steps: 28
+        guidance_scale: 3.5
+        prompts:
+          - "a majestic mountain landscape"
+          - "a futuristic city at night"
+          - "a serene forest path"
+        width: 1024
+        height: 1024

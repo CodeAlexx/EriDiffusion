@@ -1,0 +1,153 @@
+# Test configuration for all three sampling pipelines
+# This runs minimal training steps to test sampling functionality
+
+job: extension
+config:
+  name: "test_all_sampling"
+  process:
+    # SDXL Test
+    - type: 'sd_trainer'
+      device: cuda:0
+      low_vram: true
+      trigger_word: "test_sdxl"
+      model:
+        name_or_path: "/home/alex/SwarmUI/Models/diffusion_models/sd_xl_base_1.0.safetensors"
+        is_sdxl: true
+      network:
+        type: "lora"
+        linear: 4  # Very small rank for testing
+        linear_alpha: 4
+      save:
+        dtype: float16
+        save_every: 100
+        max_step_saves_to_keep: 1
+      datasets:
+        - folder_path: "/home/alex/test_dataset"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.0
+          shuffle_tokens: false
+          cache_latents_to_disk: false  # Disable for quick test
+          resolution: [512]  # Smaller for testing
+      train:
+        batch_size: 1
+        steps: 10  # Just 10 steps to test
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: false  # Disable for speed
+        noise_scheduler: "ddpm"
+        optimizer: "adamw"
+        lr: 1e-4
+        dtype: fp16
+      sample:
+        sampler: "ddim"
+        sample_every: 5  # Sample after 5 steps
+        sample_steps: 10  # Minimal steps for speed
+        guidance_scale: 7.5
+        prompts:
+          - "a beautiful mountain landscape"
+          - "a serene lake at sunset"
+          - "a cozy cottage in the forest"
+          - "a futuristic city skyline"
+          - "a magical garden with flowers"
+        neg: "blurry, low quality"
+        width: 512
+        height: 512
+
+    # SD 3.5 Test
+    - type: 'sd_trainer'
+      device: cuda:0
+      low_vram: true
+      trigger_word: "test_sd35"
+      model:
+        name_or_path: "/home/alex/SwarmUI/Models/diffusion_models/sd3_5_large.safetensors"
+        is_v3: true
+      network:
+        type: "lora"
+        linear: 4
+        linear_alpha: 4
+      save:
+        dtype: float16
+        save_every: 100
+        max_step_saves_to_keep: 1
+      datasets:
+        - folder_path: "/home/alex/test_dataset"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.0
+          shuffle_tokens: false
+          cache_latents_to_disk: false
+          resolution: [512]
+      train:
+        batch_size: 1
+        steps: 10
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: false
+        noise_scheduler: "flowmatch"
+        optimizer: "adamw"
+        lr: 1e-4
+        dtype: bf16
+        linear_timesteps: true
+      sample:
+        sampler: "euler"
+        sample_every: 5
+        sample_steps: 10
+        guidance_scale: 7.0
+        prompts:
+          - "an ancient temple ruins"
+          - "a steampunk airship"
+          - "a crystal cave with glowing minerals"
+          - "a desert oasis at dawn"
+          - "a underwater coral reef"
+        width: 512
+        height: 512
+
+    # Flux Test
+    - type: 'sd_trainer'
+      device: cuda:0
+      low_vram: true
+      trigger_word: "test_flux"
+      model:
+        name_or_path: "/home/alex/SwarmUI/Models/diffusion_models/flux1-dev.safetensors"
+        is_flux: true
+      network:
+        type: "lora"
+        linear: 4
+        linear_alpha: 4
+      save:
+        dtype: float16
+        save_every: 100
+        max_step_saves_to_keep: 1
+      datasets:
+        - folder_path: "/home/alex/test_dataset"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.0
+          shuffle_tokens: false
+          cache_latents_to_disk: false
+          resolution: [512]
+      train:
+        batch_size: 1
+        steps: 10
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: false
+        noise_scheduler: "flowmatch"
+        optimizer: "adamw"
+        lr: 1e-4
+        dtype: bf16
+        bypass_guidance_embedding: true
+      sample:
+        sampler: "euler"
+        sample_every: 5
+        sample_steps: 10
+        guidance_scale: 3.5
+        prompts:
+          - "a cyberpunk street market"
+          - "a medieval castle on a hill"
+          - "a space station orbiting Earth"
+          - "a mystical forest path"
+          - "a neon-lit arcade"
+        width: 512
+        height: 512

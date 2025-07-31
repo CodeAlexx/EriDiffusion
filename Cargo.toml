@@ -24,15 +24,23 @@ serde_json = "1.0"
 # File handling
 safetensors = "0.4"
 image = "0.24"
+half = "2.4"
+bytemuck = { version = "1.14", features = ["derive"] }
 
 # Math and randomness
 rand = "0.8"
 rand_distr = "0.4"
 
+# Text processing
+tokenizers = "0.19"
+
 # System
 rayon = "1.10"
 num_cpus = "1.16"
 chrono = "0.4"
+once_cell = "1.19"
+lazy_static = "1.4"
+thiserror = "1.0"
 
 # Optional dependencies for development
 indicatif = { version = "0.17", optional = true }
@@ -63,6 +71,31 @@ path = "src/bin/train_sd35_lora.rs"
 [[bin]]
 name = "train_flux_lora"
 path = "src/bin/train_flux_lora.rs"
+
+# Test binaries
+[[bin]]
+name = "test_sampling_pipelines"
+path = "src/bin/test_sampling_pipelines.rs"
+
+[[bin]]
+name = "test_sampling_integration"
+path = "src/bin/test_sampling_integration.rs"
+
+[[bin]]
+name = "create_test_dataset"
+path = "src/bin/create_test_dataset.rs"
+
+[[bin]]
+name = "test_jpg_png_generation"
+path = "test_jpg_png_generation.rs"
+
+[[bin]]
+name = "generate_swan_real"
+path = "src/bin/generate_swan_real.rs"
+
+[[example]]
+name = "generate_test_images"
+path = "examples/generate_test_images.rs"
 
 [profile.release]
 opt-level = 3
