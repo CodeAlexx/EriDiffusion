@@ -1,4 +1,4 @@
-//! Web UI and API server for AI-Toolkit
+//! Web UI and API server
 //!
 //! This module provides web interfaces and REST API endpoints for AI-Toolkit.
 
