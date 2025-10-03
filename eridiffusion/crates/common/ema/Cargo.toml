@@ -1,0 +1,11 @@
+ [package]
+ name = "common-ema"
+ version = "0.1.0"
+ edition = "2021"
+
+ [dependencies]
+ anyhow = "1"
+ serde = { version = "1", features = ["derive"] }
+ safetensors = "0.4"
+ half = "2.4"
+flame-core = { path = "../../../../flame/flame-core" , features = ["cuda", "bf16_u16", "bf16_kernels"]}

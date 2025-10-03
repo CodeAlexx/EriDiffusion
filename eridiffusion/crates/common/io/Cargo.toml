@@ -1,0 +1,15 @@
+[package]
+name = "eridiffusion-common-io"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+flame-core = { path = "../../../../flame/flame-core" , features = ["cuda", "bf16_u16", "bf16_kernels"]}
+eridiffusion-core = { path = "../../core" }
+safetensors = "0.4"
+bytemuck = "1.16"
+half = "2.4"
+
+[lib]
+crate-type = ["rlib"]

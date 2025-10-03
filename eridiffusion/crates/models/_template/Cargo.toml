@@ -1,0 +1,18 @@
+[package]
+name = "eridiffusion-models-template"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+safetensors = "0.4"
+thiserror = "1.0"
+
+flame-core = {path = "../../../../flame/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels"]}
+eridiffusion-common-weights = { path = "../../common/weights" }
+
+[dev-dependencies]
+tempfile = "3.10"
+

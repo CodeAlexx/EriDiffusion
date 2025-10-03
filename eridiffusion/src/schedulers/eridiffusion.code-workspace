@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"path": "../../../flame"
+		},
+		{
+			"path": "../../../../SwarmUI/Models"
+		}
+	],
+	"settings": {}
+}

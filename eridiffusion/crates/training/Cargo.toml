@@ -1,0 +1,135 @@
+[package]
+name = "eridiffusion-training"
+version = "0.1.0"
+edition = "2021"
+authors = ["AI-Toolkit Contributors"]
+description = "Training infrastructure for diffusion models"
+license = "MIT OR Apache-2.0"
+autobins = false
+
+[dependencies]
+flame-core = { path = "../../../flame/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels", "flash_attn"] }
+eridiffusion-core = { path = "../core" }
+# Heavy model/data crates are optional and enabled via the `real` feature
+eridiffusion-models = { path = "../models", optional = true }
+eridiffusion-data = { path = "../data", optional = true }
+eridiffusion-common-weights = { path = "../common/weights", optional = true }
+eridiffusion-models-hunyuan = { path = "../models/hunyuan", optional = true }
+eridiffusion-models-lumina = { path = "../models/lumina", optional = true }
+eridiffusion-models-omnigen2 = { path = "../models/omnigen2", optional = true }
+eridiffusion-models-ltx = { path = "../models/ltx", optional = true }
+eridiffusion-models-krea = { path = "../models/krea", optional = true }
+eridiffusion-models-qwen-edit = { path = "../models/qwen_edit_image", optional = true }
+eridiffusion-common-stability = { path = "../common/stability", optional = true }
+eridiffusion-common-blockswap = { path = "../common/blockswap", optional = true }
+eridiffusion-common-sampler = { path = "../common/sampler", optional = true }
+eridiffusion-models-wan22 = { path = "../models/wan22", optional = true }
+eridiffusion-models-qwen-image = { path = "../models/qwen_image", optional = true }
+eridiffusion-model-registry = { path = "../common/model_registry", optional = true }
+eridiffusion-common-text = { path = "../common/text", optional = true }
+eridiffusion-common-vae = { path = "../common/vae", optional = true, features = ["bf16_u16"] }
+eridiffusion-common-config = { path = "../common/config", optional = true }
+eridiffusion-models-chroma = { path = "../models/chroma", optional = true }
+eridiffusion-models-sdxl = { path = "../models/sdxl", optional = true }
+eridiffusion-common-io = { path = "../common/io", optional = true }
+eridiffusion-common-telemetry = { path = "../common/telemetry", optional = true }
+
+# ML Framework
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+safetensors = "0.4"
+anyhow = "1"
+bytemuck = "1.23"
+sha2 = "0.10"
+
+# Async
+tokio = { version = "1.40", features = ["full"] }
+async-trait = "0.1"
+
+# Logging
+tracing = "0.1"
+
+# Training utilities
+indicatif = "0.17"
+chrono = "0.4"
+csv = "1.3"
+
+# Distributed training
+# nccl-sys = { version = "0.1", optional = true }
+
+# Monitoring
+sysinfo = "0.31"
+
+# Utils
+rand = "0.8"
+rand_distr = "0.4"
+rayon = "1.10"
+tokenizers = "0.15"
+ctrlc = "3.4"
+half = "2.4"
+image = "0.24"
+common-ema = { path = "../common/ema" }
+ndarray = "0.15"
+ndarray-npy = "0.8"
+rand_chacha = "0.3"
+nvml-wrapper = { version = "0.9", optional = true }
+cudarc = { version = "0.11", default-features = false }
+once_cell = "1.19"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+env_logger = "0.11"
+tracing-subscriber = "0.3"
+
+[features]
+# Real mode builds only Flux model by default (keep minimal)
+real = [
+    "dep:eridiffusion-models",
+    "eridiffusion-models/flux",
+    "dep:eridiffusion-common-weights",
+    "dep:eridiffusion-data",
+    "dep:eridiffusion-common-text",
+    "dep:eridiffusion-common-vae",
+    "dep:eridiffusion-common-io",
+    "dep:eridiffusion-common-telemetry",
+    "flux",
+]
+synthetic = []
+examples = []
+distributed = []
+common-data = []
+chroma-only = []
+default = ["real", "cond_sinusoidal"]
+cond_sinusoidal = []
+cond_time_ids_mlp = []
+nvml = ["dep:nvml-wrapper"]
+common-sampler = ["dep:eridiffusion-common-sampler"]
+flash_attn = ["flame-core/flash_attn"]
+bf16_u16 = []
+bf16_kernels = []
+bf16_conv = ["flame-core/bf16_conv"]
+
+# Per-model feature toggles (used to gate modules)
+flux = []
+sdxl = [
+    "dep:eridiffusion-models",
+    "dep:eridiffusion-common-weights",
+    "dep:eridiffusion-common-text",
+    "dep:eridiffusion-common-vae",
+    "dep:eridiffusion-common-io",
+    "dep:eridiffusion-common-telemetry",
+    "common-sampler",
+    "bf16_u16",
+    "bf16_kernels",
+]
+sd35 = []
+chroma = []
+wan22 = []
+
+[dev-dependencies]
+tempfile = "3.10"
+ndarray = "0.15"
+ndarray-npy = "0.8"
+anyhow = "1"

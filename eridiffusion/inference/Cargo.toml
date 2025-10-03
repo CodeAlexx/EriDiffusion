@@ -1,0 +1,29 @@
+[package]
+name = "eridiffusion-inference"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "eridiffusion_inference"
+path = "src/lib.rs"
+
+[dependencies]
+flame-core = { path = "../../flame/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels", "bf16_conv", "flash_attn"] }
+eridiffusion-core = { path = "../crates/core" }
+eridiffusion-training = { path = "../crates/training", default-features = false, features = ["sdxl", "cond_sinusoidal", "real", "bf16_conv"] }
+eridiffusion-common-text = { path = "../crates/common/text" }
+eridiffusion-common-vae = { path = "../crates/common/vae" }
+eridiffusion-common-weights = { path = "../crates/common/weights" }
+eridiffusion-models = { path = "../crates/models" }
+anyhow = "1"
+log = "0.4"
+thiserror = "1"
+image = "0.24"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4.5", features = ["derive"] }
+env_logger = "0.11"
+
+[[bin]]
+name = "sdxl-cli"
+path = "bin/sdxl_cli.rs"

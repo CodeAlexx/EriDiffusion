@@ -1,0 +1,18 @@
+[package]
+name = "adapters"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+thiserror = "1"
+hashbrown = "0.14"
+eridiffusion-core = { path = "../core" }
+eridiffusion-common-weights = { path = "../common/weights" }
+flame-core = {path = "../../../flame/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels"]}
+
+[features]
+default = ["bf16"]
+bf16 = []
+cuda = []
+experimental_lyco = []

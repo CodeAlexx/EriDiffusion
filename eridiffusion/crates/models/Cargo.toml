@@ -1,0 +1,27 @@
+[package]
+name = "eridiffusion-models"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["flux"]
+flux = []
+sdxl = []
+sd35 = []
+chroma = []
+wan22 = []
+
+[dependencies]
+anyhow = "1.0"
+flame-core = {path = "../../../flame/flame-core", default-features = false, features = ["bf16_u16", "cuda", "bf16_kernels"]}
+safetensors = "0.4"
+adapters = { path = "../adapters" }
+eridiffusion-core = { path = "../core" }
+eridiffusion-common-text = { path = "../common/text" }
+eridiffusion-common-weights = { path = "../common/weights" }
+eridiffusion-common-io = { path = "../common/io" }
+eridiffusion-common-lora = { path = "../common/lora" }
+eridiffusion-common-telemetry = { path = "../common/telemetry" }
+eridiffusion-common-vae = { path = "../common/vae" }
+bytemuck = "1.16"
+half = "2.4"

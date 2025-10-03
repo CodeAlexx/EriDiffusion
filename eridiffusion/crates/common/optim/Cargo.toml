@@ -1,0 +1,18 @@
+[package]
+name = "eridiffusion-common-optim"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+hashbrown = "0.14"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1.0"
+tracing = "0.1"
+flame-core = {path = "../../../../flame/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels"]}
+eridiffusion-common-weights = { path = "../weights" }
+
+[dev-dependencies]
+tempfile = "3.10"
+
