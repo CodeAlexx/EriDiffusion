@@ -1,7 +1,6 @@
 use crate::loaders::WeightLoader;
 use crate::models::aligned_image_processor::AlignedImageProcessor;
-use crate::models::fast_vae::FastVAE;
-use crate::models::vae::{AutoEncoderKL as BaseVAE, VAEConfig};
+use crate::models::vae_complete::{AutoEncoderKL as BaseVAE, VAEConfig};
 use crate::trainers::cpu_offload_manager::CPUOffloadManager;
 use flame_core::device::Device;
 use flame_core::{DType, Result, Shape, Tensor};
@@ -25,12 +24,15 @@ impl AutoencoderKL {
     pub fn new(wl: &WeightLoader, device: Device, enable_offloading: bool) -> Result<Self> {
         // Flux VAE config with 16 latent channels instead of 4
         let config = VAEConfig {
+            in_channels: 3,
+            out_channels: 3,
             block_out_channels: vec![128, 256, 512, 512],
             layers_per_block: 2,
             latent_channels: 16, // Flux uses 16 channels
             norm_num_groups: 32,
             use_quant_conv: false,      // Flux VAE doesn't use quant conv
             use_post_quant_conv: false, // Flux VAE doesn't use post quant conv
+            scaling_factor: 0.3611,     // Flux scaling factor
         };
 
         // DON'T remap weights - pass them directly with original keys
@@ -43,7 +45,7 @@ impl AutoencoderKL {
         // }
         // println!("Total weight keys: {}", weights.len());
 
-        let inner = BaseVAE::new(config, device.clone(), weights)?;
+        let inner = BaseVAE::new(config, &device, weights)?;
 
         let offload_manager =
             if enable_offloading { Some(CPUOffloadManager::new(device.clone(), 4)?) } else { None };

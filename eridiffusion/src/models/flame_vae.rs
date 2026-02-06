@@ -44,7 +44,7 @@ impl VAEEncoder {
 
         // Load output layers
         let conv_norm_out =
-            GroupNorm::new(32, 512, 1e-6, true, prefixed_weights.device().cuda_device().clone())?;
+            GroupNorm::new(32, 512, 1e-6, true, DType::F32, prefixed_weights.device().cuda_device().clone())?;
         let conv_out =
             Conv2d::new(512, 8, 3, 1, 1, prefixed_weights.device().cuda_device().clone())?;
 
@@ -121,7 +121,7 @@ impl VAEDecoder {
 
         // Load output layers
         let conv_norm_out =
-            GroupNorm::new(32, 128, 1e-6, true, prefixed_weights.device().cuda_device().clone())?;
+            GroupNorm::new(32, 128, 1e-6, true, DType::F32, prefixed_weights.device().cuda_device().clone())?;
         let conv_out =
             Conv2d::new(128, 3, 3, 1, 1, prefixed_weights.device().cuda_device().clone())?;
 

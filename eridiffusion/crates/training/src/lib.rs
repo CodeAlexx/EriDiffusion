@@ -27,18 +27,18 @@ pub mod models {
     pub use super::model_registry::models::*;
 }
 pub mod checkpoint_manager;
+pub mod chroma;
 pub mod data;
+pub mod error_helpers;
+pub mod flux;
+pub mod flux_trainer;
 pub mod gradient_checkpointing;
+pub mod lora_keys;
 pub mod pipeline;
 pub mod pipelines;
 #[cfg(feature = "examples")]
 pub mod run;
-pub mod chroma;
 pub mod sd35;
-pub mod error_helpers;
-pub mod flux;
-pub mod flux_trainer;
-pub mod lora_keys;
 pub mod sdxl;
 // flux_* modules are disabled in this compile-only pass
 // pub mod flux_model_loader;

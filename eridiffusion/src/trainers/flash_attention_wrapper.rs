@@ -59,9 +59,7 @@ pub fn attention_with_flash(
         Some(scale),
         config.causal,
     )
-    .map_err(|e| {
-        flame_core::Error::InvalidOperation(format!("Flash attention failed: {:?}", e))
-    })?;
+    .map_err(|e| flame_core::Error::InvalidOperation(format!("Flash attention failed: {:?}", e)))?;
 
     // Reshape back to [batch_size, seq_len, hidden_size]
     let output = out.reshape(&[batch_size, seq_len, hidden_size])?;

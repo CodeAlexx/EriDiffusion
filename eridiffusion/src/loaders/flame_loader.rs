@@ -1,6 +1,6 @@
 use crate::loaders::WeightLoader;
-use crate::models::text_encoder::CLIPTextEncoder;
-use crate::models::vae::AutoEncoderKL;
+use crate::models::text_encoder_complete::CLIPTextEncoder;
+use crate::models::vae_complete::{AutoEncoderKL, VAEConfig};
 use anyhow::Context;
 use flame_core::device::Device;
 use flame_core::optimizers::{Adam, SGD};
@@ -53,7 +53,7 @@ impl FlameCheckpointLoader {
     pub fn load_vae(&self, path: &Path) -> flame_core::Result<AutoEncoderKL> {
         // Load VAE weights and create model
         let weights = self.load_safetensors(path)?;
-        AutoEncoderKL::from_weights(weights, self.device.clone())
+        AutoEncoderKL::from_weights(weights, VAEConfig::default(), self.device.clone())
     }
 
     pub fn load_clip_text_encoder(&self, path: &Path) -> flame_core::Result<CLIPTextEncoder> {

@@ -96,9 +96,7 @@ impl TensorCache {
 
         let tensor = build()?;
         let mut guard = self.map.lock().unwrap();
-        let entry = guard
-            .entry(key.to_string())
-            .or_insert_with(|| tensor.clone());
+        let entry = guard.entry(key.to_string()).or_insert_with(|| tensor.clone());
         Ok(entry.clone())
     }
 }
@@ -111,11 +109,7 @@ pub struct SdxlWeightProvider {
 
 impl SdxlWeightProvider {
     pub fn new(mmap: Arc<StrictMmapLoader>, device: FlameDevice) -> Self {
-        Self {
-            mmap,
-            device,
-            cache: TensorCache::default(),
-        }
+        Self { mmap, device, cache: TensorCache::default() }
     }
 
     pub fn device(&self) -> &FlameDevice {
@@ -123,22 +117,13 @@ impl SdxlWeightProvider {
     }
 
     pub fn tensor_shape(&self, key: &str) -> anyhow::Result<Vec<usize>> {
-        let info = self
-            .mmap
-            .info(key)
-            .map_err(|e| anyhow!("missing tensor {key}: {e}"))?;
+        let info = self.mmap.info(key).map_err(|e| anyhow!("missing tensor {key}: {e}"))?;
         Ok(info.shape)
     }
 
     fn load_tensor_raw(&self, key: &str) -> anyhow::Result<Tensor> {
-        let info = self
-            .mmap
-            .info(key)
-            .map_err(|e| anyhow!("missing tensor {key}: {e}"))?;
-        let raw = self
-            .mmap
-            .bytes(key)
-            .map_err(|e| anyhow!("read tensor {key}: {e}"))?;
+        let info = self.mmap.info(key).map_err(|e| anyhow!("missing tensor {key}: {e}"))?;
+        let raw = self.mmap.bytes(key).map_err(|e| anyhow!("read tensor {key}: {e}"))?;
         let tensor = tensor_from_bytes(self.device.clone(), &info, raw)
             .map_err(|e| anyhow!("tensor_from_bytes({key}): {e}"))?
             .requires_grad_(false)
@@ -154,16 +139,13 @@ impl SdxlWeightProvider {
 
             // Populate sibling slices eagerly so future lookups avoid re-splitting.
             if which != QkvSlice::Q {
-                self.cache
-                    .insert(format!("{}::{}", phys, QkvSlice::Q.cache_suffix()), q.clone());
+                self.cache.insert(format!("{}::{}", phys, QkvSlice::Q.cache_suffix()), q.clone());
             }
             if which != QkvSlice::K {
-                self.cache
-                    .insert(format!("{}::{}", phys, QkvSlice::K.cache_suffix()), k.clone());
+                self.cache.insert(format!("{}::{}", phys, QkvSlice::K.cache_suffix()), k.clone());
             }
             if which != QkvSlice::V {
-                self.cache
-                    .insert(format!("{}::{}", phys, QkvSlice::V.cache_suffix()), v.clone());
+                self.cache.insert(format!("{}::{}", phys, QkvSlice::V.cache_suffix()), v.clone());
             }
 
             let result = match which {
@@ -177,8 +159,7 @@ impl SdxlWeightProvider {
 
     /// Load a single tensor by key and place it on the provider device.
     pub fn load_tensor(&self, key: &str) -> anyhow::Result<Tensor> {
-        self.cache
-            .get_or_try_insert(key, || self.load_tensor_raw(key))
+        self.cache.get_or_try_insert(key, || self.load_tensor_raw(key))
     }
 }
 

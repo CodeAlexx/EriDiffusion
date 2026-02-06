@@ -29,11 +29,8 @@ pub fn filter_adapters(set: &AdapterSet, allow: &[String], deny: &[String]) -> A
     let deny_re = if deny.is_empty() { Vec::<Regex>::new() } else { compile_globs(deny) };
     let mut out = AdapterSet::new();
     for (k, a) in &set.by_target {
-        let allowed = if allow_re.is_empty() {
-            true
-        } else {
-            allow_re.iter().any(|re| re.is_match(k))
-        };
+        let allowed =
+            if allow_re.is_empty() { true } else { allow_re.iter().any(|re| re.is_match(k)) };
         let denied = deny_re.iter().any(|re| re.is_match(k));
         if allowed && !denied {
             out.insert(k.clone(), Arc::clone(a));

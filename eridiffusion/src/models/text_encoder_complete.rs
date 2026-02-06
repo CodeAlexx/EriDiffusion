@@ -5,6 +5,23 @@ use flame_core::Result;
 use flame_core::{embedding::Embedding, DType, Error, Shape, Tensor};
 use std::{collections::HashMap, sync::Arc};
 
+fn to_bf16_tensor(tensor: &Tensor) -> Result<Tensor> {
+    if tensor.dtype() == DType::BF16 {
+        Ok(tensor.clone())
+    } else {
+        tensor.to_dtype(DType::BF16)
+    }
+}
+
+fn to_bf16_optional(tensor: Option<&Tensor>) -> Result<Option<Tensor>> {
+    if let Some(t) = tensor {
+        Ok(Some(to_bf16_tensor(t)?))
+    } else {
+        Ok(None)
+    }
+}
+
+#[derive(Clone)]
 pub struct T5Config {
     pub vocab_size: usize,
     pub d_model: usize,
@@ -83,7 +100,9 @@ struct T5Attention {
 }
 struct T5FeedForward {
     wi: Linear,
+    wi_gate: Option<Linear>,
     wo: Linear,
+    activation: String,
 }
 
 // FLAME uses flame_core::device::Device instead of Device
@@ -197,6 +216,21 @@ impl CLIPTextEncoder {
         device: flame_core::device::Device,
         weights: std::collections::HashMap<String, Tensor>,
     ) -> Result<Self> {
+        let mut weights = weights;
+        let mut alias_keys = Vec::new();
+        for key in weights.keys() {
+            if let Some(stripped) = key.strip_prefix("text_model.") {
+                if !weights.contains_key(stripped) {
+                    alias_keys.push((stripped.to_string(), key.clone()));
+                }
+            }
+        }
+        for (alias, original) in alias_keys {
+            if let Some(tensor) = weights.get(&original) {
+                weights.insert(alias, tensor.alias());
+            }
+        }
+
         let embeddings = CLIPTextEmbeddings::new(&config, &device, &weights)?;
         let encoder = CLIPEncoder::new(&config, &device, &weights)?;
         let final_layer_norm_weight =
@@ -217,27 +251,26 @@ impl CLIPTextEncoder {
                 config.layer_norm_eps,
                 device.cuda_device().clone(),
             )?;
-            ln.weight = Some(final_layer_norm_weight.clone());
-            ln.bias = Some(final_layer_norm_bias.clone());
+            ln.weight = Some(to_bf16_tensor(final_layer_norm_weight)?);
+            ln.bias = Some(to_bf16_tensor(final_layer_norm_bias)?);
             ln
         };
 
         let text_projection = if let Some(proj_dim) = config.projection_dim {
-            let weight = weights.get("text_projection.weight").ok_or_else(|| {
-                flame_core::Error::InvalidOperation(
-                    "text_projection.weight not found".to_string(),
-                )
-            })?;
-            let bias = weights.get("text_projection.bias");
-            Some({
-                let in_features = weight.shape().dims()[1];
-                let out_features = weight.shape().dims()[0];
-                let mut linear =
-                    Linear::new(in_features, out_features, true, device.cuda_device())?;
-                linear.weight = weight.clone();
-                linear.bias = bias.map(|t| t.clone());
-                linear
-            })
+            if let Some(weight) = weights.get("text_projection.weight") {
+                let bias = weights.get("text_projection.bias");
+                Some({
+                    let in_features = weight.shape().dims()[1];
+                    let out_features = weight.shape().dims()[0];
+                    let mut linear =
+                        Linear::new(in_features, out_features, true, device.cuda_device())?;
+                    linear.weight = to_bf16_tensor(weight)?;
+                    linear.bias = to_bf16_optional(bias)?;
+                    linear
+                })
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -280,6 +313,7 @@ impl CLIPTextEncoder {
         };
 
         // Run through encoder
+        log::debug!("CLIP encoder input dtype: {:?}", hidden_states.dtype());
         let encoder_outputs = self.encoder.forward(&hidden_states, attention_mask.as_ref())?;
 
         // Final layer norm
@@ -417,36 +451,34 @@ impl CLIPTextEmbeddings {
         })?;
         let position_weight =
             weights.get("embeddings.position_embedding.weight").ok_or_else(|| {
-                flame_core::Error::InvalidOperation(
-                    "Missing position embedding weight".to_string(),
-                )
+                flame_core::Error::InvalidOperation("Missing position embedding weight".to_string())
             })?;
 
         // Create token embedding from weight tensor
         let token_embedding = {
             let dims = token_weight.shape().dims();
             let mut emb = Embedding::new(dims[0], dims[1], device.cuda_device().clone())?;
-            emb.weight = token_weight.clone();
+            emb.weight = to_bf16_tensor(token_weight)?;
             emb
         };
         // Create position embedding from weight tensor
         let position_embedding = {
             let dims = position_weight.shape().dims();
             let mut emb = Embedding::new(dims[0], dims[1], device.cuda_device().clone())?;
-            emb.weight = position_weight.clone();
+            emb.weight = to_bf16_tensor(position_weight)?;
             emb
         };
         Ok(Self { token_embedding, position_embedding })
     }
 
     fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
-        println!("DEBUG CLIPTextEmbeddings forward: input_ids shape = {:?}", input_ids.shape());
+        log::debug!("CLIPTextEmbeddings forward: input_ids shape = {:?}", input_ids.shape());
         let seq_len = input_ids.shape().dims()[1];
 
         // Get token embeddings
         let inputs_embeds = self.token_embedding.forward(input_ids)?;
-        println!(
-            "DEBUG CLIPTextEmbeddings: token_embedding output shape = {:?}",
+        log::debug!(
+            "CLIPTextEmbeddings: token_embedding output shape = {:?}",
             inputs_embeds.shape()
         );
 
@@ -455,15 +487,15 @@ impl CLIPTextEmbeddings {
             flame_core::Tensor::arange(0.0, seq_len as f32, 1.0, input_ids.device().clone())?
                 .unsqueeze(0)?
                 .broadcast_to(input_ids.shape())?;
-        println!("DEBUG CLIPTextEmbeddings: position_ids shape = {:?}", position_ids.shape());
+        log::debug!("CLIPTextEmbeddings: position_ids shape = {:?}", position_ids.shape());
 
         // Get position embeddings
         let position_embeds = self.position_embedding.forward(&position_ids)?;
-        println!("DEBUG CLIPTextEmbeddings: position_embeds shape = {:?}", position_embeds.shape());
+        log::debug!("CLIPTextEmbeddings: position_embeds shape = {:?}", position_embeds.shape());
 
         // Add embeddings
         let result = inputs_embeds.add(&position_embeds)?;
-        println!("DEBUG CLIPTextEmbeddings: final result shape = {:?}", result.shape());
+        log::debug!("CLIPTextEmbeddings: final result shape = {:?}", result.shape());
         Ok(result)
     }
 }
@@ -530,8 +562,8 @@ impl CLIPEncoderLayer {
                 config.layer_norm_eps,
                 device.cuda_device().clone(),
             )?;
-            ln.weight = Some(layer_norm1_weight.clone());
-            ln.bias = Some(layer_norm1_bias.clone());
+            ln.weight = Some(to_bf16_tensor(layer_norm1_weight)?);
+            ln.bias = Some(to_bf16_tensor(layer_norm1_bias)?);
             ln
         };
 
@@ -557,8 +589,8 @@ impl CLIPEncoderLayer {
                 config.layer_norm_eps,
                 device.cuda_device().clone(),
             )?;
-            ln.weight = Some(layer_norm2_weight.clone());
-            ln.bias = Some(layer_norm2_bias.clone());
+            ln.weight = Some(to_bf16_tensor(layer_norm2_weight)?);
+            ln.bias = Some(to_bf16_tensor(layer_norm2_bias)?);
             ln
         };
 
@@ -568,6 +600,7 @@ impl CLIPEncoderLayer {
     fn forward(&self, hidden_states: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
         // Self attention with pre-norm
         let residual = hidden_states.clone();
+        log::debug!("LayerNorm1 input dtype: {:?}", hidden_states.dtype());
         let hidden_states = self.layer_norm1.forward(hidden_states)?;
         let hidden_states = self.self_attn.forward(&hidden_states, attention_mask)?;
         let hidden_states = residual.add(&hidden_states)?;
@@ -635,8 +668,8 @@ impl CLIPAttention {
                 let out_features = k_weight.shape().dims()[0];
                 let mut linear =
                     Linear::new(in_features, out_features, true, device.cuda_device())?;
-                linear.weight = k_weight.clone();
-                linear.bias = k_bias.map(|t| t.clone());
+                linear.weight = to_bf16_tensor(k_weight)?;
+                linear.bias = to_bf16_optional(k_bias)?;
                 linear
             },
             v_proj: {
@@ -644,8 +677,8 @@ impl CLIPAttention {
                 let out_features = v_weight.shape().dims()[0];
                 let mut linear =
                     Linear::new(in_features, out_features, true, device.cuda_device())?;
-                linear.weight = v_weight.clone();
-                linear.bias = v_bias.map(|t| t.clone());
+                linear.weight = to_bf16_tensor(v_weight)?;
+                linear.bias = to_bf16_optional(v_bias)?;
                 linear
             },
             q_proj: {
@@ -653,8 +686,8 @@ impl CLIPAttention {
                 let out_features = q_weight.shape().dims()[0];
                 let mut linear =
                     Linear::new(in_features, out_features, true, device.cuda_device())?;
-                linear.weight = q_weight.clone();
-                linear.bias = q_bias.map(|t| t.clone());
+                linear.weight = to_bf16_tensor(q_weight)?;
+                linear.bias = to_bf16_optional(q_bias)?;
                 linear
             },
             out_proj: {
@@ -662,8 +695,8 @@ impl CLIPAttention {
                 let out_features = out_weight.shape().dims()[0];
                 let mut linear =
                     Linear::new(in_features, out_features, true, device.cuda_device())?;
-                linear.weight = out_weight.clone();
-                linear.bias = out_bias.map(|t| t.clone());
+                linear.weight = to_bf16_tensor(out_weight)?;
+                linear.bias = to_bf16_optional(out_bias)?;
                 linear
             },
             num_heads,
@@ -676,25 +709,45 @@ impl CLIPAttention {
         let batch_size = hidden_states.shape().dims()[0];
         let seq_len = hidden_states.shape().dims()[1];
 
+        log::debug!(
+            "CLIPAttention input dtype {:?}, q weight dtype {:?}",
+            hidden_states.dtype(),
+            self.q_proj.weight.dtype()
+        );
+
         // Project to Q, K, V
         let q = self
             .q_proj
             .forward(hidden_states)?
             .reshape(&[batch_size, seq_len, self.num_heads, self.head_dim])?
             .transpose_dims(1, 2)?;
+        let q = if q.dtype() != DType::BF16 { q.to_dtype(DType::BF16)? } else { q };
         let k = self
             .k_proj
             .forward(hidden_states)?
             .reshape(&[batch_size, seq_len, self.num_heads, self.head_dim])?
             .transpose_dims(1, 2)?;
+        let k = if k.dtype() != DType::BF16 { k.to_dtype(DType::BF16)? } else { k };
         let v = self
             .v_proj
             .forward(hidden_states)?
             .reshape(&[batch_size, seq_len, self.num_heads, self.head_dim])?
             .transpose_dims(1, 2)?;
+        let v = if v.dtype() != DType::BF16 { v.to_dtype(DType::BF16)? } else { v };
 
         // Attention scores
-        let scores = q.matmul(&k.transpose_dims(2, 3)?)?.mul_scalar(self.scale as f32)?;
+        let k_t = k.transpose_dims(2, 3)?;
+        let k_t = if k_t.dtype() != DType::BF16 { k_t.to_dtype(DType::BF16)? } else { k_t };
+        log::debug!("CLIPAttention matmul lhs {:?} rhs {:?}", q.dtype(), k_t.dtype());
+        
+        let b = q.shape().dims()[0];
+        let h = q.shape().dims()[1];
+        let s = q.shape().dims()[2];
+        let d = q.shape().dims()[3];
+        let q_3d = q.reshape(&[b * h, s, d])?;
+        let k_3d = k_t.reshape(&[b * h, d, s])?;
+        let scores_3d = q_3d.bmm(&k_3d)?;
+        let scores = scores_3d.reshape(&[b, h, s, s])?.mul_scalar(self.scale as f32)?;
 
         // Apply attention mask if provided
         let scores = if let Some(mask) = attention_mask { scores.add(mask)? } else { scores };
@@ -703,7 +756,10 @@ impl CLIPAttention {
         let attn_weights = scores.softmax(-1)?;
 
         // Apply attention to values
-        let attn_output = attn_weights.matmul(&v)?.transpose_dims(1, 2)?.reshape(&[
+        let attn_weights_3d = attn_weights.reshape(&[b * h, s, s])?;
+        let v_3d = v.reshape(&[b * h, s, d])?;
+        let attn_output_3d = attn_weights_3d.bmm(&v_3d)?;
+        let attn_output = attn_output_3d.reshape(&[b, h, s, d])?.transpose_dims(1, 2)?.reshape(&[
             batch_size,
             seq_len,
             self.num_heads * self.head_dim,
@@ -739,8 +795,8 @@ impl CLIPMLP {
                 let out_features = fc1_weight.shape().dims()[0];
                 let mut linear =
                     Linear::new(in_features, out_features, true, device.cuda_device())?;
-                linear.weight = fc1_weight.clone();
-                linear.bias = fc1_bias.map(|t| t.clone());
+                linear.weight = to_bf16_tensor(fc1_weight)?;
+                linear.bias = to_bf16_optional(fc1_bias)?;
                 linear
             },
             fc2: {
@@ -748,8 +804,8 @@ impl CLIPMLP {
                 let out_features = fc2_weight.shape().dims()[0];
                 let mut linear =
                     Linear::new(in_features, out_features, true, device.cuda_device())?;
-                linear.weight = fc2_weight.clone();
-                linear.bias = fc2_bias.map(|t| t.clone());
+                linear.weight = to_bf16_tensor(fc2_weight)?;
+                linear.bias = to_bf16_optional(fc2_bias)?;
                 linear
             },
             activation: config.hidden_act.clone(),
@@ -760,7 +816,7 @@ impl CLIPMLP {
         let hidden_states = self.fc1.forward(hidden_states)?;
 
         let hidden_states = match self.activation.as_str() {
-            "gelu" => hidden_states.gelu()?,
+            "gelu" => flame_core::cuda_ops_bf16::gelu_bf16(&hidden_states)?,
             "quick_gelu" => {
                 // Quick GELU approximation: x * sigmoid(1.702 * x)
                 let x_scaled = hidden_states.mul_scalar(1.702 as f32)?;
@@ -768,7 +824,7 @@ impl CLIPMLP {
                 hidden_states.mul(&sigmoid)?
             }
             "relu" => hidden_states.relu()?,
-            _ => hidden_states.gelu()?, // Default to GELU
+            _ => flame_core::cuda_ops_bf16::gelu_bf16(&hidden_states)?, // Default to GELU
         };
 
         self.fc2.forward(&hidden_states)
@@ -783,23 +839,91 @@ impl T5Encoder {
         device: flame_core::device::Device,
         weights: &crate::loaders::WeightLoader,
     ) -> Result<Self> {
-        // Convert WeightLoader to HashMap
+        // Legacy path: must clone/alias because we only have reference
         let mut weight_map = std::collections::HashMap::new();
-        // This is a placeholder - need to extract weights from WeightLoader
-        // For now, we'll use the weights directly
+        for (key, tensor) in weights.weights.iter() {
+            let insert_alias = |map: &mut std::collections::HashMap<String, Tensor>,
+                                name: &str,
+                                tensor: &Tensor| {
+                map.entry(name.to_string()).or_insert_with(|| tensor.alias());
+            };
+
+            insert_alias(&mut weight_map, key, tensor);
+            if let Some(stripped) = key.strip_prefix("text_model.") {
+                insert_alias(&mut weight_map, stripped, tensor);
+            }
+            if let Some(stripped) = key.strip_prefix("encoder.") {
+                insert_alias(&mut weight_map, stripped, tensor);
+            }
+        }
+        Self::from_map(config, device, weight_map)
+    }
+
+    pub fn from_map(
+        config: T5Config,
+        device: flame_core::device::Device,
+        mut weight_map: std::collections::HashMap<String, Tensor>,
+    ) -> Result<Self> {
+        // Add aliases for legacy keys if missing, but try to avoid cloning if possible.
+        // Since we own the map, we can just insert aliases pointing to existing tensors.
+        // Note: alias() might be deep copy, so we should avoid it if we can.
+        // But we need to support multiple keys pointing to same tensor.
+        // We can collect keys to process to avoid borrowing issues.
+        let keys: Vec<String> = weight_map.keys().cloned().collect();
+        for key in keys {
+            // We need to clone the handle to alias it.
+            // If alias() is deep copy, this is bad.
+            // But we only alias if we need to add a missing key.
+            // If the key already exists, we do nothing.
+            
+            let maybe_alias = |map: &mut std::collections::HashMap<String, Tensor>, src_key: &str, dst_key: &str| {
+                if !map.contains_key(dst_key) {
+                    if let Some(tensor) = map.get(src_key) {
+                        let alias = tensor.clone(); // Use clone() which is shallow (Arc)
+                        map.insert(dst_key.to_string(), alias);
+                    }
+                }
+            };
+
+            if let Some(stripped) = key.strip_prefix("text_model.") {
+                maybe_alias(&mut weight_map, &key, stripped);
+            }
+            if let Some(stripped) = key.strip_prefix("encoder.") {
+                maybe_alias(&mut weight_map, &key, stripped);
+            }
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            let mut sample: Vec<_> = weight_map.keys().take(5).cloned().collect();
+            eprintln!("[t5_loader] sample keys: {:?}", sample);
+        }
+
         let embeddings = T5Embeddings::new(&config, &device, &weight_map)?;
         let encoder = T5Stack::new(&config, &device, &weight_map)?;
         // T5 uses 'final_layer_norm' as the key for the final layer norm
-        let final_ln_weight = weights.get("encoder.final_layer_norm.weight")?;
-        let final_ln_bias = weights.get("encoder.final_layer_norm.bias")?;
+        let final_ln_weight =
+            weight_map.get("encoder.final_layer_norm.weight").ok_or_else(|| {
+                flame_core::Error::InvalidOperation(
+                    "encoder.final_layer_norm.weight not found".into(),
+                )
+            })?;
+        let final_ln_bias = weight_map.get("encoder.final_layer_norm.bias");
         let final_layer_norm = {
             let mut ln = LayerNorm::new(
                 vec![config.d_model],
                 config.layer_norm_epsilon,
                 device.cuda_device().clone(),
             )?;
-            ln.weight = Some(final_ln_weight.clone());
-            ln.bias = Some(final_ln_bias.clone());
+            ln.weight = Some(to_bf16_tensor(final_ln_weight)?);
+            ln.bias = Some(match final_ln_bias {
+                Some(bias) => to_bf16_tensor(bias)?,
+                None => Tensor::zeros_dtype(
+                    Shape::from_dims(&[config.d_model]),
+                    DType::BF16,
+                    device.cuda_device().clone(),
+                )?,
+            });
             ln
         };
 
@@ -935,21 +1059,22 @@ impl T5Layer {
                     prefix
                 ))
             })?;
-        let ln1_bias =
-            weights.get(&format!("{}.layer.0.layer_norm.bias", prefix)).ok_or_else(|| {
-                flame_core::Error::InvalidOperation(format!(
-                    "{}.layer.0.layer_norm.bias not found",
-                    prefix
-                ))
-            })?;
+        let ln1_bias = weights.get(&format!("{}.layer.0.layer_norm.bias", prefix));
         let layer_norm1 = {
             let mut ln = LayerNorm::new(
                 vec![config.d_model],
                 config.layer_norm_epsilon,
                 device.cuda_device().clone(),
             )?;
-            ln.weight = Some(ln1_weight.clone());
-            ln.bias = Some(ln1_bias.clone());
+            ln.weight = Some(to_bf16_tensor(ln1_weight)?);
+            ln.bias = Some(match ln1_bias {
+                Some(bias) => to_bf16_tensor(bias)?,
+                None => Tensor::zeros_dtype(
+                    Shape::from_dims(&[config.d_model]),
+                    DType::BF16,
+                    device.cuda_device().clone(),
+                )?,
+            });
             ln
         };
 
@@ -960,21 +1085,22 @@ impl T5Layer {
                     prefix
                 ))
             })?;
-        let ln2_bias =
-            weights.get(&format!("{}.layer.1.layer_norm.bias", prefix)).ok_or_else(|| {
-                flame_core::Error::InvalidOperation(format!(
-                    "{}.layer.1.layer_norm.bias not found",
-                    prefix
-                ))
-            })?;
+        let ln2_bias = weights.get(&format!("{}.layer.1.layer_norm.bias", prefix));
         let layer_norm2 = {
             let mut ln = LayerNorm::new(
                 vec![config.d_model],
                 config.layer_norm_epsilon,
                 device.cuda_device().clone(),
             )?;
-            ln.weight = Some(ln2_weight.clone());
-            ln.bias = Some(ln2_bias.clone());
+            ln.weight = Some(to_bf16_tensor(ln2_weight)?);
+            ln.bias = Some(match ln2_bias {
+                Some(bias) => to_bf16_tensor(bias)?,
+                None => Tensor::zeros_dtype(
+                    Shape::from_dims(&[config.d_model]),
+                    DType::BF16,
+                    device.cuda_device().clone(),
+                )?,
+            });
             ln
         };
 
@@ -1050,7 +1176,7 @@ impl T5Attention {
                 let out_features = q_weight.shape().dims()[0];
                 let mut linear =
                     Linear::new(in_features, out_features, false, device.cuda_device())?;
-                linear.weight = q_weight.clone();
+                linear.weight = to_bf16_tensor(q_weight)?;
                 linear.bias = None;
                 linear
             },
@@ -1059,7 +1185,7 @@ impl T5Attention {
                 let out_features = k_weight.shape().dims()[0];
                 let mut linear =
                     Linear::new(in_features, out_features, false, device.cuda_device())?;
-                linear.weight = k_weight.clone();
+                linear.weight = to_bf16_tensor(k_weight)?;
                 linear.bias = None;
                 linear
             },
@@ -1068,7 +1194,7 @@ impl T5Attention {
                 let out_features = v_weight.shape().dims()[0];
                 let mut linear =
                     Linear::new(in_features, out_features, false, device.cuda_device())?;
-                linear.weight = v_weight.clone();
+                linear.weight = to_bf16_tensor(v_weight)?;
                 linear.bias = None;
                 linear
             },
@@ -1077,7 +1203,7 @@ impl T5Attention {
                 let out_features = o_weight.shape().dims()[0];
                 let mut linear =
                     Linear::new(in_features, out_features, false, device.cuda_device())?;
-                linear.weight = o_weight.clone();
+                linear.weight = to_bf16_tensor(o_weight)?;
                 linear.bias = None;
                 linear
             },
@@ -1097,19 +1223,33 @@ impl T5Attention {
             .forward(hidden_states)?
             .reshape(&[batch_size, seq_len, self.num_heads, self.d_kv])?
             .transpose_dims(1, 2)?;
+        let q = if q.dtype() != DType::BF16 { q.to_dtype(DType::BF16)? } else { q };
         let k = self
             .k
             .forward(hidden_states)?
             .reshape(&[batch_size, seq_len, self.num_heads, self.d_kv])?
             .transpose_dims(1, 2)?;
+        let k = if k.dtype() != DType::BF16 { k.to_dtype(DType::BF16)? } else { k };
         let v = self
             .v
             .forward(hidden_states)?
             .reshape(&[batch_size, seq_len, self.num_heads, self.d_kv])?
             .transpose_dims(1, 2)?;
+        let v = if v.dtype() != DType::BF16 { v.to_dtype(DType::BF16)? } else { v };
 
         // Compute attention scores
-        let scores = q.matmul(&k.transpose_dims(2, 3)?)?.mul_scalar(self.scale as f32)?;
+        let k_t = k.transpose_dims(2, 3)?;
+        let k_t = if k_t.dtype() != DType::BF16 { k_t.to_dtype(DType::BF16)? } else { k_t };
+        println!("DEBUG T5Attention matmul lhs {:?} rhs {:?}", q.dtype(), k_t.dtype());
+        
+        let b = q.shape().dims()[0];
+        let h = q.shape().dims()[1];
+        let s = q.shape().dims()[2];
+        let d = q.shape().dims()[3];
+        let q_3d = q.reshape(&[b * h, s, d])?;
+        let k_3d = k_t.reshape(&[b * h, d, s])?;
+        let scores_3d = q_3d.bmm(&k_3d)?;
+        let scores = scores_3d.reshape(&[b, h, s, s])?.mul_scalar(self.scale as f32)?;
 
         // Apply attention mask if provided
         let scores = if let Some(mask) = attention_mask {
@@ -1122,7 +1262,11 @@ impl T5Attention {
         let attn_weights = scores.softmax(-1)?;
 
         // Apply attention to values
-        let attn_output = attn_weights.matmul(&v)?.transpose_dims(1, 2)?.reshape(&[
+        // Apply attention to values
+        let attn_weights_3d = attn_weights.reshape(&[b * h, s, s])?;
+        let v_3d = v.reshape(&[b * h, s, d])?;
+        let attn_output_3d = attn_weights_3d.bmm(&v_3d)?;
+        let attn_output = attn_output_3d.reshape(&[b, h, s, d])?.transpose_dims(1, 2)?.reshape(&[
             batch_size,
             seq_len,
             self.num_heads * self.d_kv,
@@ -1142,14 +1286,11 @@ impl T5FeedForward {
         weights: &std::collections::HashMap<String, Tensor>,
         prefix: &str,
     ) -> Result<Self> {
-        let wi_weight = weights
-            .get(&format!("{}.layer.1.DenseReluDense.wi.weight", prefix))
-            .ok_or_else(|| {
-                flame_core::Error::InvalidOperation(format!(
-                    "{}.layer.1.DenseReluDense.wi.weight not found",
-                    prefix
-                ))
-            })?;
+        let wi_key = format!("{}.layer.1.DenseReluDense.wi.weight", prefix);
+        let wi_weight = weights.get(&wi_key);
+        let wi0_key = format!("{}.layer.1.DenseReluDense.wi_0.weight", prefix);
+        let wi1_key = format!("{}.layer.1.DenseReluDense.wi_1.weight", prefix);
+
         let wo_weight = weights
             .get(&format!("{}.layer.1.DenseReluDense.wo.weight", prefix))
             .ok_or_else(|| {
@@ -1160,31 +1301,76 @@ impl T5FeedForward {
             })?;
 
         // T5 feed forward layers typically don't have bias
+        let (wi_linear, wi_gate_linear) = if let Some(wi_weight) = wi_weight {
+            let in_features = wi_weight.shape().dims()[1];
+            let out_features = wi_weight.shape().dims()[0];
+            let mut linear = Linear::new(in_features, out_features, false, device.cuda_device())?;
+            linear.weight = to_bf16_tensor(wi_weight)?;
+            linear.bias = None;
+            (linear, None)
+        } else {
+            let wi1 = weights.get(&wi1_key).ok_or_else(|| {
+                flame_core::Error::InvalidOperation(format!(
+                    "DenseReluDense gating requires {}, but it was not found",
+                    wi1_key
+                ))
+            })?;
+            let wi0 = weights.get(&wi0_key).ok_or_else(|| {
+                flame_core::Error::InvalidOperation(format!(
+                    "DenseReluDense gating requires {}, but it was not found",
+                    wi0_key
+                ))
+            })?;
+            let mut linear_main = Linear::new(
+                wi1.shape().dims()[1],
+                wi1.shape().dims()[0],
+                false,
+                device.cuda_device(),
+            )?;
+            linear_main.weight = to_bf16_tensor(wi1)?;
+            linear_main.bias = None;
+
+            let mut linear_gate = Linear::new(
+                wi0.shape().dims()[1],
+                wi0.shape().dims()[0],
+                false,
+                device.cuda_device(),
+            )?;
+            linear_gate.weight = to_bf16_tensor(wi0)?;
+            linear_gate.bias = None;
+            (linear_main, Some(linear_gate))
+        };
+
+        let mut wo_linear = Linear::new(
+            wo_weight.shape().dims()[1],
+            wo_weight.shape().dims()[0],
+            false,
+            device.cuda_device(),
+        )?;
+        wo_linear.weight = to_bf16_tensor(wo_weight)?;
+        wo_linear.bias = None;
+
         Ok(Self {
-            wi: {
-                let in_features = wi_weight.shape().dims()[1];
-                let out_features = wi_weight.shape().dims()[0];
-                let mut linear =
-                    Linear::new(in_features, out_features, false, device.cuda_device())?;
-                linear.weight = wi_weight.clone();
-                linear.bias = None;
-                linear
-            },
-            wo: {
-                let in_features = wo_weight.shape().dims()[1];
-                let out_features = wo_weight.shape().dims()[0];
-                let mut linear =
-                    Linear::new(in_features, out_features, false, device.cuda_device())?;
-                linear.weight = wo_weight.clone();
-                linear.bias = None;
-                linear
-            },
+            wi: wi_linear,
+            wi_gate: wi_gate_linear,
+            wo: wo_linear,
+            activation: "relu".into(),
         })
     }
 
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
-        let hidden_gelu = self.wi.forward(hidden_states)?.relu()?;
-        self.wo.forward(&hidden_gelu)
+        let activated = if let Some(ref gate) = self.wi_gate {
+            let gate_out = gate.forward(hidden_states)?.relu()?;
+            let proj = self.wi.forward(hidden_states)?;
+            gate_out.mul(&proj)?
+        } else {
+            let proj = self.wi.forward(hidden_states)?;
+            match self.activation.as_str() {
+                "relu" => proj.relu()?,
+                _ => proj.relu()?,
+            }
+        };
+        self.wo.forward(&activated)
     }
 }
 

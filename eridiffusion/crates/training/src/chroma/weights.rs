@@ -1,12 +1,16 @@
-use std::sync::Arc;
-use flame_core::{Device as FlameDevice, Tensor};
-use eridiffusion_common_weights::strict_loader::{StrictMmapLoader, tensor_from_bytes};
-use crate::streaming::{DeviceWeights, WeightProvider, KeyMap, KeyMapOwned};
-use std::collections::HashMap;
+use crate::streaming::{DeviceWeights, KeyMap, KeyMapOwned, WeightProvider};
 use anyhow::anyhow;
+use eridiffusion_common_weights::strict_loader::{tensor_from_bytes, StrictMmapLoader};
+use flame_core::{Device as FlameDevice, Tensor};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Copy, Clone, Debug)]
-enum QkvSlice { Q, K, V }
+enum QkvSlice {
+    Q,
+    K,
+    V,
+}
 
 /// Map logical q/k/v keys to the physical fused qkv key.
 fn resolve_qkv_key(key: &str) -> Option<(String, QkvSlice)> {
@@ -77,7 +81,8 @@ impl<K: KeyMap + Send + Sync + 'static> MmapWeightProvider<K> {
 
 impl<K: KeyMap + KeyMapOwned + Send + Sync + 'static> WeightProvider for MmapWeightProvider<K> {
     fn load_block_to_gpu(&self, i: usize) -> anyhow::Result<DeviceWeights> {
-        let weight_logs: bool = std::env::var("WEIGHT_LOGS").ok().map(|v| v != "0").unwrap_or(false);
+        let weight_logs: bool =
+            std::env::var("WEIGHT_LOGS").ok().map(|v| v != "0").unwrap_or(false);
         // Cache fused qkv tensor per physical key so we only load once.
         let mut qkv_cache: HashMap<String, (Tensor, Tensor, Tensor)> = HashMap::new();
         let mut out: Vec<Tensor> = Vec::new();
@@ -87,10 +92,12 @@ impl<K: KeyMap + KeyMapOwned + Send + Sync + 'static> WeightProvider for MmapWei
                     trip.clone()
                 } else {
                     let ti = self.ld.info(&phys).map_err(anyhow::Error::from)?;
-                    let b  = self.ld.bytes(&phys).map_err(anyhow::Error::from)?;
-                    let fused0 = tensor_from_bytes(self.dev.clone(), &ti, b).map_err(anyhow::Error::from)?;
+                    let b = self.ld.bytes(&phys).map_err(anyhow::Error::from)?;
+                    let fused0 =
+                        tensor_from_bytes(self.dev.clone(), &ti, b).map_err(anyhow::Error::from)?;
                     // Ensure base weights are not tracked by autograd
-                    let fused = fused0.requires_grad_(false).detach().map_err(anyhow::Error::from)?;
+                    let fused =
+                        fused0.requires_grad_(false).detach().map_err(anyhow::Error::from)?;
                     let split = split_qkv(&fused)?;
                     if weight_logs || i == 0 {
                         println!(
@@ -105,17 +112,29 @@ impl<K: KeyMap + KeyMapOwned + Send + Sync + 'static> WeightProvider for MmapWei
                     qkv_cache.insert(phys.clone(), split.clone());
                     split
                 };
-                let t_raw = match which { QkvSlice::Q => q, QkvSlice::K => k, QkvSlice::V => v };
+                let t_raw = match which {
+                    QkvSlice::Q => q,
+                    QkvSlice::K => k,
+                    QkvSlice::V => v,
+                };
                 // Detach slices too (views inherit detach state, but make explicit)
                 let t = t_raw.requires_grad_(false).detach().map_err(anyhow::Error::from)?;
-                if (weight_logs || i == 0) && matches!(which, QkvSlice::Q | QkvSlice::K | QkvSlice::V) {
-                    println!("[weights] key={} (slice {:?}) shape={:?}", key, which, t.shape().dims().to_vec());
+                if (weight_logs || i == 0)
+                    && matches!(which, QkvSlice::Q | QkvSlice::K | QkvSlice::V)
+                {
+                    println!(
+                        "[weights] key={} (slice {:?}) shape={:?}",
+                        key,
+                        which,
+                        t.shape().dims().to_vec()
+                    );
                 }
                 out.push(t);
             } else {
                 let ti = self.ld.info(&key).map_err(anyhow::Error::from)?;
-                let b  = self.ld.bytes(&key).map_err(anyhow::Error::from)?;
-                let t0 = tensor_from_bytes(self.dev.clone(), &ti, b).map_err(anyhow::Error::from)?;
+                let b = self.ld.bytes(&key).map_err(anyhow::Error::from)?;
+                let t0 =
+                    tensor_from_bytes(self.dev.clone(), &ti, b).map_err(anyhow::Error::from)?;
                 let t = t0.requires_grad_(false).detach().map_err(anyhow::Error::from)?;
                 if weight_logs || i == 0 {
                     println!("[weights] key={} shape={:?}", key, t.shape().dims().to_vec());
@@ -125,7 +144,13 @@ impl<K: KeyMap + KeyMapOwned + Send + Sync + 'static> WeightProvider for MmapWei
         }
         Ok(DeviceWeights { tensors: out })
     }
-    fn load_head_to_gpu(&self) -> anyhow::Result<DeviceWeights> { Ok(DeviceWeights { tensors: vec![] }) }
-    fn prefetch_block(&self, _block_id: usize) -> anyhow::Result<()> { Ok(()) }
-    fn release_block(&self, _block_id: isize) -> anyhow::Result<()> { Ok(()) }
+    fn load_head_to_gpu(&self) -> anyhow::Result<DeviceWeights> {
+        Ok(DeviceWeights { tensors: vec![] })
+    }
+    fn prefetch_block(&self, _block_id: usize) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn release_block(&self, _block_id: isize) -> anyhow::Result<()> {
+        Ok(())
+    }
 }

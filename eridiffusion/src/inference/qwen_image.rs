@@ -31,10 +31,7 @@ impl QwenImageModel {
     pub fn from_safetensors(path: &Path, device: Device) -> Result<Self> {
         // Use lazy mmap loader to avoid loading entire file eagerly
         let file = std::fs::File::open(path).map_err(|e| {
-            flame_core::Error::InvalidOperation(format!(
-                "Failed to open Qwen Image model: {}",
-                e
-            ))
+            flame_core::Error::InvalidOperation(format!("Failed to open Qwen Image model: {}", e))
         })?;
         let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| {
             flame_core::Error::InvalidOperation(format!("Failed to mmap file: {}", e))

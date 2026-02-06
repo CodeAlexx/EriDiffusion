@@ -1,9 +1,11 @@
 //! Complete SD3.5 training pipeline with LoRA and full fine-tuning support
 
 use crate::inference::sd35::{SD35Config as InferenceConfig, SD35Inference};
+use crate::inference::DiffusionInference;
+use crate::loaders::weight_loader::WeightLoader;
 use crate::models::{
-    mmdit_blocks::{MMDiT, MMDiTConfig},
-    unified_vae::{VAEConfig, VAE as AutoencoderKL},
+    mmdit_blocks::{ArenaScratch, MMDiT, MMDiTConfig, QkNormKind},
+    vae_complete::{VAEConfig, AutoEncoderKL as AutoencoderKL},
 };
 use crate::trainers::text_encoders::TextEncoders;
 use crate::trainers::{
@@ -21,15 +23,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 // Registry streaming (optional)
+use crate::trainers::adapters_util;
 use eridiffusion_common_weights::strict_loader::StrictMmapLoader;
+use eridiffusion_core::Device as CoreDevice;
 use eridiffusion_training::chroma::weights::MmapWeightProvider as Sd35MmapProvider;
 use eridiffusion_training::sd35::keymap::Sd35KeyMap;
 use eridiffusion_training::sd35::registry::LayerRegistry as Sd35Registry;
 use eridiffusion_training::streaming::{KeyMap as _KeyMap, WeightProvider as _WeightProvider};
-use crate::trainers::adapters_util;
 use eridiffusion_training::telemetry::TelemetryCsv;
 use eridiffusion_training::tread::TreadMetrics;
-use eridiffusion_core::Device as CoreDevice;
 
 const SD35_LYCO_ALLOW: &[&str] = &[
     "joint_blocks.*.x_block.attn.qkv",
@@ -275,15 +277,14 @@ impl SD35Trainer {
             std::env::var("USE_REGISTRY_STREAMING").ok().map(|v| v == "1").unwrap_or(false)
         };
         let (sd35_registry, sd35_provider) = if use_registry_streaming {
-            let loader = StrictMmapLoader::open(std::path::Path::new(&config.model_path)).map_err(
-                |e| {
+            let loader =
+                StrictMmapLoader::open(std::path::Path::new(&config.model_path)).map_err(|e| {
                     Error::InvalidOperation(format!(
                         "open sd35 shard {}: {}",
                         config.model_path.display(),
                         e
                     ))
-                },
-            )?;
+                })?;
             let ld = Arc::new(loader);
             let provider: Sd35MmapProvider<Sd35KeyMap> =
                 Sd35MmapProvider::new(ld, Device::from(device.clone()));
@@ -534,8 +535,8 @@ impl SD35Trainer {
         let prompts = batch.prompts;
 
         // Encode images to latents
-        let (mean, _logvar) = self.vae.encode(&images)?;
-        let latents = mean;
+        let dist = self.vae.encode(&images)?;
+        let latents = dist.mode()?;
 
         // Sample noise
         let noise = Tensor::randn(latents.shape().clone(), 0.0, 1.0, latents.device().clone())?;
@@ -662,7 +663,8 @@ impl SD35Trainer {
                         let _ = wp.release_block(i as isize);
                     }
                 } else {
-                    let empty_loras: Vec<eridiffusion_training::chroma::lora::LoRALinear> = Vec::new();
+                    let empty_loras: Vec<eridiffusion_training::chroma::lora::LoRALinear> =
+                        Vec::new();
                     let cond = eridiffusion_training::sd35::registry::Cond {
                         text_hidden: clip_l.clone(),
                         sigma: timesteps.clone(),
@@ -682,23 +684,30 @@ impl SD35Trainer {
                 x_seq.transpose_dims(1, 2)?.reshape(&[b, c, h, w])?
             } else {
                 // Fallback to legacy path if registry pieces missing
-                let positions = Tensor::zeros(
-                    Shape::from_dims(&[noisy_latents.shape().dims()[0], 2]),
-                    noisy_latents.device().clone(),
-                )?;
-                let (pred, _) =
-                    self.mmdit.forward(&noisy_latents, &context, &timesteps, &positions)?;
-                pred
+                let scratch = ArenaScratch::from_tensor(&context);
+                let mut arena_ctx = None;
+                let context_ref =
+                    if context.dtype() == DType::BF16 && context.storage_dtype() == DType::BF16 {
+                        arena_ctx = Some(scratch.copy_from(&context)?);
+                        arena_ctx.as_ref().unwrap()
+                    } else {
+                        &context
+                    };
+                self.mmdit.forward(&noisy_latents, &timesteps, context_ref, None)?
             }
         } else {
             // MMDiT forward needs 4 arguments: x, context, conditioning, positions
             // Create dummy positions for now
-            let positions = Tensor::zeros(
-                Shape::from_dims(&[noisy_latents.shape().dims()[0], 2]),
-                noisy_latents.device().clone(),
-            )?;
-            let (pred, _) = self.mmdit.forward(&noisy_latents, &context, &timesteps, &positions)?;
-            pred
+            let scratch = ArenaScratch::from_tensor(&context);
+            let mut arena_ctx = None;
+            let context_ref =
+                if context.dtype() == DType::BF16 && context.storage_dtype() == DType::BF16 {
+                    arena_ctx = Some(scratch.copy_from(&context)?);
+                    arena_ctx.as_ref().unwrap()
+                } else {
+                    &context
+                };
+            self.mmdit.forward(&noisy_latents, &timesteps, context_ref, None)?
         };
 
         // Apply LoRA if enabled
@@ -1170,24 +1179,39 @@ struct TrainingState {
 // Helper functions
 fn load_vae(path: &Path, device: Arc<CudaDevice>) -> flame_core::Result<AutoencoderKL> {
     // TODO: Implement VAE loading from safetensors
-    let config = VAEConfig::sd3_vae(); // SD3.5 uses 16-channel VAE
-    AutoencoderKL::new(config, device)
+    let config = VAEConfig::sd3(); // SD3.5 uses 16-channel VAE
+    let device_wrapped = Device::from(device.clone());
+    let wl = crate::loaders::weight_loader::WeightLoader::from_safetensors(path.to_str().unwrap_or(""), device_wrapped.clone())?;
+    AutoencoderKL::new(config, &device_wrapped, wl.weights)
 }
 
 fn load_mmdit(path: &Path, device: Arc<CudaDevice>) -> flame_core::Result<MMDiT> {
-    // TODO: Implement MMDiT loading from safetensors
-    let config = MMDiTConfig {
-        hidden_size: 1536, // SD3.5 Large
-        num_heads: 24,
-        depth: 38,
-        mlp_ratio: 4.0,
-        qkv_bias: false,
-        qk_norm: true,
-        pos_embed_max_size: 192,
-    };
-    let cond_dim = 4096; // T5-XXL hidden size for SD3.5
-    let device = Device::from(device.clone());
-    MMDiT::new(config, cond_dim, &device)
+    let device_wrapped = Device::from(device.clone());
+    let loader =
+        WeightLoader::from_safetensors_with_dtype(path, device_wrapped.clone(), DType::BF16)?;
+
+    let mut config = MMDiTConfig::default();
+    let meta = loader.infer_mmdit_metadata();
+    if let Some(hidden) = meta.hidden_size {
+        config.hidden_size = hidden;
+    }
+    if let Some(heads) = meta.num_heads {
+        config.num_heads = heads;
+    }
+    if let Some(depth) = meta.depth {
+        config.depth = depth;
+    }
+    if let Some(ratio) = meta.mlp_ratio {
+        config.mlp_ratio = ratio;
+    }
+    config.qk_norm = meta.qk_norm;
+    config.x_self_attn_layers = meta.x_self_attn_layers;
+    config.context_dim = 4096;
+    config.pooled_dim = Some(2048);
+
+    let mut mmdit = MMDiT::new(config, &device_wrapped)?;
+    crate::loaders::load_mmdit_weights(&mut mmdit, &loader)?;
+    Ok(mmdit)
 }
 
 fn load_text_encoders(

@@ -71,7 +71,7 @@ impl AttentionBlock {
         let weight = prefixed_weights.tensor("norm.weight", &[channels])?;
         let bias = prefixed_weights.tensor("norm.bias", &[channels])?;
         // Create GroupNorm with constructor
-        let norm = GroupNorm::new(32, channels, 1e-6, true, weight.device().clone())?;
+        let norm = GroupNorm::new(32, channels, 1e-6, true, DType::F32, weight.device().clone())?;
         // TODO: Load weights after creating GroupNorm
 
         // TODO: Load weights after creating Linear
@@ -90,7 +90,7 @@ impl AttentionBlock {
     }
 
     pub fn new(channels: usize, num_heads: usize, device: &Device) -> Result<Self> {
-        let norm = GroupNorm::new(32, channels, 1e-6, true, device.cuda_device().clone())?;
+        let norm = GroupNorm::new(32, channels, 1e-6, true, DType::F32, device.cuda_device().clone())?;
 
         // Initialize linear layers
         let q = Linear::new(channels, channels, true, device.cuda_device())?;
@@ -363,7 +363,7 @@ impl SpatialTransformer {
     ) -> Result<Self> {
         let inner_dim = num_attention_heads * attention_head_dim;
 
-        let norm = GroupNorm::new(32, in_channels, 1e-6, true, device.cuda_device().clone())?;
+        let norm = GroupNorm::new(32, in_channels, 1e-6, true, DType::F32, device.cuda_device().clone())?;
         let proj_in = Linear::new(in_channels, inner_dim, true, device.cuda_device())?;
 
         let mut transformer_blocks = Vec::new();

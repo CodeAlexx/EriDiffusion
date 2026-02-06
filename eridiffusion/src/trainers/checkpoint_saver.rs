@@ -105,9 +105,8 @@ impl CheckpointSaver {
         };
 
         // Save metadata
-        let metadata_json = serde_json::to_string_pretty(&metadata).map_err(|e| {
-            Error::InvalidOperation(format!("Failed to serialize metadata: {}", e))
-        })?;
+        let metadata_json = serde_json::to_string_pretty(&metadata)
+            .map_err(|e| Error::InvalidOperation(format!("Failed to serialize metadata: {}", e)))?;
         fs::write(checkpoint_path.join("metadata.json"), metadata_json)
             .map_err(|e| Error::Io(format!("Failed to write metadata: {}", e)))?;
 
@@ -209,9 +208,8 @@ impl CheckpointSaver {
         let metadata_path = checkpoint_path.join("metadata.json");
         let metadata_json = fs::read_to_string(&metadata_path)
             .map_err(|e| Error::Io(format!("Failed to read metadata: {}", e)))?;
-        let metadata: CheckpointMetadata = serde_json::from_str(&metadata_json).map_err(|e| {
-            Error::InvalidOperation(format!("Failed to parse metadata: {}", e))
-        })?;
+        let metadata: CheckpointMetadata = serde_json::from_str(&metadata_json)
+            .map_err(|e| Error::InvalidOperation(format!("Failed to parse metadata: {}", e)))?;
 
         // Load model weights
         let model_path = checkpoint_path.join("model.safetensors");
@@ -235,8 +233,8 @@ impl CheckpointSaver {
 
     /// Load tensors from safetensors format
     fn load_safetensors(&self, path: &Path) -> Result<HashMap<String, Tensor>> {
-        let data = fs::read(path)
-            .map_err(|e| Error::Io(format!("Failed to read safetensors: {}", e)))?;
+        let data =
+            fs::read(path).map_err(|e| Error::Io(format!("Failed to read safetensors: {}", e)))?;
 
         let tensors = SafeTensors::deserialize(&data)
             .map_err(|e| Error::InvalidOperation(format!("Failed to deserialize: {}", e)))?;

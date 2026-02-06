@@ -2,29 +2,30 @@ use eridiffusion_core::{Device, Error, Result};
 use flame_core::{DType, Tensor, TensorGradExt};
 
 use crate::optimizer::Optimizer;
+use crate::tensor_utils::sum_all_bf16;
 
-/// Per-parameter FP32 master gradient buffer
+/// Per-parameter master gradient buffer (matches parameter dtype)
 #[derive(Default)]
 struct GradSlot {
-    master_fp32: Option<Tensor>,
+    master: Option<Tensor>,
 }
 
 impl GradSlot {
     fn accumulate(&mut self, grad_in: &Tensor, param: &Tensor) -> Result<()> {
-        // Ensure FP32 master on same device and shape as param
-        if self.master_fp32.is_none() {
+        // Ensure master buffer on same device/shape/dtype as param
+        if self.master.is_none() {
             let zero =
-                Tensor::zeros_dtype(param.shape().clone(), DType::F32, param.device().clone())?;
-            self.master_fp32 = Some(zero);
+                Tensor::zeros_dtype(param.shape().clone(), param.dtype(), param.device().clone())?;
+            self.master = Some(zero);
         }
-        let g = if grad_in.dtype() != DType::F32 {
-            grad_in.to_dtype(DType::F32)?
+        let g = if grad_in.dtype() != param.dtype() {
+            grad_in.to_dtype(param.dtype())?
         } else {
             grad_in.clone()
         };
         // Accumulate
-        let sum = self.master_fp32.as_ref().unwrap().add(&g)?;
-        self.master_fp32 = Some(sum);
+        let sum = self.master.as_ref().unwrap().add(&g)?;
+        self.master = Some(sum);
         Ok(())
     }
 
@@ -32,24 +33,25 @@ impl GradSlot {
         &mut self,
         shape: &flame_core::Shape,
         device: &std::sync::Arc<flame_core::CudaDevice>,
+        dtype: DType,
     ) -> Result<Tensor> {
-        if let Some(t) = self.master_fp32.take() {
+        if let Some(t) = self.master.take() {
             Ok(t)
         } else {
-            Tensor::zeros_dtype(shape.clone(), DType::F32, device.clone())
+            Tensor::zeros_dtype(shape.clone(), dtype, device.clone())
                 .map_err(eridiffusion_core::Error::from)
         }
     }
 
     fn zero_(&mut self) -> Result<()> {
-        if let Some(m) = &mut self.master_fp32 {
+        if let Some(m) = &mut self.master {
             *m = m.affine(0.0f32, 0.0f32)?;
         }
         Ok(())
     }
 
     fn reset(&mut self) {
-        self.master_fp32 = None;
+        self.master = None;
     }
 }
 
@@ -137,7 +139,7 @@ impl GradientAccumulator {
     pub fn get_gradients(&mut self, params: &[&Tensor]) -> Result<Vec<Tensor>> {
         let mut out = Vec::with_capacity(params.len());
         for (i, p) in params.iter().enumerate() {
-            let g = self.accumulated_grads[i].take(p.shape(), p.device())?;
+            let g = self.accumulated_grads[i].take(p.shape(), p.device(), p.dtype())?;
             out.push(g);
         }
         Ok(out)
@@ -203,7 +205,13 @@ impl GradientAccumulator {
     fn clip_vec_grads(&self, grads: &mut [Tensor], max_norm: f32) -> Result<f32> {
         let mut total_sq = 0.0f32;
         for g in grads.iter() {
-            total_sq += g.square()?.sum()?.item()?;
+            let sq = g.square()?;
+            let sum = if sq.dtype() == DType::BF16 {
+                sum_all_bf16(&sq)?
+            } else {
+                sq.sum()?
+            };
+            total_sq += sum.item()?;
         }
         let total = total_sq.sqrt();
         if total.is_finite() && total > max_norm {

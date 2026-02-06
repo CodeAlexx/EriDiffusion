@@ -443,9 +443,8 @@ impl SDXLSampler {
         let image_data: Vec<u8> = image_data.iter().map(|&x| x.clamp(0.0, 255.0) as u8).collect();
 
         // Save image
-        let img = RgbImage::from_raw(w as u32, h as u32, image_data).ok_or_else(|| {
-            flame_core::Error::InvalidOperation("Failed to create image".into())
-        })?;
+        let img = RgbImage::from_raw(w as u32, h as u32, image_data)
+            .ok_or_else(|| flame_core::Error::InvalidOperation("Failed to create image".into()))?;
         img.save(path).map_err(|e| flame_core::Error::Io(e.to_string()))?;
 
         info!("Saved SDXL sample to: {}", path.display());

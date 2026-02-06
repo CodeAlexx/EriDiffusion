@@ -78,10 +78,7 @@ impl StreamingTextEncoders {
     ) -> flame_core::Result<()> {
         // Load CLIP tokenizer
         self.tokenizer_clip = Some(Tokenizer::from_file(clip_tokenizer_path).map_err(|e| {
-            flame_core::Error::InvalidOperation(format!(
-                "Failed to load CLIP tokenizer: {}",
-                e
-            ))
+            flame_core::Error::InvalidOperation(format!("Failed to load CLIP tokenizer: {}", e))
         })?);
 
         // Load T5 tokenizer
@@ -138,13 +135,14 @@ impl StreamingTextEncoders {
 
         // Encode with T5 if available
         let text_embeds_t5 = if self.t5_streaming.is_some() {
-            let tokenizer_t5 = self.tokenizer_t5.as_ref().ok_or_else(|| {
-                Error::InvalidOperation("T5 tokenizer not loaded".into())
-            })?;
+            let tokenizer_t5 = self
+                .tokenizer_t5
+                .as_ref()
+                .ok_or_else(|| Error::InvalidOperation("T5 tokenizer not loaded".into()))?;
 
-            let mut t5_encoding = tokenizer_t5.encode(prompt, false).map_err(|e| {
-                Error::InvalidOperation(format!("T5 tokenization failed: {}", e))
-            })?;
+            let mut t5_encoding = tokenizer_t5
+                .encode(prompt, false)
+                .map_err(|e| Error::InvalidOperation(format!("T5 tokenization failed: {}", e)))?;
 
             // Pad or truncate
             let t5_ids = if t5_encoding.get_ids().len() > t5_max_length {
@@ -166,9 +164,7 @@ impl StreamingTextEncoders {
                 // Process on GPU with layer streaming and cuDNN optimization
                 t5_streaming.encode_batch(&t5_input)?
             } else {
-                return Err(Error::InvalidOperation(
-                    "T5 streaming encoder not loaded".to_string(),
-                ));
+                return Err(Error::InvalidOperation("T5 streaming encoder not loaded".to_string()));
             };
 
             Some(t5_embeds)

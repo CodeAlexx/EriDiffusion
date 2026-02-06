@@ -69,7 +69,7 @@ impl OptimizedTextEncoders {
         // Use the CLIP-L config
         let config = crate::models::text_encoder::CLIPConfig::clip_l();
 
-        self.clip_l = Some(clip::ClipTextTransformer::new(config, &self.device, wl.weights)?);
+        self.clip_l = Some(clip::ClipTextTransformer::new(config, self.device.clone(), wl.weights)?);
         println!("✅ CLIP-L loaded in {:.2}s", start.elapsed().as_secs_f32());
         Ok(())
     }
@@ -88,22 +88,10 @@ impl OptimizedTextEncoders {
             WeightLoader::from_safetensors_streaming(model_path, self.device.clone(), DType::F16)?;
 
         // Create T5-XXL config
-        let config = T5Config {
-            vocab_size: 32128,
-            d_model: 4096,
-            d_kv: 64, // Add this field
-            d_ff: 10240,
-            num_layers: 24,
-            num_heads: 64,
-            relative_attention_num_buckets: 32,
-            relative_attention_max_distance: 128,
-            dropout_rate: 0.1,
-            layer_norm_epsilon: 1e-6,
-            feed_forward_proj_gated: true, // Add this field
-        };
+        let config = T5Config::t5_xxl();
 
         // Use T5EncoderModel from t5.rs, not T5Encoder
-        self.t5 = Some(T5EncoderModel::new(&wl.weights, &config, self.device.clone())?);
+        self.t5 = Some(T5EncoderModel::new(config, self.device.clone(), &wl)?);
         self.t5_loaded = true;
 
         println!("✅ T5-XXL loaded in {:.2}s", start.elapsed().as_secs_f32());
@@ -121,9 +109,10 @@ impl OptimizedTextEncoders {
         })?);
 
         // Load T5 tokenizer
-        self.tokenizer_t5 = Some(Tokenizer::from_file(t5_tokenizer_path).map_err(|e| {
-            Error::InvalidOperation(format!("Failed to load T5 tokenizer: {}", e))
-        })?);
+        self.tokenizer_t5 =
+            Some(Tokenizer::from_file(t5_tokenizer_path).map_err(|e| {
+                Error::InvalidOperation(format!("Failed to load T5 tokenizer: {}", e))
+            })?);
 
         println!("Tokenizers loaded successfully");
         Ok(())
@@ -162,7 +151,8 @@ impl OptimizedTextEncoders {
         // Encode with T5 (slower)
         let t5_start = std::time::Instant::now();
         let t5_model = self.t5.as_ref().unwrap();
-        let t5_embed = t5_model.forward(&t5_tokens)?; // T5EncoderModel returns Tensor directly
+        let t5_output = t5_model.forward(&t5_tokens)?;
+        let t5_embed = t5_output.last_hidden_state; // T5Encoder returns T5Output
         println!("    T5-XXL encoding: {:.3}s", t5_start.elapsed().as_secs_f32());
 
         println!("  ✅ Total encoding time: {:.3}s", encode_start.elapsed().as_secs_f32());

@@ -10,7 +10,7 @@ vae_debug_stats = []
 [dependencies]
 anyhow = "1.0"
 image = { version = "0.24", default-features = false, features = ["png"] }
-flame-core = {path = "../../../../flame/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels"]}
+flame-core = {path = "/home/alex/EriDiffusion/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels"]}
 rand = "0.8"
 rand_distr = "0.4"
 eridiffusion-common-vae = { path = "../vae" }

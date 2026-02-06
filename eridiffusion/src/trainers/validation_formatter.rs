@@ -124,10 +124,7 @@ impl ValidationFormatter {
             if improved {
                 if self.color_output {
                     stdout.set_color(ColorSpec::new().set_fg(Some(Color::Green))).map_err(|e| {
-                        flame_core::Error::InvalidOperation(format!(
-                            "Failed to set color: {}",
-                            e
-                        ))
+                        flame_core::Error::InvalidOperation(format!("Failed to set color: {}", e))
                     })?;
                 }
                 println!(

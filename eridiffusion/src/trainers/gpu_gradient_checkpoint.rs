@@ -1,8 +1,10 @@
 use anyhow::Context;
 use flame_core::device::Device;
+use flame_core::gradient_checkpointing::{CheckpointPolicy, CheckpointStats, CHECKPOINT_MANAGER};
 use flame_core::optimizers::{Adam, SGD};
 use flame_core::{DType, Result, Shape, Tensor};
-use std::{collections::HashMap, sync::Arc};
+use log::{info, warn};
+use std::{collections::HashMap, env};
 
 // GPU-only gradient checkpointing - NO CPU FALLBACKS!
 // Uses our CUDA kernels for efficient GPU memory management
@@ -21,49 +23,37 @@ use std::{collections::HashMap, sync::Arc};
 /// GPU-only gradient checkpoint manager
 pub struct GPUGradientCheckpoint {
     enabled: bool,
-    #[cfg(feature = "cuda")]
-    checkpoint_manager: Option<*mut std::ffi::c_void>,
     checkpoint_interval: usize,
     max_layers: usize,
+    policy: CheckpointPolicy,
 }
 
 unsafe impl Send for GPUGradientCheckpoint {}
 unsafe impl Sync for GPUGradientCheckpoint {}
 
 impl GPUGradientCheckpoint {
-    pub fn new(enabled: bool) -> Self {
+    pub fn new(enabled: bool, device: &Device) -> Self {
         if enabled & !cfg!(feature = "cuda") {
             panic!("GPU gradient checkpointing requires CUDA feature! No CPU fallback!");
         }
 
-        let checkpoint_interval = 4; // Checkpoint every 4 layers
-        let max_layers = 64; // SDXL has ~60 transformer blocks
+        let checkpoint_interval =
+            parse_env_usize("GRADIENT_CHECKPOINT_INTERVAL", /*layers*/ 4).max(1);
+        let max_layers = parse_env_usize("GRADIENT_CHECKPOINT_MAX_LAYERS", 64).max(1);
+        let policy = parse_policy_from_env();
 
-        #[cfg(feature = "cuda")]
-        let checkpoint_manager = None; // TODO: Re-enable when cuda_backend is implemented
-                                       // let checkpoint_manager = if enabled {
-                                       //     unsafe {
-                                       //         let manager = create_checkpoint_manager(max_layers as i32, checkpoint_interval as i32);
-                                       //
-                                       //         // Pre-allocate checkpoint buffers for typical SDXL sizes
-                                       //         let typical_activation_size = 4 * 1024 * 1024 * 16; // 4MB * 16 channels
-                                       //         for i in 0..(max_layers / checkpoint_interval) {
-                                       //             allocate_checkpoint_buffer(manager, i as i32, typical_activation_size);
-                                       //         }
-                                       //
-                                       //         Some(manager)
-                                       //     }
-                                       // } else {
-                                       //     None
-                                       // };
-
-        Self {
-            enabled,
-            #[cfg(feature = "cuda")]
-            checkpoint_manager,
-            checkpoint_interval,
-            max_layers,
+        if enabled {
+            Self::install_manager(device, policy);
+            info!(
+                "Gradient checkpointing enabled (policy={:?}, interval={} layers, max_layers={}, device=cuda:{})",
+                policy,
+                checkpoint_interval,
+                max_layers,
+                device.ordinal()
+            );
         }
+
+        Self { enabled, checkpoint_interval, max_layers, policy }
     }
 
     /// Check if checkpointing is enabled
@@ -78,7 +68,7 @@ impl GPUGradientCheckpoint {
         activation: &Tensor,
         layer_idx: usize,
     ) -> flame_core::Result<Tensor> {
-        if !self.enabled || self.checkpoint_manager.is_none() {
+        if !self.enabled {
             return Ok(activation.clone());
         }
 
@@ -87,55 +77,46 @@ impl GPUGradientCheckpoint {
             return Ok(activation.clone());
         }
 
-        let device = Device::from(activation.device().clone());
-        if !true {
-            panic!("GPU gradient checkpointing requires CUDA tensors! No CPU fallback!");
-        }
-
-        // TODO: Re-enable when storage() method becomes public or alternative API is available
-        // unsafe {
-        //     if let Some(manager) = self.checkpoint_manager {
-        //         // Get raw pointer to tensor data
-        //         let storage = activation.storage();
-        //         match &*storage {
-        //             Storage::Cuda(cuda_storage) => {
-        //                 let slice = cuda_storage.as_cuda_slice::<f32>()?;
-        //                 let ptr = slice.as_ptr();
-        //                 let size = activation.shape().dims().iter().product::<usize>();
-        //
-        //                 // TODO: Re-enable when cuda_backend is implemented
-        //                 // save_activation_checkpoint(
-        //                 //     manager,
-        //                 //     ptr as *const f32,
-        //                 //     layer_idx as i32,
-        //                 //     size,
-        //                 // );
-        //             }
-        //             _ => panic!("GPU gradient checkpointing requires CUDA tensors!"),
-        //         }
-        //     }
-        // }
-
         Ok(activation.clone())
     }
 
-    /// Get checkpoint manager for direct CUDA kernel integration
-    #[cfg(feature = "cuda")]
-    pub fn get_manager(&self) -> Option<*mut std::ffi::c_void> {
-        self.checkpoint_manager
+    fn install_manager(device: &Device, policy: CheckpointPolicy) {
+        match CHECKPOINT_MANAGER.lock() {
+            Ok(mut manager) => {
+                manager.set_device(device.cuda_device().clone());
+                manager.set_policy(policy);
+            }
+            Err(err) => {
+                warn!(
+                    "Failed to acquire gradient checkpoint manager ({:?}); checkpointing disabled",
+                    err
+                );
+            }
+        }
+    }
+
+    pub fn stats(&self) -> Option<CheckpointStats> {
+        if !self.enabled {
+            return None;
+        }
+        CHECKPOINT_MANAGER.lock().ok().map(|manager| manager.stats())
     }
 }
 
 impl Drop for GPUGradientCheckpoint {
     fn drop(&mut self) {
-        #[cfg(feature = "cuda")]
-        {
-            // TODO: Re-enable when cuda_backend is implemented
-            // unsafe {
-            //     if let Some(manager) = self.checkpoint_manager {
-            //         destroy_checkpoint_manager(manager);
-            //     }
-            // }
+        if !self.enabled {
+            return;
+        }
+        if let Ok(manager) = CHECKPOINT_MANAGER.lock() {
+            let stats = manager.stats();
+            info!(
+                "Gradient checkpointing disabled (policy={:?}, tensors={}, recompute_count={}, approx_saved={} MB)",
+                self.policy,
+                stats.checkpointed_tensors,
+                stats.recompute_count,
+                stats.memory_saved / (1024 * 1024)
+            );
         }
     }
 }
@@ -166,7 +147,7 @@ pub fn forward_sdxl_gpu_checkpoint(
     // We'll use ordinal 0 as a default since we can't get the ordinal from Arc<CudaDevice>
     let device = flame_core::device::Device::cuda(0)?;
     let weight_loader =
-        crate::loaders::weight_loader::WeightLoader { weights: cloned_weights, device };
+        crate::loaders::weight_loader::WeightLoader::from_tensor_map(cloned_weights, device);
     crate::trainers::sdxl_forward_sd_format_flash::forward_sdxl_sd_format_flash(
         x,
         timestep,
@@ -175,4 +156,40 @@ pub fn forward_sdxl_gpu_checkpoint(
         lora_collection,
         true, // use_flash_attention
     )
+}
+
+fn parse_env_usize(key: &str, default: usize) -> usize {
+    env::var(key).ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(default)
+}
+
+fn parse_policy_from_env() -> CheckpointPolicy {
+    match env::var("GRADIENT_CHECKPOINT_POLICY")
+        .unwrap_or_else(|_| "recompute".to_string())
+        .to_lowercase()
+        .as_str()
+    {
+        "cpu" | "cpu_offload" | "cpu-offload" => CheckpointPolicy::CPUOffload,
+        "adaptive" => {
+            let threshold_mb =
+                parse_env_usize("GRADIENT_CHECKPOINT_MEMORY_THRESHOLD_MB", 8192).max(1);
+            let prefer_recompute = parse_env_bool("GRADIENT_CHECKPOINT_PREFER_RECOMPUTE", true);
+            CheckpointPolicy::Adaptive {
+                memory_threshold: threshold_mb * 1024 * 1024,
+                prefer_recompute,
+            }
+        }
+        other => {
+            if other != "recompute" {
+                warn!("Unknown GRADIENT_CHECKPOINT_POLICY='{}', falling back to recompute", other);
+            }
+            CheckpointPolicy::Recompute
+        }
+    }
+}
+
+fn parse_env_bool(key: &str, default: bool) -> bool {
+    env::var(key)
+        .ok()
+        .map(|value| matches!(value.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(default)
 }

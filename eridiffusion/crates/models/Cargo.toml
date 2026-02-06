@@ -13,7 +13,7 @@ wan22 = []
 
 [dependencies]
 anyhow = "1.0"
-flame-core = {path = "../../../flame/flame-core", default-features = false, features = ["bf16_u16", "cuda", "bf16_kernels"]}
+flame-core = {path = "/home/alex/EriDiffusion/flame-core", default-features = false, features = ["bf16_u16", "cuda", "bf16_kernels"]}
 safetensors = "0.4"
 adapters = { path = "../adapters" }
 eridiffusion-core = { path = "../core" }
@@ -25,3 +25,7 @@ eridiffusion-common-telemetry = { path = "../common/telemetry" }
 eridiffusion-common-vae = { path = "../common/vae" }
 bytemuck = "1.16"
 half = "2.4"
+
+[[test]]
+name = "adaln_no_panic"
+required-features = ["sdxl"]

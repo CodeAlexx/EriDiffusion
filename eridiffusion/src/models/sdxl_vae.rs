@@ -5,7 +5,7 @@ use flame_core::{DType, Result, Shape, Tensor};
 use std::collections::HashMap;
 
 // Import the VAE modules we need
-use crate::models::vae::{AutoEncoderKL, DiagonalGaussianDistribution, VAEConfig};
+use crate::models::vae_complete::{AutoEncoderKL, DiagonalGaussianDistribution, VAEConfig};
 
 // PrefixedWeightLoader is already imported from loaders module
 
@@ -16,16 +16,9 @@ pub struct SDXLVAE {
 
 impl SDXLVAE {
     pub fn new(wl: WeightLoader) -> Result<Self> {
-        let config = VAEConfig {
-            block_out_channels: vec![128, 256, 512, 512],
-            layers_per_block: 2,
-            latent_channels: 4,
-            norm_num_groups: 32,
-            use_quant_conv: true, // SDXL uses quantization convolutions
-            use_post_quant_conv: true,
-        };
+        let config = VAEConfig::sdxl();
 
-        let vae = AutoEncoderKL::new(config, wl.device, wl.weights)?;
+        let vae = AutoEncoderKL::new(config, &wl.device, wl.weights)?;
 
         Ok(Self { vae, scale_factor: 0.18215 })
     }
@@ -70,16 +63,9 @@ pub struct SD3VAE {
 
 impl SD3VAE {
     pub fn new(wl: WeightLoader) -> Result<Self> {
-        let config = VAEConfig {
-            block_out_channels: vec![128, 256, 512, 512],
-            layers_per_block: 2,
-            latent_channels: 16,
-            norm_num_groups: 32,
-            use_quant_conv: false, // SD3 does not use quantization convolutions
-            use_post_quant_conv: false,
-        };
+        let config = VAEConfig::sd3();
 
-        let vae = AutoEncoderKL::new(config, wl.device, wl.weights)?;
+        let vae = AutoEncoderKL::new(config, &wl.device, wl.weights)?;
 
         Ok(Self { vae, scale_factor: 0.18215 })
     }

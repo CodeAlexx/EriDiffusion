@@ -195,20 +195,14 @@ impl SDLoRAModule {
         let lora_a = tensors
             .get(&format!("{}.lora_down.weight", prefix))
             .ok_or_else(|| {
-                flame_core::Error::InvalidOperation(format!(
-                    "Missing {}.lora_down.weight",
-                    prefix
-                ))
+                flame_core::Error::InvalidOperation(format!("Missing {}.lora_down.weight", prefix))
             })?
             .to_dtype(dtype)?;
 
         let lora_b = tensors
             .get(&format!("{}.lora_up.weight", prefix))
             .ok_or_else(|| {
-                flame_core::Error::InvalidOperation(format!(
-                    "Missing {}.lora_up.weight",
-                    prefix
-                ))
+                flame_core::Error::InvalidOperation(format!("Missing {}.lora_up.weight", prefix))
             })?
             .to_dtype(dtype)?;
 

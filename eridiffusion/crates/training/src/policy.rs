@@ -2,7 +2,7 @@
 
 use eridiffusion_core::{DType, Device, Error, Result};
 use eridiffusion_models::devtensor::{shape1, shape2, uniform_on};
-use flame_core::Tensor;
+use flame_core::{bf16_factories, ops::reduce::sum_dim_keepdim_as, rng, Shape, Tensor};
 
 /// Error if not running on a CUDA device.
 pub fn assert_gpu_only(dev: &Device) -> Result<()> {
@@ -38,6 +38,18 @@ pub fn enforce_nhwc_latent(z: &Tensor) -> Result<Tensor> {
 
 /// Reduce mean in FP32 with keepdim=true across all elements (returns scalar [1]).
 pub fn reduce_mean_fp32_keepdim(x: &Tensor) -> Result<Tensor> {
+    if x.dtype() == DType::BF16 {
+        let numel = x.shape().elem_count();
+        if numel == 0 {
+            return Err(Error::InvalidInput(
+                "reduce_mean_fp32_keepdim: empty tensor".into(),
+            ));
+        }
+        let flat = x.reshape(&[1, 1, numel])?;
+        let sum = sum_dim_keepdim_as(&flat, 2, DType::BF16).map_err(Error::from)?;
+        return sum.div_scalar(numel as f32).map_err(Error::from);
+    }
+
     // Avoid dtype cast here to preserve requires_grad on the computation graph
     let sum = x.sum()?;
     let denom = (x.shape().elem_count() as f32).max(1.0);
@@ -76,11 +88,18 @@ pub fn sample_timesteps01(b: usize, dev: &Device) -> Result<Tensor> {
 
 /// Bounded sigma schedule: sigma in [sigma_min, sigma_max], monotone decreasing ~ exp(-t ln r)
 pub fn sigma_for_bounded(t01: &Tensor, sigma_min: f32, sigma_max: f32) -> Result<Tensor> {
-    let t = if t01.dtype() != DType::F32 { t01.to_dtype(DType::F32)? } else { t01.clone_result()? };
+    let t = t01.clone_result()?;
     let ratio = (sigma_max / sigma_min).max(1.0 + 1e-6f32);
-    let ln_r = Tensor::from_scalar(ratio.ln(), t.device().clone())?;
-    let exp_term = ln_r.mul(&t.neg()?)?.exp()?; // r^{-t}
+    let exp_term = t.neg()?.mul_scalar(ratio.ln())?.exp()?; // r^{-t}
     Ok(exp_term.mul_scalar(sigma_min)?)
+}
+
+/// Uniform timesteps in [0,1) as [B,1] tensor (BF16)
+pub fn sample_timesteps01_bf16(b: usize, dev: &Device) -> Result<Tensor> {
+    let cuda = dev.to_flame_cuda().map_err(Error::from)?;
+    let seed = rng::next_u64();
+    let shape = Shape::from_dims(&[b, 1]);
+    bf16_factories::uniform_bf16(shape, 0.0, 1.0, seed, cuda).map_err(Error::from)
 }
 
 /// FP32 add_noise with sigma broadcast from [B,1] to data shape

@@ -44,9 +44,7 @@ fn forward_sdxl_basic(
 
     // Time MLP
     let time_mlp_0_weight = weights.get("time_embedding.linear_1.weight").ok_or_else(|| {
-        flame_core::Error::InvalidOperation(
-            "Missing time_embedding.linear_1.weight".to_string(),
-        )
+        flame_core::Error::InvalidOperation("Missing time_embedding.linear_1.weight".to_string())
     })?;
     let time_mlp_0_bias = weights.get("time_embedding.linear_1.bias").ok_or_else(|| {
         flame_core::Error::InvalidOperation("Missing time_embedding.linear_1.bias".into())
@@ -57,9 +55,7 @@ fn forward_sdxl_basic(
     let time_emb = time_emb.silu()?; // SiLU activation
 
     let time_mlp_2_weight = weights.get("time_embedding.linear_2.weight").ok_or_else(|| {
-        flame_core::Error::InvalidOperation(
-            "Missing time_embedding.linear_2.weight".to_string(),
-        )
+        flame_core::Error::InvalidOperation("Missing time_embedding.linear_2.weight".to_string())
     })?;
     let time_mlp_2_bias = weights.get("time_embedding.linear_2.bias").ok_or_else(|| {
         flame_core::Error::InvalidOperation("Missing time_embedding.linear_2.bias".into())
@@ -69,12 +65,12 @@ fn forward_sdxl_basic(
     let time_emb = time_emb.add(time_mlp_2_bias)?;
 
     // Initial convolution
-    let conv_in_weight = weights.get("conv_in.weight").ok_or_else(|| {
-        flame_core::Error::InvalidOperation("Missing conv_in.weight".into())
-    })?;
-    let conv_in_bias = weights.get("conv_in.bias").ok_or_else(|| {
-        flame_core::Error::InvalidOperation("Missing conv_in.bias".into())
-    })?;
+    let conv_in_weight = weights
+        .get("conv_in.weight")
+        .ok_or_else(|| flame_core::Error::InvalidOperation("Missing conv_in.weight".into()))?;
+    let conv_in_bias = weights
+        .get("conv_in.bias")
+        .ok_or_else(|| flame_core::Error::InvalidOperation("Missing conv_in.bias".into()))?;
 
     let mut hidden_states = sample.conv2d(conv_in_weight, None, 1, 1)?;
     hidden_states = hidden_states.add(&conv_in_bias.reshape(&[1, 320, 1, 1])?)?;
@@ -121,12 +117,12 @@ fn forward_sdxl_basic(
     hidden_states = hidden_states.silu()?;
 
     // Output projection
-    let conv_out_weight = weights.get("conv_out.weight").ok_or_else(|| {
-        flame_core::Error::InvalidOperation("Missing conv_out.weight".into())
-    })?;
-    let conv_out_bias = weights.get("conv_out.bias").ok_or_else(|| {
-        flame_core::Error::InvalidOperation("Missing conv_out.bias".into())
-    })?;
+    let conv_out_weight = weights
+        .get("conv_out.weight")
+        .ok_or_else(|| flame_core::Error::InvalidOperation("Missing conv_out.weight".into()))?;
+    let conv_out_bias = weights
+        .get("conv_out.bias")
+        .ok_or_else(|| flame_core::Error::InvalidOperation("Missing conv_out.bias".into()))?;
 
     let output = hidden_states.conv2d(conv_out_weight, None, 1, 1)?;
     let output = output.add(&conv_out_bias.reshape(&[1, 4, 1, 1])?)?;

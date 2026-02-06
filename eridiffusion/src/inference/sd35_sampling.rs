@@ -221,7 +221,7 @@ impl SD35Sampler {
     /// Generate samples using SD 3.5
     pub fn generate(
         &self,
-        mmdit_forward: &dyn Fn(&Tensor, &Tensor, &Tensor, &Tensor) -> Result<Tensor>,
+        mmdit_forward: &dyn Fn(&Tensor, &Tensor, &Tensor, Option<&Tensor>) -> Result<Tensor>,
         vae_decode: &dyn Fn(&Tensor) -> Result<Tensor>,
         text_embeds: &Tensor,
         pooled_embeds: &Tensor,
@@ -258,7 +258,8 @@ impl SD35Sampler {
             let t = if self.config.guidance_scale > 1.0 { Tensor::cat(&[&t, &t], 0)? } else { t };
 
             // Forward pass through MMDiT
-            let model_output = mmdit_forward(&latent_model_input, &t, text_embeds, pooled_embeds)?;
+            let model_output =
+                mmdit_forward(&latent_model_input, &t, text_embeds, Some(pooled_embeds))?;
 
             // Perform guidance if needed
             let model_output = if self.config.guidance_scale > 1.0 {
@@ -292,10 +293,7 @@ impl SD35Sampler {
         let output_dir = Path::new("outputs/sd35");
         std::fs::create_dir_all(output_dir)
             .map_err(|e| {
-                flame_core::Error::InvalidOperation(format!(
-                    "Failed to create directory: {}",
-                    e
-                ))
+                flame_core::Error::InvalidOperation(format!("Failed to create directory: {}", e))
             })
             .map_err(|e| flame_core::Error::InvalidOperation(e.to_string()))?;
 
@@ -349,7 +347,7 @@ impl SD35Sampler {
 /// Example usage function
 pub fn sample_sd35(
     device: Device,
-    mmdit_forward: impl Fn(&Tensor, &Tensor, &Tensor, &Tensor) -> Result<Tensor>,
+    mmdit_forward: impl Fn(&Tensor, &Tensor, &Tensor, Option<&Tensor>) -> Result<Tensor>,
     vae_decode: impl Fn(&Tensor) -> Result<Tensor>,
     clip_l: impl Fn(&str) -> Result<(Tensor, Tensor)>,
     clip_g: impl Fn(&str) -> Result<(Tensor, Tensor)>,

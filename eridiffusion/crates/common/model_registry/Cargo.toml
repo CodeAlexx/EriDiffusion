@@ -9,7 +9,7 @@ inventory = "0.3"
 serde_yaml = "0.9"
 tracing = "0.1"
 
-flame-core = {path = "../../../../flame/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels"]}
+flame-core = {path = "/home/alex/EriDiffusion/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels"]}
 eridiffusion-common-weights = { path = "../weights" }
 eridiffusion-common-lora    = { path = "../lora" }
 eridiffusion-common-stability = { path = "../stability" }

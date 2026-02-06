@@ -3,7 +3,7 @@ use std::sync::Arc;
 use eridiffusion_core::{Error, Result};
 use flame_core::{
     bf16_elementwise::{add_bf16, mul_bf16},
-    ops::tile::tile_bc_to_bhwc_f32,
+    ops::{elt, reduce::sum_dim_keepdim_as, tile::tile_bc_to_bhwc_f32},
     tensor_ext::to_owning_fp32_strong,
     CudaDevice, DType, Shape, Tensor,
 };
@@ -24,6 +24,11 @@ pub fn broadcast_mul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     broadcast_binary(a, b, BinaryOp::Mul)
 }
 
+/// Thin wrapper around the CUDA in-place add helper to keep error types aligned.
+pub fn add_inplace_same_dtype(dst: &mut Tensor, src: &Tensor) -> Result<()> {
+    elt::add_inplace_same_dtype(dst, src).map_err(Error::from)
+}
+
 /// Broadcast tensor to a target shape while ensuring storage dtype matches `dtype`.
 pub fn broadcast_to_as(a: &Tensor, target: &[usize], dtype: DType) -> Result<Tensor> {
     let cast = if a.dtype() == dtype { a.clone_result()? } else { a.to_dtype(dtype)? };
@@ -38,11 +43,16 @@ pub fn broadcast_to_as(a: &Tensor, target: &[usize], dtype: DType) -> Result<Ten
     }
     let shape = shape_from_usize(target);
     let out = cast.broadcast_to(&shape).map_err(Error::from)?;
+    let out = if dtype == DType::BF16 && out.storage_dtype() == DType::BF16 {
+        out.clone_result().map_err(Error::from)?
+    } else {
+        out
+    };
     if std::env::var("SDXL_DEBUG_SHAPES").ok().as_deref() == Some("1") {
         eprintln!(
-            "[broadcast_to_as] result dtype {:?} storage_f32={} shape {:?}",
+            "[broadcast_to_as] result dtype {:?} storage {:?} shape {:?}",
             out.dtype(),
-            out.to_dtype(DType::F32)?.dtype() == DType::F32, // force eval to catch errors
+            out.storage_dtype(),
             out.shape().dims()
         );
     }
@@ -266,14 +276,112 @@ mod tests {
 
 #[inline]
 pub fn sum_keepdim_fp32(x: &Tensor, dim: usize) -> Result<Tensor> {
-    let x32 = x.to_dtype(DType::F32).map_err(Error::from)?;
-    x32.sum_dim_keepdim(dim).map_err(Error::from)
+    let dims = x.shape().dims().to_vec();
+    if dims.is_empty() {
+        return Err(Error::InvalidInput("sum_keepdim_fp32: tensor rank must be >= 1".into()));
+    }
+    if dim >= dims.len() {
+        return Err(Error::InvalidInput(format!("sum_keepdim_fp32: dim {dim} out of range")));
+    }
+    if dims[dim] == 0 {
+        return Err(Error::InvalidInput(
+            "sum_keepdim_fp32: reduction axis must have non-zero length".into(),
+        ));
+    }
+    if x.dtype() != DType::BF16 {
+        return Err(Error::InvalidInput(format!(
+            "sum_keepdim_fp32: expected BF16 tensor, got {:?}",
+            x.dtype()
+        )));
+    }
+
+    let (prepared, restore_shape, inv_perm, _, moved) = bf16_reduce_prepare(x, dim)?;
+    let sum = sum_dim_keepdim_as(&prepared, 2, DType::BF16).map_err(Error::from)?;
+    let sum = sum.reshape(&restore_shape).map_err(Error::from)?;
+    let result = if moved { sum.permute(&inv_perm).map_err(Error::from)? } else { sum };
+    Ok(result)
 }
 
 #[inline]
 pub fn mean_keepdim_fp32(x: &Tensor, dim: usize) -> Result<Tensor> {
-    let x32 = x.to_dtype(DType::F32).map_err(Error::from)?;
-    x32.mean_dim(&[dim], true).map_err(Error::from)
+    let dims = x.shape().dims().to_vec();
+    if dims.is_empty() {
+        return Err(Error::InvalidInput("mean_keepdim_fp32: tensor rank must be >= 1".into()));
+    }
+    if dim >= dims.len() {
+        return Err(Error::InvalidInput(format!("mean_keepdim_fp32: dim {dim} out of range")));
+    }
+    if dims[dim] == 0 {
+        return Err(Error::InvalidInput(
+            "mean_keepdim_fp32: reduction axis must have non-zero length".into(),
+        ));
+    }
+    if x.dtype() != DType::BF16 {
+        return Err(Error::InvalidInput(format!(
+            "mean_keepdim_fp32: expected BF16 tensor, got {:?}",
+            x.dtype()
+        )));
+    }
+
+    let (prepared, restore_shape, inv_perm, reduce_len, moved) = bf16_reduce_prepare(x, dim)?;
+    let sum = sum_dim_keepdim_as(&prepared, 2, DType::BF16).map_err(Error::from)?;
+    let mean = sum
+        .to_dtype(DType::F32)
+        .map_err(Error::from)?
+        .div_scalar(reduce_len as f32)
+        .map_err(Error::from)?
+        .to_dtype(DType::BF16)
+        .map_err(Error::from)?;
+    let mean = mean.reshape(&restore_shape).map_err(Error::from)?;
+    let result = if moved { mean.permute(&inv_perm).map_err(Error::from)? } else { mean };
+    Ok(result)
+}
+
+#[inline]
+pub fn mean_keepdim_bf16(x: &Tensor, dim: usize) -> Result<Tensor> {
+    let dims = x.shape().dims().to_vec();
+    if dims.is_empty() {
+        return Err(Error::InvalidInput("mean_keepdim_bf16: tensor rank must be >= 1".into()));
+    }
+    if dim >= dims.len() {
+        return Err(Error::InvalidInput(format!("mean_keepdim_bf16: dim {dim} out of range")));
+    }
+    if dims[dim] == 0 {
+        return Err(Error::InvalidInput(
+            "mean_keepdim_bf16: reduction axis must have non-zero length".into(),
+        ));
+    }
+    if x.dtype() != DType::BF16 {
+        return Err(Error::InvalidInput(format!(
+            "mean_keepdim_bf16: expected BF16 tensor, got {:?}",
+            x.dtype()
+        )));
+    }
+
+    let (prepared, restore_shape, inv_perm, reduce_len, moved) = bf16_reduce_prepare(x, dim)?;
+    let sum = sum_dim_keepdim_as(&prepared, 2, DType::BF16).map_err(Error::from)?;
+    let mean = sum.div_scalar(reduce_len as f32).map_err(Error::from)?;
+    let mean = mean.reshape(&restore_shape).map_err(Error::from)?;
+    let result = if moved { mean.permute(&inv_perm).map_err(Error::from)? } else { mean };
+    Ok(result)
+}
+
+#[inline]
+pub fn sum_all_bf16(x: &Tensor) -> Result<Tensor> {
+    let numel = x.shape().elem_count();
+    if numel == 0 {
+        return Err(Error::InvalidInput(
+            "sum_all_bf16: zero-sized tensor not supported".into(),
+        ));
+    }
+    if x.dtype() != DType::BF16 {
+        return Err(Error::InvalidInput(format!(
+            "sum_all_bf16: expected BF16 tensor, got {:?}",
+            x.dtype()
+        )));
+    }
+    let flat = x.reshape(&[1, 1, numel]).map_err(Error::from)?;
+    sum_dim_keepdim_as(&flat, 2, DType::BF16).map_err(Error::from)
 }
 
 #[inline]
@@ -293,6 +401,57 @@ pub fn softmax_stable(x: &Tensor, dim: i64) -> Result<Tensor> {
     let s_safe = s.maximum(&eps).map_err(Error::from)?;
     let y32 = e.div(&s_safe).map_err(Error::from)?;
     y32.to_dtype(x.dtype()).map_err(Error::from)
+}
+
+fn bf16_reduce_prepare(
+    x: &Tensor,
+    dim: usize,
+) -> Result<(Tensor, Vec<usize>, Vec<usize>, usize, bool)> {
+    let dims = x.shape().dims().to_vec();
+    let rank = dims.len();
+    let mut perm: Vec<usize> = (0..rank).collect();
+    let moved = dim != rank.saturating_sub(1);
+    if moved {
+        let axis = perm.remove(dim);
+        perm.push(axis);
+    }
+
+    let permuted = if moved {
+        x.permute(&perm).map_err(Error::from)?
+    } else {
+        x.clone_result().map_err(Error::from)?
+    };
+    let perm_dims = permuted.shape().dims().to_vec();
+    let total: usize = perm_dims.iter().product();
+    if total == 0 {
+        return Err(Error::InvalidInput(
+            "bf16_reduce_prepare: zero-sized tensor not supported in BF16 path".into(),
+        ));
+    }
+
+    let reduce_len = *perm_dims
+        .last()
+        .ok_or_else(|| Error::InvalidInput("bf16_reduce_prepare: empty shape".into()))?;
+    let outer = total
+        .checked_div(reduce_len)
+        .ok_or_else(|| Error::InvalidInput("bf16_reduce_prepare: invalid reshape".into()))?;
+
+    let reshaped = permuted.reshape(&[1, outer, reduce_len]).map_err(Error::from)?;
+    let mut restore_shape = perm_dims;
+    let last_idx = restore_shape.len() - 1;
+    restore_shape[last_idx] = 1;
+
+    let inv_perm = if moved { invert_permutation(&perm) } else { (0..rank).collect() };
+
+    Ok((reshaped, restore_shape, inv_perm, reduce_len, moved))
+}
+
+fn invert_permutation(perm: &[usize]) -> Vec<usize> {
+    let mut inv = vec![0usize; perm.len()];
+    for (i, &axis) in perm.iter().enumerate() {
+        inv[axis] = i;
+    }
+    inv
 }
 
 #[inline]

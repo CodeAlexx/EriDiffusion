@@ -1,14 +1,13 @@
-#![cfg(feature = "legacy-bins")]
-
-// NOTE: Legacy binary; gated behind the `legacy-bins` feature so it stays out of default builds. Enable with `--features legacy-bins` if you still rely on it.
-
-use flame_core::Result;
+use flame_core::Error;
 use log::info;
 use std::{env, path::PathBuf};
 
 fn main() -> flame_core::Result<()> {
     // Initialize logging
-    eridiffusion::logging::init_logger();
+    let _ = eridiffusion::logging::init_logger();
+
+    // Initialize core device manager + plugins to avoid runtime panics
+    eridiffusion_core::initialize().map_err(|e| Error::InvalidOperation(e.to_string()))?;
 
     // Get config path from args
     let args: Vec<String> = env::args().collect();

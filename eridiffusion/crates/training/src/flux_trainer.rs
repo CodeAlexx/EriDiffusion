@@ -10,17 +10,18 @@ use anyhow::{anyhow, bail, ensure, Result};
 use chrono::Utc;
 use eridiffusion_core::{Device, FluxVariant};
 use eridiffusion_models::{
-    devtensor::{randn_on, tensor_from_slice_on, zeros_on},
+    devtensor::{randn_on, zeros_on},
     flux::{ae::FluxAE, text::FluxText},
 };
 use flame_core::{device::Device as FlameDevice, DType, Shape, Tensor};
+use half::bf16;
 use safetensors::Dtype as SafeDtype;
 use serde_json;
 
 use crate::{
     checkpoint_safetensors::{
-        bf16_bytes_to_f32_vec, deserialize_tensors, f32_bytes_to_vec, serialize_tensors,
-        tensor_to_bf16_bytes, tensor_to_f32_bytes, OwnedTensorView,
+        deserialize_tensors, loaded_to_tensor, serialize_tensors, tensor_to_bf16_bytes,
+        OwnedTensorView,
     },
     flame_ctx,
     flux::{
@@ -33,10 +34,10 @@ use crate::{
     gradient_accumulator::GradientAccumulator,
     lora_keys::LoraSpec as TrainerLoraSpec,
     optimizer::{
-        clip_grads_global_norm_fp32_tensors, create_optimizer, Optimizer, OptimizerConfig,
+        clip_grads_global_norm_tensors, create_optimizer, Optimizer, OptimizerConfig,
     },
     policy,
-    tensor_utils::mean_keepdim_fp32,
+    tensor_utils::{mean_keepdim_bf16, sum_all_bf16},
 };
 
 /// Flux training configuration (LoRA-only).
@@ -153,7 +154,7 @@ impl FluxTrainer {
         let mut ema_shadow = Vec::new();
         if ema_enabled {
             for param in &lora_params {
-                let initial = param.tensor()?.to_dtype(DType::F32)?;
+                let initial = param.tensor()?.to_dtype(DType::BF16)?;
                 ema_shadow.push(initial);
             }
         }
@@ -197,18 +198,18 @@ impl FluxTrainer {
         text_cond: usize,
     ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
         let scale = 1e-3f32;
-        let img_proj = randn_on(Shape::from_dims(&[4, hidden]), device, DType::F32, None)?
+        let img_proj = randn_on(Shape::from_dims(&[4, hidden]), device, DType::BF16, None)?
             .mul_scalar(scale)?;
         let text_proj =
-            randn_on(Shape::from_dims(&[text_hidden, hidden]), device, DType::F32, None)?
+            randn_on(Shape::from_dims(&[text_hidden, hidden]), device, DType::BF16, None)?
                 .mul_scalar(scale)?;
-        let img_head = zeros_on(Shape::from_dims(&[hidden, 4]), device, DType::F32)?;
+        let img_head = zeros_on(Shape::from_dims(&[hidden, 4]), device, DType::BF16)?;
         let cond_in = text_hidden + 1;
         let cond_proj_img =
-            randn_on(Shape::from_dims(&[cond_in, image_cond]), device, DType::F32, None)?
+            randn_on(Shape::from_dims(&[cond_in, image_cond]), device, DType::BF16, None)?
                 .mul_scalar(scale)?;
         let cond_proj_txt =
-            randn_on(Shape::from_dims(&[cond_in, text_cond]), device, DType::F32, None)?
+            randn_on(Shape::from_dims(&[cond_in, text_cond]), device, DType::BF16, None)?
                 .mul_scalar(scale)?;
         Ok((img_proj, text_proj, img_head, cond_proj_img, cond_proj_txt))
     }
@@ -247,13 +248,18 @@ impl FluxTrainer {
     fn pooled_text_and_time(&self, text_tokens: &Tensor, timesteps: &Tensor) -> Result<Tensor> {
         let b = text_tokens.shape().dims()[0];
         let pooled = flame_ctx!(
-            mean_keepdim_fp32(text_tokens, 1),
+            mean_keepdim_bf16(text_tokens, 1),
             "flux_trainer::pooled_text_and_time.mean"
         )?;
         let dtype = text_tokens.dtype();
-        let pooled = pooled.to_dtype(dtype)?;
         let pooled = pooled.reshape(&[b, self.text_hidden_in])?;
-        let time = timesteps.to_dtype(dtype)?;
+        ensure!(
+            timesteps.dtype() == dtype,
+            "timesteps dtype mismatch {:?} vs {:?}",
+            timesteps.dtype(),
+            dtype
+        );
+        let time = timesteps.clone_result()?;
         let cond_in = Tensor::cat(&[&pooled, &time], 1)?; // [B, text_hidden+1]
         Ok(cond_in)
     }
@@ -288,31 +294,41 @@ impl FluxTrainer {
             "Latents must be [B,4,H,W], got {:?}",
             lat_dims
         );
+        ensure!(
+            text_ctx.dtype() == DType::BF16,
+            "text ctx must be BF16, got {:?}",
+            text_ctx.dtype()
+        );
         let b = lat_dims[0];
         let h_lat = lat_dims[2];
         let w_lat = lat_dims[3];
         let seq_img = h_lat * w_lat;
 
-        let z0_f32 = latents_nchw.to_dtype(DType::F32)?;
+        ensure!(
+            latents_nchw.dtype() == DType::BF16,
+            "latents must be BF16, got {:?}",
+            latents_nchw.dtype()
+        );
         let eps_target =
-            randn_on(Shape::from_dims(&[b, 4, h_lat, w_lat]), &self.device, DType::F32, None)?;
-        let t_b = policy::sample_timesteps01(b, &self.device)?; // [B,1]
+            randn_on(Shape::from_dims(&[b, 4, h_lat, w_lat]), &self.device, DType::BF16, None)?;
+        let t_b = policy::sample_timesteps01_bf16(b, &self.device)?; // [B,1]
         let mut sigma_b1 =
             policy::sigma_for_bounded(&t_b, self.config.sigma_min, self.config.sigma_max)?;
-        let clamp_min = Tensor::from_scalar(1e-3f32, sigma_b1.device().clone())?;
-        let clamp_max = Tensor::from_scalar(1.0f32, sigma_b1.device().clone())?;
+        let clamp_min = sigma_b1
+            .zeros_like_with_dtype(sigma_b1.dtype())?
+            .add_scalar(1e-3f32)?;
+        let clamp_max = sigma_b1
+            .zeros_like_with_dtype(sigma_b1.dtype())?
+            .add_scalar(1.0f32)?;
         sigma_b1 = sigma_b1.maximum(&clamp_min)?.minimum(&clamp_max)?;
-        let sigma_exp = sigma_b1.to_dtype(DType::F32)?.reshape(&[b, 1, 1, 1])?;
-        let xt_f32 = z0_f32.add(&eps_target.mul(&sigma_exp)?)?;
-        let xt_nchw = xt_f32.to_dtype(DType::BF16)?;
-        let eps_target = eps_target.to_dtype(DType::BF16)?;
+        let sigma_exp = sigma_b1.reshape(&[b, 1, 1, 1])?;
+        let xt_nchw = latents_nchw.add(&eps_target.mul(&sigma_exp)?)?;
 
         // Image tokens: [B,T_img,D]
         let latents_bhwc = xt_nchw.permute(&[0, 2, 3, 1])?;
         let latents_tokens = latents_bhwc.reshape(&[b, seq_img, 4])?;
         let tokens_flat = latents_tokens.reshape(&[b * seq_img, 4])?;
-        let proj =
-            tokens_flat.matmul(&self.img_proj.to_dtype(DType::F32)?.transpose_dims(0, 1)?)?;
+        let proj = tokens_flat.matmul(&self.img_proj.transpose_dims(0, 1)?)?;
         let img_tokens = proj.reshape(&[b, seq_img, self.hidden])?;
 
         // Text tokens (assume padded length is dims[1])
@@ -327,14 +343,13 @@ impl FluxTrainer {
             self.text_hidden_in
         );
         let text_flat = text_ctx.reshape(&[b * text_len, self.text_hidden_in])?;
-        let text_proj =
-            text_flat.matmul(&self.text_proj.to_dtype(DType::F32)?.transpose_dims(0, 1)?)?;
+        let text_proj = text_flat.matmul(&self.text_proj.transpose_dims(0, 1)?)?;
         let text_tokens = text_proj.reshape(&[b, text_len, self.hidden])?;
 
         // Conditioning
         let cond_input = self.pooled_text_and_time(&text_tokens, &t_b)?;
-        let img_cond = cond_input.matmul(&self.cond_proj_img.to_dtype(DType::F32)?)?;
-        let txt_cond = cond_input.matmul(&self.cond_proj_txt.to_dtype(DType::F32)?)?;
+        let img_cond = cond_input.matmul(&self.cond_proj_img)?;
+        let txt_cond = cond_input.matmul(&self.cond_proj_txt)?;
 
         let (img_out, _txt_out) = self.registry.forward(
             &img_tokens,
@@ -346,15 +361,13 @@ impl FluxTrainer {
 
         let pred_flat = img_out
             .reshape(&[b * seq_img, self.hidden])?
-            .matmul(&self.img_head.to_dtype(DType::F32)?.transpose_dims(0, 1)?)?;
+            .matmul(&self.img_head.transpose_dims(0, 1)?)?;
         let pred_eps_tokens = pred_flat.reshape(&[b, seq_img, 4])?;
         let pred_eps = pred_eps_tokens
             .reshape(&[b, h_lat, w_lat, 4])?
-            .permute(&[0, 3, 1, 2])?
-            .to_dtype(DType::BF16)?;
+            .permute(&[0, 3, 1, 2])?;
 
-        let eps_target_bf = eps_target.to_dtype(DType::BF16)?;
-        let loss = self.compute_loss(&pred_eps, &eps_target_bf)?;
+        let loss = self.compute_loss(&pred_eps, &eps_target)?;
         let loss_scalar = tensor_scalar_f32(&loss)?;
 
         let param_refs_storage = self.param_refs();
@@ -368,12 +381,16 @@ impl FluxTrainer {
             let mut sum_sq = 0.0f32;
             for g in &grads {
                 let squared = g.mul(&g)?;
-                let sum_val = squared.sum()?;
+                let sum_val = if squared.dtype() == DType::BF16 {
+                    sum_all_bf16(&squared)?
+                } else {
+                    squared.sum()?
+                };
                 sum_sq += tensor_scalar_f32(&sum_val)?;
             }
             self.last_grad_norm = sum_sq.sqrt();
             if self.config.max_grad_norm > 0.0 {
-                let _ = clip_grads_global_norm_fp32_tensors(
+                let _ = clip_grads_global_norm_tensors(
                     &mut grads,
                     self.config.max_grad_norm as f32,
                 )?;
@@ -391,9 +408,7 @@ impl FluxTrainer {
     }
 
     fn compute_loss(&self, pred: &Tensor, target: &Tensor) -> Result<Tensor> {
-        let pred32 = pred.to_dtype(DType::F32)?;
-        let target32 = target.to_dtype(DType::F32)?;
-        let diff = pred32.sub(&target32)?;
+        let diff = pred.sub(target)?;
         let sq = diff.mul(&diff)?;
         flame_ctx!(policy::reduce_mean_fp32_keepdim(&sq), "flux_trainer::compute_loss")
     }
@@ -459,18 +474,13 @@ impl FluxTrainer {
             let loaded = lora_tensors
                 .get(&key)
                 .ok_or_else(|| anyhow!("missing tensor {} in {}", key, lora_path.display()))?;
-            let values = match loaded.dtype {
-                SafeDtype::BF16 => bf16_bytes_to_f32_vec(&loaded.bytes)?,
-                SafeDtype::F32 => f32_bytes_to_vec(&loaded.bytes)?,
-                other => bail!("unsupported dtype {:?} for {}", other, key),
-            };
-            let tensor = tensor_from_slice_on(
-                &values,
-                Shape::from_dims(&loaded.shape),
+            let tensor = loaded_to_tensor(
                 &self.device,
-                DType::F32,
-            )?
-            .to_dtype(DType::BF16)?;
+                DType::BF16,
+                &loaded.shape,
+                loaded.dtype,
+                &loaded.bytes,
+            )?;
             self.apply_lora_tensor(name, &tensor)?;
         }
 
@@ -481,22 +491,18 @@ impl FluxTrainer {
                 if self.ema_shadow.len() != self.lora_params.len() {
                     self.ema_shadow.clear();
                     for param in &self.lora_params {
-                        self.ema_shadow.push(param.tensor()?.to_dtype(DType::F32)?);
+                        self.ema_shadow.push(param.tensor()?.to_dtype(DType::BF16)?);
                     }
                 }
                 for (idx, name) in param_indices.iter() {
                     let key = format!("ema.{name}");
                     if let Some(loaded) = ema_tensors.get(&key) {
-                        let values = match loaded.dtype {
-                            SafeDtype::F32 => f32_bytes_to_vec(&loaded.bytes)?,
-                            SafeDtype::BF16 => bf16_bytes_to_f32_vec(&loaded.bytes)?,
-                            other => bail!("unsupported dtype {:?} for {}", other, key),
-                        };
-                        let tensor = tensor_from_slice_on(
-                            &values,
-                            Shape::from_dims(&loaded.shape),
+                        let tensor = loaded_to_tensor(
                             &self.device,
-                            DType::F32,
+                            DType::BF16,
+                            &loaded.shape,
+                            loaded.dtype,
+                            &loaded.bytes,
                         )?;
                         self.ema_shadow[*idx] = tensor;
                     }
@@ -504,7 +510,7 @@ impl FluxTrainer {
             } else {
                 self.ema_shadow.clear();
                 for param in &self.lora_params {
-                    self.ema_shadow.push(param.tensor()?.to_dtype(DType::F32)?);
+                    self.ema_shadow.push(param.tensor()?.to_dtype(DType::BF16)?);
                 }
             }
         }
@@ -609,13 +615,13 @@ impl FluxTrainer {
         if self.ema_shadow.len() != self.lora_params.len() {
             self.ema_shadow.clear();
             for param in &self.lora_params {
-                self.ema_shadow.push(param.tensor()?.to_dtype(DType::F32)?);
+                self.ema_shadow.push(param.tensor()?.to_dtype(DType::BF16)?);
             }
         }
         let decay = self.config.ema_decay as f32;
         let one_minus = 1.0f32 - decay;
         for (idx, param) in self.lora_params.iter().enumerate() {
-            let current = param.tensor()?.to_dtype(DType::F32)?;
+            let current = param.tensor()?.to_dtype(DType::BF16)?;
             let ema_prev = &self.ema_shadow[idx];
             let decayed = ema_prev.mul_scalar(decay)?;
             let added = current.mul_scalar(one_minus)?;
@@ -647,9 +653,9 @@ impl FluxTrainer {
         let mut tensors: Vec<(String, OwnedTensorView)> = Vec::new();
         for (idx, name) in self.param_names.iter().enumerate() {
             let ema = &self.ema_shadow[idx];
-            let (shape, data) = tensor_to_f32_bytes(ema)?;
+            let (shape, data) = tensor_to_bf16_bytes(ema)?;
             tensors
-                .push((format!("ema.{name}"), OwnedTensorView::new(SafeDtype::F32, shape, data)));
+                .push((format!("ema.{name}"), OwnedTensorView::new(SafeDtype::BF16, shape, data)));
         }
         let mut metadata = HashMap::new();
         metadata.insert("step".to_string(), step.to_string());
@@ -661,8 +667,20 @@ impl FluxTrainer {
 }
 
 fn tensor_scalar_f32(tensor: &Tensor) -> Result<f32> {
-    let vec = tensor.to_dtype(DType::F32)?.to_vec()?;
-    vec.first().copied().ok_or_else(|| anyhow!("expected scalar tensor"))
+    let value = match tensor.dtype() {
+        DType::BF16 => {
+            let raw = tensor.to_vec_bf16()?;
+            raw.first()
+                .map(|bits| bf16::from_bits(*bits).to_f32())
+                .ok_or_else(|| anyhow!("expected scalar tensor"))?
+        }
+        _ => tensor
+            .to_vec()?
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow!("expected scalar tensor"))?,
+    };
+    Ok(value)
 }
 
 /// Create a Flux trainer from strict weights and adapters.
@@ -688,10 +706,14 @@ pub async fn create_flux_trainer(
         Device::Cuda(ix) => FlameDevice::cuda(ix)?,
         _ => bail!("Flux training requires a CUDA device"),
     };
+    
+    println!("[Flux Trainer] Loading Flux model weights from {}...", model_path.display());
+    println!("[Flux Trainer] This may take several minutes for large models (23GB+)");
     let provider = FluxWeightProvider::from_path(
         model_path,
         Device::from_flame_cuda(flame_dev.cuda_device().as_ref()),
     )?;
+    println!("[Flux Trainer] Model weights loaded successfully!");
     let registry = build_layer_registry(&provider)?;
     let metadata = registry.metadata();
     ensure!(!metadata.is_empty(), "no Flux blocks discovered");
@@ -753,8 +775,12 @@ pub async fn create_flux_trainer(
     };
     let flux_registry = FluxRegistry::build(&registry_plan);
 
+    println!("[Flux Trainer] Loading VAE from {}...", vae_path.display());
     let ae = FluxAE::load(vae_path.to_string_lossy().as_ref(), device.clone(), DType::BF16)
         .map_err(|e| anyhow!("FluxAE load failed: {e}"))?;
+    println!("[Flux Trainer] VAE loaded successfully!");
+    
+    println!("[Flux Trainer] Loading T5 and CLIP text encoders...");
     let text = FluxText::load(
         t5_tokenizer_path.to_string_lossy().as_ref(),
         t5_path.to_string_lossy().as_ref(),
@@ -762,6 +788,7 @@ pub async fn create_flux_trainer(
         DType::BF16,
     )
     .map_err(|e| anyhow!("FluxText load failed: {e}"))?;
+    println!("[Flux Trainer] Text encoders loaded successfully!");
 
     let text_hidden_in = text.hidden_dim();
 

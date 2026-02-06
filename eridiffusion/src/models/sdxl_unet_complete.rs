@@ -608,9 +608,9 @@ impl UNet2DConditionModel {
         weights: HashMap<String, Tensor>,
     ) -> Result<Self> {
         // Input convolution
-        let conv_in_weight = weights.get("conv_in.weight").ok_or_else(|| {
-            flame_core::Error::InvalidOperation("Missing conv_in.weight".into())
-        })?;
+        let conv_in_weight = weights
+            .get("conv_in.weight")
+            .ok_or_else(|| flame_core::Error::InvalidOperation("Missing conv_in.weight".into()))?;
         let weight_shape = conv_in_weight.shape();
         let out_channels = weight_shape.dims()[0];
         let in_channels = weight_shape.dims()[1];
@@ -766,12 +766,13 @@ impl UNet2DConditionModel {
             config.block_out_channels[0],
             config.norm_eps,
             true,
+            DType::F32,
             device.cuda_device().clone(),
         )?;
 
-        let conv_out_weight = weights.get("conv_out.weight").ok_or_else(|| {
-            flame_core::Error::InvalidOperation("Missing conv_out.weight".into())
-        })?;
+        let conv_out_weight = weights
+            .get("conv_out.weight")
+            .ok_or_else(|| flame_core::Error::InvalidOperation("Missing conv_out.weight".into()))?;
         let weight_shape = conv_out_weight.shape();
         let out_channels = weight_shape.dims()[0];
         let in_channels = weight_shape.dims()[1];

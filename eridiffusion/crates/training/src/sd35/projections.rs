@@ -32,18 +32,11 @@ impl Latent1x1Conv {
         .to_dtype(DType::BF16)
         .map_err(Error::from)?
         .requires_grad_(true);
-        let b = Tensor::zeros_dtype(
-            Shape::from_dims(&[hidden]),
-            DType::BF16,
-            device.cuda_device_arc(),
-        )
-        .map_err(Error::from)?
-        .requires_grad_(true);
-        Ok(Self {
-            weight: Parameter::new(w),
-            bias: Parameter::new(b),
-            hidden,
-        })
+        let b =
+            Tensor::zeros_dtype(Shape::from_dims(&[hidden]), DType::BF16, device.cuda_device_arc())
+                .map_err(Error::from)?
+                .requires_grad_(true);
+        Ok(Self { weight: Parameter::new(w), bias: Parameter::new(b), hidden })
     }
 
     pub fn forward(&self, latents: &Tensor) -> Result<Tensor> {
@@ -73,9 +66,7 @@ impl Latent1x1Conv {
         let bias = self.bias.tensor().map_err(Error::from)?;
         let bias32 = cast_preserve_grad(&bias, DType::F32)?;
         out = out.add(
-            &bias32
-                .unsqueeze(0)?
-                .broadcast_to(&Shape::from_dims(&[b * h * w, self.hidden]))?,
+            &bias32.unsqueeze(0)?.broadcast_to(&Shape::from_dims(&[b * h * w, self.hidden]))?,
         )?;
 
         let out = out.reshape(&[b, h, w, self.hidden])?;
@@ -107,18 +98,11 @@ impl TextLinearPad {
         .to_dtype(DType::BF16)
         .map_err(Error::from)?
         .requires_grad_(true);
-        let b = Tensor::zeros_dtype(
-            Shape::from_dims(&[hidden]),
-            DType::BF16,
-            device.cuda_device_arc(),
-        )
-        .map_err(Error::from)?
-        .requires_grad_(true);
-        Ok(Self {
-            weight: Parameter::new(w),
-            bias: Parameter::new(b),
-            hidden,
-        })
+        let b =
+            Tensor::zeros_dtype(Shape::from_dims(&[hidden]), DType::BF16, device.cuda_device_arc())
+                .map_err(Error::from)?
+                .requires_grad_(true);
+        Ok(Self { weight: Parameter::new(w), bias: Parameter::new(b), hidden })
     }
 
     pub fn forward(&self, text: &Tensor) -> Result<Tensor> {
@@ -137,11 +121,8 @@ impl TextLinearPad {
             )));
         }
 
-        let mut work = if seq > TARGET_TOKENS {
-            text.narrow(1, 0, TARGET_TOKENS)?
-        } else {
-            text.clone()
-        };
+        let mut work =
+            if seq > TARGET_TOKENS { text.narrow(1, 0, TARGET_TOKENS)? } else { text.clone() };
         if seq < TARGET_TOKENS {
             let pad = Tensor::zeros_dtype(
                 Shape::from_dims(&[b, TARGET_TOKENS - seq, TEXT_INPUT_DIM]),
@@ -199,19 +180,13 @@ impl VelocityHead {
         )
         .map_err(Error::from)?
         .requires_grad_(true);
-        Ok(Self {
-            weight: Parameter::new(w),
-            bias: Parameter::new(b),
-        })
+        Ok(Self { weight: Parameter::new(w), bias: Parameter::new(b) })
     }
 
     pub fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let dims = hidden_states.shape().dims().to_vec();
         if dims.len() != LATENT_SPATIAL_DIMS {
-            return Err(Error::Training(format!(
-                "VelocityHead expects 4D tensor, got {:?}",
-                dims
-            )));
+            return Err(Error::Training(format!("VelocityHead expects 4D tensor, got {:?}", dims)));
         }
         let (b, c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
 

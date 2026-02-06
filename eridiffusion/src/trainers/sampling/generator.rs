@@ -119,18 +119,12 @@ pub fn save_samples(
             "jpg" | "jpeg" => {
                 let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
                     std::fs::File::create(&path).map_err(|e| {
-                        flame_core::Error::InvalidOperation(format!(
-                            "Failed to create file: {}",
-                            e
-                        ))
+                        flame_core::Error::InvalidOperation(format!("Failed to create file: {}", e))
                     })?,
                     95,
                 );
                 encoder.encode_image(&rgb_image).map_err(|e| {
-                    flame_core::Error::InvalidOperation(format!(
-                        "Failed to encode JPEG: {}",
-                        e
-                    ))
+                    flame_core::Error::InvalidOperation(format!("Failed to encode JPEG: {}", e))
                 })?;
             }
             _ => {

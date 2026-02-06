@@ -123,14 +123,12 @@ impl ValidationDataset {
         let mut items = Vec::new();
 
         // Load validation items
-        let entries = fs::read_dir(&config.dataset_path).map_err(|e| {
-            Error::InvalidOperation(format!("Failed to read directory: {}", e))
-        })?;
+        let entries = fs::read_dir(&config.dataset_path)
+            .map_err(|e| Error::InvalidOperation(format!("Failed to read directory: {}", e)))?;
 
         for entry in entries {
-            let entry = entry.map_err(|e| {
-                Error::InvalidOperation(format!("Failed to read entry: {}", e))
-            })?;
+            let entry = entry
+                .map_err(|e| Error::InvalidOperation(format!("Failed to read entry: {}", e)))?;
             let path = entry.path();
 
             if path
@@ -156,10 +154,7 @@ impl ValidationDataset {
                         Error::InvalidOperation(format!("Failed to read metadata: {}", e))
                     })?;
                     Some(serde_json::from_str(&data).map_err(|e| {
-                        flame_core::Error::InvalidOperation(format!(
-                            "Failed to parse JSON: {}",
-                            e
-                        ))
+                        flame_core::Error::InvalidOperation(format!("Failed to parse JSON: {}", e))
                     })?)
                 } else {
                     None
@@ -261,15 +256,12 @@ impl ValidationRunner {
     /// Create new validation runner
     pub fn new(dataset: ValidationDataset, output_dir: PathBuf) -> flame_core::Result<Self> {
         // Create output directories
-        fs::create_dir_all(&output_dir).map_err(|e| {
-            Error::InvalidOperation(format!("Failed to create output dir: {}", e))
-        })?;
-        fs::create_dir_all(output_dir.join("samples")).map_err(|e| {
-            Error::InvalidOperation(format!("Failed to create samples dir: {}", e))
-        })?;
-        fs::create_dir_all(output_dir.join("metrics")).map_err(|e| {
-            Error::InvalidOperation(format!("Failed to create metrics dir: {}", e))
-        })?;
+        fs::create_dir_all(&output_dir)
+            .map_err(|e| Error::InvalidOperation(format!("Failed to create output dir: {}", e)))?;
+        fs::create_dir_all(output_dir.join("samples"))
+            .map_err(|e| Error::InvalidOperation(format!("Failed to create samples dir: {}", e)))?;
+        fs::create_dir_all(output_dir.join("metrics"))
+            .map_err(|e| Error::InvalidOperation(format!("Failed to create metrics dir: {}", e)))?;
 
         // Initialize early stopping if configured
         let early_stopping_state =
@@ -580,9 +572,7 @@ fn load_image(path: &Path, device: Arc<CudaDevice>) -> flame_core::Result<Tensor
     use image::{io::Reader, DynamicImage};
 
     let img = Reader::open(path)
-        .map_err(|e| {
-            flame_core::Error::InvalidOperation(format!("Failed to open image: {}", e))
-        })?
+        .map_err(|e| flame_core::Error::InvalidOperation(format!("Failed to open image: {}", e)))?
         .decode()
         .map_err(|e| {
             flame_core::Error::InvalidOperation(format!("Failed to decode image: {}", e))

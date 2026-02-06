@@ -10,8 +10,7 @@ use std::{
 
 use csv::Writer;
 use eridiffusion_core::{
-    device as core_device, DType, DiffusionModel, Error, ModelInputs, NetworkAdapter,
-    Result,
+    device as core_device, DType, DiffusionModel, Error, ModelInputs, NetworkAdapter, Result,
 };
 use eridiffusion_models::devtensor::{shape1, uniform_on};
 use flame_core::{Shape, Tensor};

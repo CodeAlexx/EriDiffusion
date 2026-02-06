@@ -92,7 +92,8 @@ impl PreprocessedFluxDataset {
         } else if names.iter().any(|&s| s == "text_embed") {
             "text_embed"
         } else {
-            names.first()
+            names
+                .first()
                 .ok_or_else(|| anyhow!("safetensors file {} has no tensors", path.display()))?
                 .as_str()
         };
@@ -120,7 +121,8 @@ impl PreprocessedFluxDataset {
 
         // Squeeze batch dimension if present [1, seq_len, hidden] -> [seq_len, hidden]
         if shape_dims.len() == 3 && shape_dims[0] == 1 {
-            tensor_f32 = tensor_f32.squeeze(Some(0)).map_err(|e| anyhow!("squeeze failed: {}", e))?;
+            tensor_f32 =
+                tensor_f32.squeeze(Some(0)).map_err(|e| anyhow!("squeeze failed: {}", e))?;
         }
 
         Ok(tensor_f32.to_dtype(BF16)?)

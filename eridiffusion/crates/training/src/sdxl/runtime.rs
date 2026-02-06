@@ -12,22 +12,23 @@ use flame_core::kernels::adaln::{adaln_modulate_bf16_inplace, layernorm_affine_b
 use flame_core::ops::gemm_bf16::bmm_bf16_fp32acc_out;
 #[cfg(feature = "bf16_u16")]
 use flame_core::sdpa;
-#[cfg(not(feature = "bf16_u16"))]
 use flame_core::tensor_ext::to_owning_fp32_strong;
 use flame_core::{CudaDevice, DType, Shape, Tensor};
+use eridiffusion_core::{cuda::cuda_available_memory, Device as CoreDevice};
 use std::cell::Cell;
 #[cfg(feature = "bf16_u16")]
 use std::cell::RefCell;
-use std::fmt::Write as _;
 #[cfg(feature = "bf16_u16")]
 use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::env;
 use std::sync::{Arc, OnceLock};
 use std::thread_local;
 use std::time::Instant;
 
 use cudarc::driver::result;
 #[cfg(feature = "bf16_u16")]
-use cudarc::driver::{sys, LaunchConfig};
+use cudarc::driver::{sys, LaunchAsync, LaunchConfig};
 #[cfg(feature = "bf16_u16")]
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 
@@ -356,8 +357,7 @@ fn kernel_debug_enabled() -> bool {
         return override_value;
     }
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG
-        .get_or_init(|| std::env::var("SDXL_KERNEL_TELEMETRY").ok().as_deref() == Some("1"))
+    *FLAG.get_or_init(|| std::env::var("SDXL_KERNEL_TELEMETRY").ok().as_deref() == Some("1"))
 }
 
 #[cfg(feature = "bf16_u16")]
@@ -378,9 +378,17 @@ pub struct AttnChunkConfig {
     pub kv_chunk: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct AttnRuntimeConfig {
+    reuse: bool,
+    max_workspace_mb: usize,
+    min_free_mb: usize,
+}
+
 thread_local! {
     static ATTENTION_CHUNK: Cell<AttnChunkConfig> = Cell::new(AttnChunkConfig::default());
     static TELEMETRY_OVERRIDE: Cell<Option<bool>> = Cell::new(None);
+    static ATTENTION_RUNTIME: Cell<Option<AttnRuntimeConfig>> = Cell::new(None);
 }
 
 pub(crate) fn with_attn_chunks<R, F: FnOnce() -> R>(chunk: AttnChunkConfig, f: F) -> R {
@@ -403,6 +411,55 @@ pub(crate) fn with_kernel_telemetry<R, F: FnOnce() -> R>(enabled: bool, f: F) ->
 
 pub(crate) fn current_attn_chunks() -> AttnChunkConfig {
     ATTENTION_CHUNK.with(|cell| cell.get())
+}
+
+fn with_attn_runtime<R, F: FnOnce() -> R>(cfg: AttnRuntimeConfig, f: F) -> R {
+    ATTENTION_RUNTIME.with(|cell| {
+        let prev = cell.replace(Some(cfg));
+        let result = f();
+        cell.set(prev);
+        result
+    })
+}
+
+fn current_attn_runtime() -> Option<AttnRuntimeConfig> {
+    ATTENTION_RUNTIME.with(|cell| cell.get())
+}
+
+pub(crate) fn attn_env_from_env() -> Option<AttnEnvOverrides> {
+    let chunk_q = env::var("ATTN_Q_CHUNK").ok().and_then(|v| v.parse::<usize>().ok());
+    let chunk_kv = env::var("ATTN_KV_CHUNK").ok().and_then(|v| v.parse::<usize>().ok());
+    let chunk_shared = env::var("ATTN_CHUNK_SIZE").ok().and_then(|v| v.parse::<usize>().ok());
+
+    let reuse_raw = env::var("ATTN_CHUNK_REUSE").ok();
+    let reuse = reuse_raw
+        .as_deref()
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(true);
+
+    let max_ws = env::var("ATTN_MAX_WORKSPACE_MB").ok().and_then(|v| v.parse::<usize>().ok());
+    let min_free = env::var("ATTN_MIN_FREE_MB").ok().and_then(|v| v.parse::<usize>().ok());
+
+    let chunk_q_final = chunk_q.or(chunk_shared).unwrap_or(0);
+    let chunk_kv_final = chunk_kv.or(chunk_shared).unwrap_or(chunk_q_final);
+
+    let have_env = chunk_q.is_some()
+        || chunk_kv.is_some()
+        || chunk_shared.is_some()
+        || reuse_raw.is_some()
+        || max_ws.is_some()
+        || min_free.is_some();
+
+    if !have_env {
+        return None;
+    }
+
+    Some(AttnEnvOverrides {
+        chunk: AttnChunkConfig { q_chunk: chunk_q_final, kv_chunk: chunk_kv_final },
+        reuse,
+        max_workspace_mb: max_ws.unwrap_or(0),
+        min_free_mb: min_free.unwrap_or(0),
+    })
 }
 
 fn effective_chunk_len(seq: usize, requested: usize) -> usize {
@@ -530,10 +587,7 @@ pub(crate) fn mem_snap(tag: &str) {
 
 #[cfg(feature = "bf16_u16")]
 fn ensure_fused_attention_kernel(device: &Arc<CudaDevice>) -> Result<()> {
-    if device
-        .get_func(FUSED_ATTENTION_MODULE, FUSED_ATTENTION_FUNC)
-        .is_some()
-    {
+    if device.get_func(FUSED_ATTENTION_MODULE, FUSED_ATTENTION_FUNC).is_some() {
         return Ok(());
     }
 
@@ -562,12 +616,7 @@ fn ensure_fused_attention_kernel(device: &Arc<CudaDevice>) -> Result<()> {
         }
         ensured_default = true;
     }
-    if !ensured_default
-        && !opts
-            .include_paths
-            .iter()
-            .any(|p| p == "/usr/local/cuda/include")
-    {
+    if !ensured_default && !opts.include_paths.iter().any(|p| p == "/usr/local/cuda/include") {
         opts.include_paths.push("/usr/local/cuda/include".into());
     }
 
@@ -604,15 +653,12 @@ fn fused_attention_forward(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Re
     let device = q.device().clone();
     ensure_fused_attention_kernel(&device)?;
 
-    let q_ptr = q
-        .as_device_ptr_bf16("fused_attention.q")
-        .map_err(|e| anyhow!("{e}"))? as usize as sys::CUdeviceptr;
-    let k_ptr = k
-        .as_device_ptr_bf16("fused_attention.k")
-        .map_err(|e| anyhow!("{e}"))? as usize as sys::CUdeviceptr;
-    let v_ptr = v
-        .as_device_ptr_bf16("fused_attention.v")
-        .map_err(|e| anyhow!("{e}"))? as usize as sys::CUdeviceptr;
+    let q_ptr = q.as_device_ptr_bf16("fused_attention.q").map_err(|e| anyhow!("{e}"))? as usize
+        as sys::CUdeviceptr;
+    let k_ptr = k.as_device_ptr_bf16("fused_attention.k").map_err(|e| anyhow!("{e}"))? as usize
+        as sys::CUdeviceptr;
+    let v_ptr = v.as_device_ptr_bf16("fused_attention.v").map_err(|e| anyhow!("{e}"))? as usize
+        as sys::CUdeviceptr;
 
     let mut out_ws = acquire_workspace_tensor(&device, DType::BF16, &[bh, seq_q, head_dim])?;
     let out_ptr = out_ws
@@ -635,16 +681,7 @@ fn fused_attention_forward(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Re
     unsafe {
         func.launch(
             cfg,
-            (
-                q_ptr,
-                k_ptr,
-                v_ptr,
-                out_ptr,
-                head_dim as i32,
-                seq_q as i32,
-                seq_k as i32,
-                scale,
-            ),
+            (q_ptr, k_ptr, v_ptr, out_ptr, head_dim as i32, seq_q as i32, seq_k as i32, scale),
         )
         .map_err(|e| anyhow!("launch fused attention kernel failed: {e}"))?;
     }
@@ -654,9 +691,7 @@ fn fused_attention_forward(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Re
 
 #[cfg(not(feature = "bf16_u16"))]
 fn fused_attention_forward(_q: &Tensor, _k: &Tensor, _v: &Tensor, _scale: f32) -> Result<Tensor> {
-    Err(anyhow!(
-        "fused BF16 attention requires the bf16_u16 feature flag to be enabled"
-    ))
+    Err(anyhow!("fused BF16 attention requires the bf16_u16 feature flag to be enabled"))
 }
 
 #[cfg(feature = "bf16_u16")]
@@ -713,9 +748,8 @@ fn fused_ffn_forward(
     let device = proj.device().clone();
     ensure_fused_ffn_kernel(&device)?;
 
-    let proj_ptr = proj
-        .as_device_ptr_bf16("fused_ffn.proj")
-        .map_err(|e| anyhow!("{e}"))? as usize as sys::CUdeviceptr;
+    let proj_ptr = proj.as_device_ptr_bf16("fused_ffn.proj").map_err(|e| anyhow!("{e}"))? as usize
+        as sys::CUdeviceptr;
     let proj_bias_ptr = proj_bias
         .as_device_ptr_bf16("fused_ffn.proj_bias")
         .map_err(|e| anyhow!("{e}"))? as usize as sys::CUdeviceptr;
@@ -727,10 +761,9 @@ fn fused_ffn_forward(
         .map_err(|e| anyhow!("{e}"))? as usize as sys::CUdeviceptr;
 
     let mut out_ws = acquire_workspace_tensor(&device, DType::BF16, &[rows, hidden])?;
-    let out_ptr = out_ws
-        .tensor_mut()
-        .as_mut_device_ptr_bf16("fused_ffn.out")
-        .map_err(|e| anyhow!("{e}"))? as usize as sys::CUdeviceptr;
+    let out_ptr =
+        out_ws.tensor_mut().as_mut_device_ptr_bf16("fused_ffn.out").map_err(|e| anyhow!("{e}"))?
+            as usize as sys::CUdeviceptr;
 
     let threads = 128u32;
     let grid_x = rows as u32;
@@ -773,17 +806,12 @@ fn fused_ffn_forward(
     out_weight: &Tensor,
     out_bias: &Tensor,
 ) -> Result<Tensor> {
-    Err(anyhow!(
-        "fused BF16 FFN requires the bf16_u16 feature flag to be enabled"
-    ))
+    Err(anyhow!("fused BF16 FFN requires the bf16_u16 feature flag to be enabled"))
 }
 
 #[cfg(feature = "bf16_u16")]
 fn ensure_fused_ffn_kernel(device: &Arc<CudaDevice>) -> Result<()> {
-    if device
-        .get_func(FUSED_FFN_MODULE, FUSED_FFN_FUNC)
-        .is_some()
-    {
+    if device.get_func(FUSED_FFN_MODULE, FUSED_FFN_FUNC).is_some() {
         return Ok(());
     }
 
@@ -812,12 +840,7 @@ fn ensure_fused_ffn_kernel(device: &Arc<CudaDevice>) -> Result<()> {
         }
         ensured_default = true;
     }
-    if !ensured_default
-        && !opts
-            .include_paths
-            .iter()
-            .any(|p| p == "/usr/local/cuda/include")
-    {
+    if !ensured_default && !opts.include_paths.iter().any(|p| p == "/usr/local/cuda/include") {
         opts.include_paths.push("/usr/local/cuda/include".into());
     }
 
@@ -833,9 +856,7 @@ fn ensure_fused_ffn_kernel(device: &Arc<CudaDevice>) -> Result<()> {
 #[cfg(not(feature = "bf16_u16"))]
 #[allow(unused_variables)]
 fn ensure_fused_ffn_kernel(_device: &Arc<CudaDevice>) -> Result<()> {
-    Err(anyhow!(
-        "fused BF16 FFN requires the bf16_u16 feature flag to be enabled"
-    ))
+    Err(anyhow!("fused BF16 FFN requires the bf16_u16 feature flag to be enabled"))
 }
 
 fn record_kernel_stats(tag: &str, tensor: &Tensor, start: Option<Instant>) -> Result<()> {
@@ -848,9 +869,7 @@ fn record_kernel_stats(tag: &str, tensor: &Tensor, start: Option<Instant>) -> Re
     let max_abs = tensor_f32.abs()?.max_all()?;
 
     if !sum.is_finite() || !max_abs.is_finite() {
-        bail!(
-            "{tag}: detected non-finite values (sum={sum}, max|x|={max_abs})"
-        );
+        bail!("{tag}: detected non-finite values (sum={sum}, max|x|={max_abs})");
     }
 
     if let Some(start) = start {
@@ -951,9 +970,7 @@ fn ensure_bf16_tensor(tensor: Tensor, name: &str) -> Result<Tensor> {
     if tensor.dtype() == DType::BF16 {
         Ok(tensor)
     } else {
-        tensor
-            .to_dtype(DType::BF16)
-            .map_err(|e| anyhow!("failed to cast {name} to BF16: {e}"))
+        tensor.to_dtype(DType::BF16).map_err(|e| anyhow!("failed to cast {name} to BF16: {e}"))
     }
 }
 
@@ -1025,6 +1042,30 @@ pub struct SdxlBlockRuntime {
     heads: usize,
     head_dim: usize,
     pub raw_keys: Vec<String>,
+    attn_env: Option<AttnEnvOverrides>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AttnEnvOverrides {
+    chunk: AttnChunkConfig,
+    reuse: bool,
+    max_workspace_mb: usize,
+    min_free_mb: usize,
+}
+
+impl AttnEnvOverrides {
+    fn runtime_config(&self) -> AttnRuntimeConfig {
+        AttnRuntimeConfig {
+            reuse: self.reuse,
+            max_workspace_mb: self.max_workspace_mb,
+            min_free_mb: self.min_free_mb,
+        }
+    }
+
+    pub(crate) fn apply_to(&self, block: &mut SdxlBlockRuntime) {
+        let chunk_size = self.chunk.q_chunk.max(self.chunk.kv_chunk);
+        block.apply_attn_env(chunk_size, self.reuse, self.max_workspace_mb, self.min_free_mb);
+    }
 }
 
 impl SdxlBlockRuntime {
@@ -1197,7 +1238,74 @@ impl SdxlBlockRuntime {
             heads,
             head_dim,
             raw_keys: keys,
+            attn_env: None,
         })
+    }
+
+    fn enforce_attn_env(
+        &self,
+        env: &AttnEnvOverrides,
+        sample: &Tensor,
+        ctx: &Tensor,
+    ) -> Result<()> {
+        const MB_BYTES: usize = 1_048_576;
+        if !env.reuse {
+            bail!(
+                "SDXL streaming attention requires ATTN_CHUNK_REUSE=1 (set ATTN_CHUNK_REUSE=1)."
+            );
+        }
+
+        if env.max_workspace_mb > 0 {
+            let dims = sample.shape().dims().to_vec();
+            ensure!(
+                dims.len() == 4,
+                "SDXL block expects NHWC sample tensor, got {:?}",
+                dims
+            );
+            let ctx_dims = ctx.shape().dims().to_vec();
+            ensure!(
+                ctx_dims.len() == 3,
+                "SDXL block expects [B,T,C] context tensor, got {:?}",
+                ctx_dims
+            );
+
+            let b = dims[0] as usize;
+            let h = dims[1] as usize;
+            let w = dims[2] as usize;
+            let seq_q = h.saturating_mul(w).max(1);
+            let seq_k = ctx_dims[1] as usize;
+            let bh = b.saturating_mul(self.heads).max(1);
+            let q_len = env.chunk.q_chunk.max(1).min(seq_q);
+            let kv_len = env.chunk.kv_chunk.max(1).min(seq_k);
+            let workspace_bytes = bh
+                .saturating_mul(q_len)
+                .saturating_mul(kv_len)
+                .saturating_mul(4);
+            let workspace_mb = (workspace_bytes + MB_BYTES - 1) / MB_BYTES;
+            ensure!(
+                workspace_mb <= env.max_workspace_mb,
+                "SDXL streaming attention chunk (q_len={} kv_len={}) would require ~{} MB of workspace (> {} MB cap). Lower ATTN_CHUNK_SIZE or raise ATTN_MAX_WORKSPACE_MB.",
+                q_len,
+                kv_len,
+                workspace_mb,
+                env.max_workspace_mb
+            );
+        }
+
+        if env.min_free_mb > 0 {
+            let core_device = CoreDevice::from_flame_cuda(sample.device().as_ref());
+            let free_bytes = cuda_available_memory(&core_device)
+                .context("sdxl streaming attention: query available GPU memory")?;
+            let free_mb = free_bytes / MB_BYTES;
+            ensure!(
+                free_mb >= env.min_free_mb,
+                "SDXL streaming attention requires at least {} MB of free GPU memory (found {} MB). Reduce ATTN_CHUNK_SIZE or free additional memory.",
+                env.min_free_mb,
+                free_mb
+            );
+        }
+
+        Ok(())
     }
 
     pub fn forward_inference(
@@ -1208,7 +1316,33 @@ impl SdxlBlockRuntime {
         time_proj_1536: Option<&Tensor>,
     ) -> Result<Tensor> {
         let _ = time_proj_1536;
-        forward_block_inference(self, sample, encoder_hidden_states, driver_1280)
+        if let Some(env) = self.attn_env {
+            self.enforce_attn_env(&env, sample, encoder_hidden_states)?;
+            let runtime_cfg = env.runtime_config();
+            with_attn_runtime(runtime_cfg, || {
+                with_attn_chunks(env.chunk, || {
+                    forward_block_inference(self, sample, encoder_hidden_states, driver_1280)
+                })
+            })
+        } else {
+            forward_block_inference(self, sample, encoder_hidden_states, driver_1280)
+        }
+    }
+
+    pub fn apply_attn_env(
+        &mut self,
+        chunk_size: usize,
+        reuse: bool,
+        max_ws_mb: usize,
+        min_free_mb: usize,
+    ) {
+        let chunk = AttnChunkConfig { q_chunk: chunk_size, kv_chunk: chunk_size };
+        self.attn_env = Some(AttnEnvOverrides {
+            chunk,
+            reuse,
+            max_workspace_mb: max_ws_mb,
+            min_free_mb,
+        });
     }
 }
 
@@ -1233,7 +1367,17 @@ impl ExecutableBlock for SdxlBlockRuntime {
         time_proj_1536: Option<&Tensor>,
     ) -> Result<Tensor> {
         let _ = time_proj_1536; // reserved for future modulation
-        forward_block(self, sample, encoder_hidden_states, driver_1280)
+        if let Some(env) = self.attn_env {
+            self.enforce_attn_env(&env, sample, encoder_hidden_states)?;
+            let runtime_cfg = env.runtime_config();
+            with_attn_runtime(runtime_cfg, || {
+                with_attn_chunks(env.chunk, || {
+                    forward_block(self, sample, encoder_hidden_states, driver_1280)
+                })
+            })
+        } else {
+            forward_block(self, sample, encoder_hidden_states, driver_1280)
+        }
     }
 }
 
@@ -1432,7 +1576,10 @@ fn forward_block_inference(
     debug_assert_eq!(sample.dtype(), DType::BF16, "forward_block expects BF16 sample");
     let dims_raw = sample.shape().dims();
     if trace_verbose() {
-        eprintln!("[forward_block_infer] {} hidden {} sample {:?}", block.name, block.hidden, dims_raw);
+        eprintln!(
+            "[forward_block_infer] {} hidden {} sample {:?}",
+            block.name, block.hidden, dims_raw
+        );
     }
     if mem_trace_enabled() {
         let tag = format!("block {}:entry", block.name);
@@ -1947,18 +2094,12 @@ fn self_attention_inference(block: &SdxlBlockRuntime, x: &Tensor) -> Result<Tens
     #[cfg(feature = "bf16_u16")]
     if fused_attention_enabled() && use_full_seq {
         let bh = b * heads;
-        let q_flat = q
-            .permute(&[0, 2, 1, 3])?
-            .reshape(&[bh, seq, block.head_dim])?
-            .clone_result()?;
-        let k_flat = k
-            .permute(&[0, 2, 1, 3])?
-            .reshape(&[bh, seq_k, block.head_dim])?
-            .clone_result()?;
-        let v_flat = v
-            .permute(&[0, 2, 1, 3])?
-            .reshape(&[bh, seq_k, block.head_dim])?
-            .clone_result()?;
+        let q_flat =
+            q.permute(&[0, 2, 1, 3])?.reshape(&[bh, seq, block.head_dim])?.clone_result()?;
+        let k_flat =
+            k.permute(&[0, 2, 1, 3])?.reshape(&[bh, seq_k, block.head_dim])?.clone_result()?;
+        let v_flat =
+            v.permute(&[0, 2, 1, 3])?.reshape(&[bh, seq_k, block.head_dim])?.clone_result()?;
 
         let fused_start = if kernel_debug { Some(Instant::now()) } else { None };
         match fused_attention_forward(&q_flat, &k_flat, &v_flat, scale) {
@@ -2045,7 +2186,8 @@ fn self_attention_inference(block: &SdxlBlockRuntime, x: &Tensor) -> Result<Tens
         while start < seq {
             let len = q_chunk.min(seq - start);
             let q_chunk_tensor = q.narrow(2, start, len)?.clone_result()?;
-            let out = sdpa_chunked_bf16("self_attn", &q_chunk_tensor, &k, &v, scale, len, kv_chunk)?;
+            let out =
+                sdpa_chunked_bf16("self_attn", &q_chunk_tensor, &k, &v, scale, len, kv_chunk)?;
             outputs.push(out);
             start += len;
             if mem_trace_enabled() {
@@ -2101,18 +2243,12 @@ fn cross_attention_inference(block: &SdxlBlockRuntime, x: &Tensor, ctx: &Tensor)
     #[cfg(feature = "bf16_u16")]
     if fused_attention_enabled() && use_full_seq {
         let bh = b * heads;
-        let q_flat = q
-            .permute(&[0, 2, 1, 3])?
-            .reshape(&[bh, seq, block.head_dim])?
-            .clone_result()?;
-        let k_flat = k
-            .permute(&[0, 2, 1, 3])?
-            .reshape(&[bh, seq_k, block.head_dim])?
-            .clone_result()?;
-        let v_flat = v
-            .permute(&[0, 2, 1, 3])?
-            .reshape(&[bh, seq_k, block.head_dim])?
-            .clone_result()?;
+        let q_flat =
+            q.permute(&[0, 2, 1, 3])?.reshape(&[bh, seq, block.head_dim])?.clone_result()?;
+        let k_flat =
+            k.permute(&[0, 2, 1, 3])?.reshape(&[bh, seq_k, block.head_dim])?.clone_result()?;
+        let v_flat =
+            v.permute(&[0, 2, 1, 3])?.reshape(&[bh, seq_k, block.head_dim])?.clone_result()?;
 
         let fused_start = if kernel_debug { Some(Instant::now()) } else { None };
         match fused_attention_forward(&q_flat, &k_flat, &v_flat, scale) {
@@ -2188,7 +2324,10 @@ fn cross_attention_inference(block: &SdxlBlockRuntime, x: &Tensor, ctx: &Tensor)
             sdpa_chunked_bf16("cross_attn", &q, &k, &v, scale, q_chunk, kv_chunk)?
         }
     } else {
-        if fused_attention_enabled() && seq <= CHUNK_SMALL_SEQ_GUARD && seq_k <= CHUNK_SMALL_SEQ_GUARD {
+        if fused_attention_enabled()
+            && seq <= CHUNK_SMALL_SEQ_GUARD
+            && seq_k <= CHUNK_SMALL_SEQ_GUARD
+        {
             bail!(
                 "chunk fallback entered for cross-attention at seq={} seq_k={} head_dim={} with SDXL_FUSED_ATTENTION=1",
                 seq,
@@ -2207,7 +2346,8 @@ fn cross_attention_inference(block: &SdxlBlockRuntime, x: &Tensor, ctx: &Tensor)
         while start < seq {
             let len = q_chunk.min(seq - start);
             let q_chunk_tensor = q.narrow(2, start, len)?.clone_result()?;
-            let out = sdpa_chunked_bf16("cross_attn", &q_chunk_tensor, &k, &v, scale, len, kv_chunk)?;
+            let out =
+                sdpa_chunked_bf16("cross_attn", &q_chunk_tensor, &k, &v, scale, len, kv_chunk)?;
             outputs.push(out);
             start += len;
             if mem_trace_enabled() {
@@ -2302,7 +2442,10 @@ fn self_attention(block: &SdxlBlockRuntime, x: &Tensor) -> Result<Tensor> {
             sdpa_chunked_bf16("self_attn", &q, &k, &v, scale, q_chunk, kv_chunk)?
         }
     } else {
-        if fused_attention_enabled() && seq <= CHUNK_SMALL_SEQ_GUARD && seq_k <= CHUNK_SMALL_SEQ_GUARD {
+        if fused_attention_enabled()
+            && seq <= CHUNK_SMALL_SEQ_GUARD
+            && seq_k <= CHUNK_SMALL_SEQ_GUARD
+        {
             bail!(
                 "chunk fallback entered for self-attention at seq={} seq_k={} head_dim={} with SDXL_FUSED_ATTENTION=1",
                 seq,
@@ -2505,9 +2648,7 @@ fn feed_forward_fused(block: &SdxlBlockRuntime, x: &Tensor) -> Result<Tensor> {
 
 #[cfg(not(feature = "bf16_u16"))]
 fn feed_forward_fused(_block: &SdxlBlockRuntime, _x: &Tensor) -> Result<Tensor> {
-    Err(anyhow!(
-        "fused BF16 FFN requires the bf16_u16 feature flag to be enabled"
-    ))
+    Err(anyhow!("fused BF16 FFN requires the bf16_u16 feature flag to be enabled"))
 }
 
 fn feed_forward(block: &SdxlBlockRuntime, x: &Tensor) -> Result<Tensor> {
@@ -2611,8 +2752,7 @@ fn sdpa_full_attn_bf16(
     let device = q_flat.device().clone();
     let bh = b * heads;
     let k_t = k_flat.transpose_dims(1, 2)?.clone_result()?;
-    let mut logits_ws =
-        acquire_workspace_tensor(&device, DType::BF16, &[bh, seq_q, seq_k])?;
+    let mut logits_ws = acquire_workspace_tensor(&device, DType::BF16, &[bh, seq_q, seq_k])?;
     {
         let logits_buf = logits_ws.tensor_mut();
         bmm_bf16_fp32acc_out(q_flat, &k_t, logits_buf, false, false)?;
@@ -2626,8 +2766,7 @@ fn sdpa_full_attn_bf16(
 
     let exp_bf16 = exp_logits.to_dtype(DType::BF16)?;
     let v_bf16 = v_flat.to_dtype(DType::BF16)?;
-    let mut out_ws =
-        acquire_workspace_tensor(&device, DType::BF16, &[bh, seq_q, head_dim])?;
+    let mut out_ws = acquire_workspace_tensor(&device, DType::BF16, &[bh, seq_q, head_dim])?;
     {
         let out_chunk = out_ws.tensor_mut();
         bmm_bf16_fp32acc_out(&exp_bf16, &v_bf16, out_chunk, false, false)?;
@@ -2637,10 +2776,7 @@ fn sdpa_full_attn_bf16(
     let normed = out.div(&denom)?;
     let result = normed.to_dtype(DType::BF16)?;
     if trace_verbose() {
-        eprintln!(
-            "[attn_fallback] {tag} full-seq path bh={} seq_q={} seq_k={}",
-            bh, seq_q, seq_k
-        );
+        eprintln!("[attn_fallback] {tag} full-seq path bh={} seq_q={} seq_k={}", bh, seq_q, seq_k);
     }
     result.reshape(&[b, heads, seq_q, head_dim]).map_err(Into::into)
 }
@@ -2672,9 +2808,7 @@ fn sdpa_full_attn_bf16(
             bh, seq_q, seq_k
         );
     }
-    ctx.to_dtype(DType::BF16)?
-        .reshape(&[b, heads, seq_q, head_dim])
-        .map_err(Into::into)
+    ctx.to_dtype(DType::BF16)?.reshape(&[b, heads, seq_q, head_dim]).map_err(Into::into)
 }
 
 fn sdpa_chunked_bf16(
@@ -2686,6 +2820,7 @@ fn sdpa_chunked_bf16(
     q_chunk: usize,
     kv_chunk: usize,
 ) -> Result<Tensor> {
+    const MB_BYTES: u128 = 1_048_576;
     let dims = q.shape().dims().to_vec();
     ensure!(dims.len() == 4, "sdpa_chunked expects [B,H,SEQ,D], got {:?}", dims);
     let b = dims[0] as usize;
@@ -2700,6 +2835,25 @@ fn sdpa_chunked_bf16(
     let base_kv_chunk = effective_chunk_len(seq_k, kv_chunk);
 
     let device = q.device().clone();
+    let runtime_cfg = current_attn_runtime();
+    if let Some(env) = runtime_cfg {
+        if !env.reuse {
+            bail!("SDXL streaming attention requires ATTN_CHUNK_REUSE=1 (set ATTN_CHUNK_REUSE=1).");
+        }
+        if env.min_free_mb > 0 {
+            let core_device = CoreDevice::from_flame_cuda(device.as_ref());
+            let free_bytes = cuda_available_memory(&core_device)
+                .context("sdxl streaming attention: query available GPU memory")?;
+            let free_mb = free_bytes / (MB_BYTES as usize);
+            ensure!(
+                free_mb >= env.min_free_mb,
+                "SDXL streaming attention requires at least {} MB of free GPU memory (found {} MB). \
+                 Reduce ATTN_CHUNK_SIZE or free additional memory.",
+                env.min_free_mb,
+                free_mb
+            );
+        }
+    }
     if trace_verbose() {
         eprintln!(
             "[attn_cfg] {tag} bh={} head_dim={} seq_q={} seq_k={} q_chunk={} base_kv_chunk={}",
@@ -2726,16 +2880,7 @@ fn sdpa_chunked_bf16(
 
     if q_chunk >= seq_q && base_kv_chunk >= seq_k {
         return sdpa_full_attn_bf16(
-            tag,
-            &q_flat,
-            &k_flat,
-            &v_flat,
-            scale,
-            b,
-            heads,
-            seq_q,
-            seq_k,
-            head_dim,
+            tag, &q_flat, &k_flat, &v_flat, scale, b, heads, seq_q, seq_k, head_dim,
         );
     }
 
@@ -2745,6 +2890,25 @@ fn sdpa_chunked_bf16(
         let q_len = q_chunk.min(seq_q - q_start);
         let q_slice = q_flat.narrow(1, q_start, q_len)?.clone_result()?;
         let kv_chunk = clamp_kv_chunk(bh, q_len, base_kv_chunk);
+        if let Some(env) = runtime_cfg {
+            if env.max_workspace_mb > 0 {
+                let workspace_bytes = (bh as u128)
+                    .saturating_mul(q_len as u128)
+                    .saturating_mul(kv_chunk as u128)
+                    .saturating_mul(4u128);
+                let workspace_mb =
+                    ((workspace_bytes + MB_BYTES - 1) / MB_BYTES) as usize;
+                ensure!(
+                    workspace_mb <= env.max_workspace_mb,
+                    "SDXL streaming attention chunk (q_len={}, kv_len={}) would require ~{} MB of workspace (> {} MB cap). \
+                     Lower ATTN_CHUNK_SIZE or raise ATTN_MAX_WORKSPACE_MB.",
+                    q_len,
+                    kv_chunk,
+                    workspace_mb,
+                    env.max_workspace_mb
+                );
+            }
+        }
         if trace_verbose() {
             eprintln!(
                 "[attn_chunk] {tag} q_start={} q_len={} kv_chunk={} bh={}",
@@ -2771,11 +2935,8 @@ fn sdpa_chunked_bf16(
             #[cfg(feature = "bf16_u16")]
             let mut logits = {
                 let k_t = k_slice.transpose_dims(1, 2)?.clone_result()?;
-                let mut logits_ws = acquire_workspace_tensor(
-                    &device,
-                    DType::BF16,
-                    &[bh, q_len, kv_len],
-                )?;
+                let mut logits_ws =
+                    acquire_workspace_tensor(&device, DType::BF16, &[bh, q_len, kv_len])?;
                 {
                     let logits_buf = logits_ws.tensor_mut();
                     bmm_bf16_fp32acc_out(&q_slice, &k_t, logits_buf, false, false)?;
@@ -2815,11 +2976,8 @@ fn sdpa_chunked_bf16(
             let attn_chunk = {
                 let exp_chunk_bf16 = exp_chunk.to_dtype(DType::BF16)?;
                 let v_bf16 = v_slice.to_dtype(DType::BF16)?;
-                let mut out_ws = acquire_workspace_tensor(
-                    &device,
-                    DType::BF16,
-                    &[bh, q_len, head_dim],
-                )?;
+                let mut out_ws =
+                    acquire_workspace_tensor(&device, DType::BF16, &[bh, q_len, head_dim])?;
                 {
                     let out_chunk = out_ws.tensor_mut();
                     bmm_bf16_fp32acc_out(&exp_chunk_bf16, &v_bf16, out_chunk, false, false)?;

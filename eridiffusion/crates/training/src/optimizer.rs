@@ -6,6 +6,7 @@ use eridiffusion_core::{Error, Result};
 use flame_core::{DType, Tensor};
 use serde::{Deserialize, Serialize};
 
+use crate::tensor_utils::sum_all_bf16;
 /// Optimizer trait
 pub trait Optimizer: Send + Sync {
     /// Perform optimization step
@@ -71,6 +72,44 @@ pub fn clip_grads_global_norm_fp32_tensors(grads: &mut [Tensor], max_norm: f32) 
     for g in grads.iter() {
         let g32 = if g.dtype() != DType::F32 { g.to_dtype(DType::F32)? } else { g.clone() };
         let sq = g32.mul(&g32)?.sum()?.item()?;
+        total_sq += sq;
+    }
+    let global = total_sq.sqrt();
+    if global.is_finite() && global > max_norm {
+        let scale = max_norm / (global + 1e-6);
+        for gi in grads.iter_mut() {
+            *gi = gi.affine(scale as f32, 0.0f32)?;
+        }
+    }
+    Ok(global)
+}
+
+/// Compute global norm without dtype promotion and clip gradients in-place.
+pub fn clip_grads_global_norm_tensors(grads: &mut [Tensor], max_norm: f32) -> Result<f32> {
+    if grads.is_empty() || max_norm <= 0.0 || !max_norm.is_finite() {
+        let mut total: f32 = 0.0;
+        for g in grads.iter() {
+            let sq = g.mul(&g)?;
+            let sum = if sq.dtype() == DType::BF16 {
+                sum_all_bf16(&sq)?
+            } else {
+                sq.sum()?
+            };
+            let sq = sum.item()?;
+            total += sq;
+        }
+        return Ok(total.sqrt());
+    }
+
+    let mut total_sq: f32 = 0.0;
+    for g in grads.iter() {
+        let sq = g.mul(&g)?;
+        let sum = if sq.dtype() == DType::BF16 {
+            sum_all_bf16(&sq)?
+        } else {
+            sq.sum()?
+        };
+        let sq = sum.item()?;
         total_sq += sq;
     }
     let global = total_sq.sqrt();
@@ -166,8 +205,8 @@ impl AdamOptimizer {
         let mut v = Vec::new();
 
         for param in params {
-            m.push(Tensor::zeros_like(param)?);
-            v.push(Tensor::zeros_like(param)?);
+            m.push(param.zeros_like_with_dtype(param.dtype())?);
+            v.push(param.zeros_like_with_dtype(param.dtype())?);
         }
 
         Ok(Self { config, state: OptimizerState::new(), m, v })

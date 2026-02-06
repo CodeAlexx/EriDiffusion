@@ -117,9 +117,7 @@ impl UnifiedSampler {
         let text_encoders = text_encoders
             .downcast_mut::<super::sdxl_sampling::TextEncoders>()
             .ok_or_else(|| {
-                flame_core::Error::InvalidOperation(
-                    "Failed to downcast text encoders".to_string(),
-                )
+                flame_core::Error::InvalidOperation("Failed to downcast text encoders".to_string())
             })?;
 
         sampler.generate_samples(
@@ -233,7 +231,7 @@ pub enum ModelComponents<'a> {
         lora: Box<dyn std::any::Any>,             // LoRACollection
     },
     SD35 {
-        mmdit: Box<dyn Fn(&Tensor, &Tensor, &Tensor, &Tensor) -> Result<Tensor> + 'a>,
+        mmdit: Box<dyn Fn(&Tensor, &Tensor, &Tensor, Option<&Tensor>) -> Result<Tensor> + 'a>,
         vae: Box<dyn Fn(&Tensor) -> Result<Tensor> + 'a>,
         clip_l: Box<dyn Fn(&str) -> Result<(Tensor, Tensor)> + 'a>,
         clip_g: Box<dyn Fn(&str) -> Result<(Tensor, Tensor)> + 'a>,

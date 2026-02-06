@@ -166,39 +166,39 @@ impl VAEResNetBlock {
         }
 
         // Load norm1
-        let norm1_weight = weights.get(&format!("{}.norm1.weight", prefix)).ok_or_else(|| {
-            Error::InvalidOperation(format!("Missing {}.norm1.weight", prefix))
-        })?;
-        let norm1_bias = weights.get(&format!("{}.norm1.bias", prefix)).ok_or_else(|| {
-            Error::InvalidOperation(format!("Missing {}.norm1.bias", prefix))
-        })?;
+        let norm1_weight = weights
+            .get(&format!("{}.norm1.weight", prefix))
+            .ok_or_else(|| Error::InvalidOperation(format!("Missing {}.norm1.weight", prefix)))?;
+        let norm1_bias = weights
+            .get(&format!("{}.norm1.bias", prefix))
+            .ok_or_else(|| Error::InvalidOperation(format!("Missing {}.norm1.bias", prefix)))?;
         let norm1 = GroupNorm::new(norm1_weight.clone(), norm1_bias.clone(), 32)?;
 
         // Load conv1
-        let conv1_weight = weights.get(&format!("{}.conv1.weight", prefix)).ok_or_else(|| {
-            Error::InvalidOperation(format!("Missing {}.conv1.weight", prefix))
-        })?;
-        let conv1_bias = weights.get(&format!("{}.conv1.bias", prefix)).ok_or_else(|| {
-            Error::InvalidOperation(format!("Missing {}.conv1.bias", prefix))
-        })?;
+        let conv1_weight = weights
+            .get(&format!("{}.conv1.weight", prefix))
+            .ok_or_else(|| Error::InvalidOperation(format!("Missing {}.conv1.weight", prefix)))?;
+        let conv1_bias = weights
+            .get(&format!("{}.conv1.bias", prefix))
+            .ok_or_else(|| Error::InvalidOperation(format!("Missing {}.conv1.bias", prefix)))?;
         let conv1 = Conv2d::new(conv1_weight.clone(), Some(conv1_bias.clone()), 1);
 
         // Load norm2
-        let norm2_weight = weights.get(&format!("{}.norm2.weight", prefix)).ok_or_else(|| {
-            Error::InvalidOperation(format!("Missing {}.norm2.weight", prefix))
-        })?;
-        let norm2_bias = weights.get(&format!("{}.norm2.bias", prefix)).ok_or_else(|| {
-            Error::InvalidOperation(format!("Missing {}.norm2.bias", prefix))
-        })?;
+        let norm2_weight = weights
+            .get(&format!("{}.norm2.weight", prefix))
+            .ok_or_else(|| Error::InvalidOperation(format!("Missing {}.norm2.weight", prefix)))?;
+        let norm2_bias = weights
+            .get(&format!("{}.norm2.bias", prefix))
+            .ok_or_else(|| Error::InvalidOperation(format!("Missing {}.norm2.bias", prefix)))?;
         let norm2 = GroupNorm::new(norm2_weight.clone(), norm2_bias.clone(), 32)?;
 
         // Load conv2
-        let conv2_weight = weights.get(&format!("{}.conv2.weight", prefix)).ok_or_else(|| {
-            Error::InvalidOperation(format!("Missing {}.conv2.weight", prefix))
-        })?;
-        let conv2_bias = weights.get(&format!("{}.conv2.bias", prefix)).ok_or_else(|| {
-            Error::InvalidOperation(format!("Missing {}.conv2.bias", prefix))
-        })?;
+        let conv2_weight = weights
+            .get(&format!("{}.conv2.weight", prefix))
+            .ok_or_else(|| Error::InvalidOperation(format!("Missing {}.conv2.weight", prefix)))?;
+        let conv2_bias = weights
+            .get(&format!("{}.conv2.bias", prefix))
+            .ok_or_else(|| Error::InvalidOperation(format!("Missing {}.conv2.bias", prefix)))?;
         let conv2 = Conv2d::new(conv2_weight.clone(), Some(conv2_bias.clone()), 1);
 
         // Load conv_shortcut if needed
@@ -248,9 +248,9 @@ impl VAEResNetBlock {
 
 impl VAEAttentionBlock {
     fn new(weights: &HashMap<String, Tensor>, prefix: &str) -> flame_core::Result<Self> {
-        let norm_weight = weights.get(&format!("{}.norm.weight", prefix)).ok_or_else(|| {
-            Error::InvalidOperation(format!("Missing {}.norm.weight", prefix))
-        })?;
+        let norm_weight = weights
+            .get(&format!("{}.norm.weight", prefix))
+            .ok_or_else(|| Error::InvalidOperation(format!("Missing {}.norm.weight", prefix)))?;
         let norm_bias = weights
             .get(&format!("{}.norm.bias", prefix))
             .ok_or_else(|| Error::InvalidOperation(format!("Missing {}.norm.bias", prefix)))?;
@@ -284,9 +284,9 @@ impl VAEAttentionBlock {
             weights.get(&format!("{}.proj_out.weight", prefix)).ok_or_else(|| {
                 Error::InvalidOperation(format!("Missing {}.proj_out.weight", prefix))
             })?;
-        let proj_out_bias = weights.get(&format!("{}.proj_out.bias", prefix)).ok_or_else(|| {
-            Error::InvalidOperation(format!("Missing {}.proj_out.bias", prefix))
-        })?;
+        let proj_out_bias = weights
+            .get(&format!("{}.proj_out.bias", prefix))
+            .ok_or_else(|| Error::InvalidOperation(format!("Missing {}.proj_out.bias", prefix)))?;
         let proj_out = Conv2d::new(proj_out_weight.clone(), Some(proj_out_bias.clone()), 0);
 
         Ok(Self { norm, q, k, v, proj_out })
@@ -537,16 +537,12 @@ impl SDXLVAENative {
         let encoder_conv_in = Conv2d::new(
             weights
                 .get("encoder.conv_in.weight")
-                .ok_or_else(|| {
-                    Error::InvalidOperation("Missing encoder.conv_in.weight".into())
-                })?
+                .ok_or_else(|| Error::InvalidOperation("Missing encoder.conv_in.weight".into()))?
                 .clone(),
             Some(
                 weights
                     .get("encoder.conv_in.bias")
-                    .ok_or_else(|| {
-                        Error::InvalidOperation("Missing encoder.conv_in.bias".into())
-                    })?
+                    .ok_or_else(|| Error::InvalidOperation("Missing encoder.conv_in.bias".into()))?
                     .clone(),
             ),
             1,
@@ -577,15 +573,11 @@ impl SDXLVAENative {
         let encoder_norm_out = GroupNorm::new(
             weights
                 .get("encoder.norm_out.weight")
-                .ok_or_else(|| {
-                    Error::InvalidOperation("Missing encoder.norm_out.weight".into())
-                })?
+                .ok_or_else(|| Error::InvalidOperation("Missing encoder.norm_out.weight".into()))?
                 .clone(),
             weights
                 .get("encoder.norm_out.bias")
-                .ok_or_else(|| {
-                    Error::InvalidOperation("Missing encoder.norm_out.bias".into())
-                })?
+                .ok_or_else(|| Error::InvalidOperation("Missing encoder.norm_out.bias".into()))?
                 .clone(),
             32,
         )?;
@@ -593,16 +585,12 @@ impl SDXLVAENative {
         let encoder_conv_out = Conv2d::new(
             weights
                 .get("encoder.conv_out.weight")
-                .ok_or_else(|| {
-                    Error::InvalidOperation("Missing encoder.conv_out.weight".into())
-                })?
+                .ok_or_else(|| Error::InvalidOperation("Missing encoder.conv_out.weight".into()))?
                 .clone(),
             Some(
                 weights
                     .get("encoder.conv_out.bias")
-                    .ok_or_else(|| {
-                        Error::InvalidOperation("Missing encoder.conv_out.bias".into())
-                    })?
+                    .ok_or_else(|| Error::InvalidOperation("Missing encoder.conv_out.bias".into()))?
                     .clone(),
             ),
             1,
@@ -612,16 +600,12 @@ impl SDXLVAENative {
         let quant_conv = Conv2d::new(
             weights
                 .get("quant_conv.weight")
-                .ok_or_else(|| {
-                    Error::InvalidOperation("Missing quant_conv.weight".into())
-                })?
+                .ok_or_else(|| Error::InvalidOperation("Missing quant_conv.weight".into()))?
                 .clone(),
             Some(
                 weights
                     .get("quant_conv.bias")
-                    .ok_or_else(|| {
-                        Error::InvalidOperation("Missing quant_conv.bias".into())
-                    })?
+                    .ok_or_else(|| Error::InvalidOperation("Missing quant_conv.bias".into()))?
                     .clone(),
             ),
             0,
@@ -630,16 +614,12 @@ impl SDXLVAENative {
         let post_quant_conv = Conv2d::new(
             weights
                 .get("post_quant_conv.weight")
-                .ok_or_else(|| {
-                    Error::InvalidOperation("Missing post_quant_conv.weight".into())
-                })?
+                .ok_or_else(|| Error::InvalidOperation("Missing post_quant_conv.weight".into()))?
                 .clone(),
             Some(
                 weights
                     .get("post_quant_conv.bias")
-                    .ok_or_else(|| {
-                        Error::InvalidOperation("Missing post_quant_conv.bias".into())
-                    })?
+                    .ok_or_else(|| Error::InvalidOperation("Missing post_quant_conv.bias".into()))?
                     .clone(),
             ),
             0,
@@ -649,16 +629,12 @@ impl SDXLVAENative {
         let decoder_conv_in = Conv2d::new(
             weights
                 .get("decoder.conv_in.weight")
-                .ok_or_else(|| {
-                    Error::InvalidOperation("Missing decoder.conv_in.weight".into())
-                })?
+                .ok_or_else(|| Error::InvalidOperation("Missing decoder.conv_in.weight".into()))?
                 .clone(),
             Some(
                 weights
                     .get("decoder.conv_in.bias")
-                    .ok_or_else(|| {
-                        Error::InvalidOperation("Missing decoder.conv_in.bias".into())
-                    })?
+                    .ok_or_else(|| Error::InvalidOperation("Missing decoder.conv_in.bias".into()))?
                     .clone(),
             ),
             1,
@@ -690,15 +666,11 @@ impl SDXLVAENative {
         let decoder_norm_out = GroupNorm::new(
             weights
                 .get("decoder.norm_out.weight")
-                .ok_or_else(|| {
-                    Error::InvalidOperation("Missing decoder.norm_out.weight".into())
-                })?
+                .ok_or_else(|| Error::InvalidOperation("Missing decoder.norm_out.weight".into()))?
                 .clone(),
             weights
                 .get("decoder.norm_out.bias")
-                .ok_or_else(|| {
-                    Error::InvalidOperation("Missing decoder.norm_out.bias".into())
-                })?
+                .ok_or_else(|| Error::InvalidOperation("Missing decoder.norm_out.bias".into()))?
                 .clone(),
             32,
         )?;
@@ -706,16 +678,12 @@ impl SDXLVAENative {
         let decoder_conv_out = Conv2d::new(
             weights
                 .get("decoder.conv_out.weight")
-                .ok_or_else(|| {
-                    Error::InvalidOperation("Missing decoder.conv_out.weight".into())
-                })?
+                .ok_or_else(|| Error::InvalidOperation("Missing decoder.conv_out.weight".into()))?
                 .clone(),
             Some(
                 weights
                     .get("decoder.conv_out.bias")
-                    .ok_or_else(|| {
-                        Error::InvalidOperation("Missing decoder.conv_out.bias".into())
-                    })?
+                    .ok_or_else(|| Error::InvalidOperation("Missing decoder.conv_out.bias".into()))?
                     .clone(),
             ),
             1,

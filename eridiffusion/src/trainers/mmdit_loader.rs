@@ -1,45 +1,13 @@
-use super::rms_norm_patch::{rms_norm, RmsNorm};
-use crate::loaders::WeightLoader;
+use super::rms_norm_patch::rms_norm;
+use crate::loaders::{load_mmdit_weights, WeightLoader};
 use crate::models::mmdit_blocks::MMDiT as ActualMMDiT;
-use crate::ops::Linear;
-use anyhow::{anyhow, Context};
 use flame_core::device::Device;
-use flame_core::optimizers::{Adam, SGD};
 use flame_core::Result;
-use flame_core::{DType, Shape, Tensor};
-use std::collections::HashMap;
-
-// PrefixedWeightLoader is imported from crate::loaders
-use crate::loaders::PrefixedWeightLoader;
-
-// TimestepEmbedding for processing timesteps
-struct TimestepEmbedding {
-    linear_1: Linear,
-    linear_2: Linear,
-}
-
-impl TimestepEmbedding {
-    fn new(time_embed_dim: usize, out_dim: usize, device: &Device) -> flame_core::Result<Self> {
-        Ok(Self {
-            linear_1: Linear::new(time_embed_dim, out_dim, true, &device.cuda_device())?,
-            linear_2: Linear::new(out_dim, out_dim, true, &device.cuda_device())?,
-        })
-    }
-
-    fn forward(&self, timestep: &Tensor) -> flame_core::Result<Tensor> {
-        // Convert timestep to sinusoidal embeddings
-        let timesteps = get_timestep_embedding(timestep, 256)?;
-        // MLP projection
-        let emb = self.linear_1.forward(&timesteps)?;
-        let emb = emb.silu()?;
-        self.linear_2.forward(&emb)
-    }
-}
+use flame_core::{DType, Tensor};
 
 // MMDiT wrapper with actual implementation
 pub struct MMDiT {
     inner: ActualMMDiT,
-    time_embed: TimestepEmbedding,
     device: Device,
 }
 
@@ -73,14 +41,18 @@ pub fn load_mmdit_with_gpu_rms_norm(
     // First verify our GPU RMS norm works
     // verify_gpu_rms_norm()?; // Function doesn't exist
 
+    let meta = wl.infer_mmdit_metadata();
+    let mut config = config.clone();
+    config.qk_norm = meta.qk_norm;
+    config.x_self_attn_layers = meta.x_self_attn_layers;
+
     // Create the actual MMDiT
-    let cond_dim = 4096; // T5-XXL conditioning dimension
-    let inner = ActualMMDiT::new(config.clone(), cond_dim, device)?;
+    config.context_dim = 4096;
+    config.pooled_dim = Some(2048);
+    let mut inner = ActualMMDiT::new(config, device)?;
+    load_mmdit_weights(&mut inner, &wl)?;
 
-    // Create timestep embedding
-    let time_embed = TimestepEmbedding::new(256, config.hidden_size, device)?;
-
-    let mmdit = MMDiT { inner, time_embed, device: device.clone() };
+    let mmdit = MMDiT { inner, device: device.clone() };
 
     Ok(mmdit)
 }
@@ -99,21 +71,9 @@ impl MMDiT {
         // Set a thread-local flag to use our RMS norm;
         std::env::set_var("CANDLE_USE_GPU_RMS_NORM", "1");
 
-        // Process timestep embedding
-        let time_emb = self.time_embed.forward(t)?;
-
-        // Create position embeddings (placeholder for now)
-        let batch_size = x.shape().dims()[0];
-        let seq_len = x.shape().dims()[1];
-        let positions =
-            Tensor::arange(0.0, seq_len as f32, 1.0, self.device.cuda_device().clone())?
-                .unsqueeze(0)?
-                .expand(&[batch_size, seq_len])?;
-
-        // Call the inner MMDiT forward pass
-        let (output, _) = self.inner.forward(x, context, &time_emb, &positions)?;
-
-        Ok(output)
+        let _ = skip_layers;
+        let pooled = if y.shape().elem_count() == 0 { None } else { Some(y) };
+        self.inner.forward(x, t, context, pooled)
     }
 }
 
@@ -135,18 +95,6 @@ impl MMDiTWrapper {
 }
 
 /// Generate sinusoidal timestep embeddings
-fn get_timestep_embedding(timesteps: &Tensor, embedding_dim: usize) -> flame_core::Result<Tensor> {
-    let device = Device::from(timesteps.device().clone());
-    let half_dim = embedding_dim / 2;
-    let emb = (0..half_dim).map(|i| -(i as f32 * 2.0 / embedding_dim as f32)).collect::<Vec<_>>();
-    let emb = Tensor::from_vec(emb, Shape::from_dims(&[half_dim]), device.cuda_device().clone())?;
-    let emb = emb.mul_scalar(10000f32.ln())?.exp()?;
-    let emb = timesteps.unsqueeze(1)?.mul(&emb.unsqueeze(0)?)?;
-    let sin = emb.sin()?;
-    let cos = emb.cos()?;
-    Tensor::cat(&[&sin, &cos], 1)
-}
-
 pub fn monkey_patch_rms_norm() -> flame_core::Result<()> {
     use std::sync::Once;
     static PATCH_ONCE: Once = Once::new();

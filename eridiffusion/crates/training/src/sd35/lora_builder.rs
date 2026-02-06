@@ -44,11 +44,7 @@ pub struct Sd35LoraPolicy<'a> {
 
 impl<'a> Default for Sd35LoraPolicy<'a> {
     fn default() -> Self {
-        Self {
-            targets: &[],
-            head_targets: &[],
-            zero_init_b: true,
-        }
+        Self { targets: &[], head_targets: &[], zero_init_b: true }
     }
 }
 
@@ -81,16 +77,11 @@ fn create_lora(
         return Err(Error::Config("LoRA rank must be >0".into()));
     }
     let scale = (1.0f32 / rank.max(1) as f32).sqrt();
-    let a_t = Tensor::randn(
-        Shape::from_dims(&[in_dim, rank]),
-        0.0,
-        scale,
-        dev.cuda_device_arc(),
-    )
-    .map_err(Error::from)?
-    .to_dtype(DType::BF16)
-    .map_err(Error::from)?
-    .requires_grad_(true);
+    let a_t = Tensor::randn(Shape::from_dims(&[in_dim, rank]), 0.0, scale, dev.cuda_device_arc())
+        .map_err(Error::from)?
+        .to_dtype(DType::BF16)
+        .map_err(Error::from)?
+        .requires_grad_(true);
 
     let b_shape = Shape::from_dims(&[rank, out_dim]);
     let b_t = if zero_init_b {
@@ -104,12 +95,7 @@ fn create_lora(
     .requires_grad_(true);
 
     Ok((
-        LoRALinear {
-            a: Parameter::new(a_t),
-            b: Parameter::new(b_t),
-            rank,
-            alpha,
-        },
+        LoRALinear { a: Parameter::new(a_t), b: Parameter::new(b_t), rank, alpha },
         in_dim,
         out_dim,
     ))
@@ -166,14 +152,8 @@ pub fn build_sd35_loras(
     for block in 0..BLOCK_COUNT {
         let prefix = format!("block{block}.");
         if want_q {
-            let (lora, in_d, out_d) = create_lora(
-                &device,
-                HIDDEN_DIM,
-                HIDDEN_DIM,
-                rank,
-                alpha,
-                policy.zero_init_b,
-            )?;
+            let (lora, in_d, out_d) =
+                create_lora(&device, HIDDEN_DIM, HIDDEN_DIM, rank, alpha, policy.zero_init_b)?;
             register_adapter(
                 &mut adapters,
                 &mut index,
@@ -185,14 +165,8 @@ pub fn build_sd35_loras(
             );
         }
         if want_k {
-            let (lora, in_d, out_d) = create_lora(
-                &device,
-                HIDDEN_DIM,
-                HIDDEN_DIM,
-                rank,
-                alpha,
-                policy.zero_init_b,
-            )?;
+            let (lora, in_d, out_d) =
+                create_lora(&device, HIDDEN_DIM, HIDDEN_DIM, rank, alpha, policy.zero_init_b)?;
             register_adapter(
                 &mut adapters,
                 &mut index,
@@ -204,14 +178,8 @@ pub fn build_sd35_loras(
             );
         }
         if want_v {
-            let (lora, in_d, out_d) = create_lora(
-                &device,
-                HIDDEN_DIM,
-                HIDDEN_DIM,
-                rank,
-                alpha,
-                policy.zero_init_b,
-            )?;
+            let (lora, in_d, out_d) =
+                create_lora(&device, HIDDEN_DIM, HIDDEN_DIM, rank, alpha, policy.zero_init_b)?;
             register_adapter(
                 &mut adapters,
                 &mut index,
@@ -223,14 +191,8 @@ pub fn build_sd35_loras(
             );
         }
         if want_o {
-            let (lora, in_d, out_d) = create_lora(
-                &device,
-                HIDDEN_DIM,
-                HIDDEN_DIM,
-                rank,
-                alpha,
-                policy.zero_init_b,
-            )?;
+            let (lora, in_d, out_d) =
+                create_lora(&device, HIDDEN_DIM, HIDDEN_DIM, rank, alpha, policy.zero_init_b)?;
             register_adapter(
                 &mut adapters,
                 &mut index,
@@ -242,14 +204,8 @@ pub fn build_sd35_loras(
             );
         }
         if want_fc1 {
-            let (lora, in_d, out_d) = create_lora(
-                &device,
-                HIDDEN_DIM,
-                EXPANDED_DIM,
-                rank,
-                alpha,
-                policy.zero_init_b,
-            )?;
+            let (lora, in_d, out_d) =
+                create_lora(&device, HIDDEN_DIM, EXPANDED_DIM, rank, alpha, policy.zero_init_b)?;
             register_adapter(
                 &mut adapters,
                 &mut index,
@@ -261,14 +217,8 @@ pub fn build_sd35_loras(
             );
         }
         if want_fc2 {
-            let (lora, in_d, out_d) = create_lora(
-                &device,
-                EXPANDED_DIM,
-                HIDDEN_DIM,
-                rank,
-                alpha,
-                policy.zero_init_b,
-            )?;
+            let (lora, in_d, out_d) =
+                create_lora(&device, EXPANDED_DIM, HIDDEN_DIM, rank, alpha, policy.zero_init_b)?;
             register_adapter(
                 &mut adapters,
                 &mut index,
@@ -413,9 +363,5 @@ pub fn build_sd35_loras(
         );
     }
 
-    Ok(Sd35LoraBuild {
-        adapters,
-        index,
-        trainable_bytes: bytes,
-    })
+    Ok(Sd35LoraBuild { adapters, index, trainable_bytes: bytes })
 }

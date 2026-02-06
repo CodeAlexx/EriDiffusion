@@ -66,12 +66,12 @@ fn resnet_block(
     let h = h.silu()?;
 
     // First conv
-    let conv1_weight = weights.get(&format!("{}.in_layers.2.weight", prefix)).ok_or_else(|| {
-        flame_core::Error::InvalidOperation("Missing conv1 weight".into())
-    })?;
-    let conv1_bias = weights.get(&format!("{}.in_layers.2.bias", prefix)).ok_or_else(|| {
-        flame_core::Error::InvalidOperation("Missing conv1 bias".into())
-    })?;
+    let conv1_weight = weights
+        .get(&format!("{}.in_layers.2.weight", prefix))
+        .ok_or_else(|| flame_core::Error::InvalidOperation("Missing conv1 weight".into()))?;
+    let conv1_bias = weights
+        .get(&format!("{}.in_layers.2.bias", prefix))
+        .ok_or_else(|| flame_core::Error::InvalidOperation("Missing conv1 bias".into()))?;
 
     let h = conv2d(&h, conv1_weight, conv1_bias, 1, 1)?;
     println!("    Conv1 output shape: {:?}", h.shape());
@@ -92,26 +92,22 @@ fn resnet_block(
         let h = h.add(&time_proj)?;
 
         // Second norm + conv
-        let norm2_weight =
-            weights.get(&format!("{}.out_layers.0.weight", prefix)).ok_or_else(|| {
-                flame_core::Error::InvalidOperation("Missing norm2 weight".into())
-            })?;
-        let norm2_bias =
-            weights.get(&format!("{}.out_layers.0.bias", prefix)).ok_or_else(|| {
-                flame_core::Error::InvalidOperation("Missing norm2 bias".into())
-            })?;
+        let norm2_weight = weights
+            .get(&format!("{}.out_layers.0.weight", prefix))
+            .ok_or_else(|| flame_core::Error::InvalidOperation("Missing norm2 weight".into()))?;
+        let norm2_bias = weights
+            .get(&format!("{}.out_layers.0.bias", prefix))
+            .ok_or_else(|| flame_core::Error::InvalidOperation("Missing norm2 bias".into()))?;
 
         let h = group_norm_32(&h, 32, norm2_weight, norm2_bias)?;
         let h = h.silu()?;
 
-        let conv2_weight =
-            weights.get(&format!("{}.out_layers.3.weight", prefix)).ok_or_else(|| {
-                flame_core::Error::InvalidOperation("Missing conv2 weight".into())
-            })?;
-        let conv2_bias =
-            weights.get(&format!("{}.out_layers.3.bias", prefix)).ok_or_else(|| {
-                flame_core::Error::InvalidOperation("Missing conv2 bias".into())
-            })?;
+        let conv2_weight = weights
+            .get(&format!("{}.out_layers.3.weight", prefix))
+            .ok_or_else(|| flame_core::Error::InvalidOperation("Missing conv2 weight".into()))?;
+        let conv2_bias = weights
+            .get(&format!("{}.out_layers.3.bias", prefix))
+            .ok_or_else(|| flame_core::Error::InvalidOperation("Missing conv2 bias".into()))?;
 
         let h = conv2d(&h, conv2_weight, conv2_bias, 1, 1)?;
 
@@ -131,9 +127,7 @@ fn resnet_block(
                 })?;
             let skip_bias =
                 weights.get(&format!("{}.skip_connection.bias", prefix)).ok_or_else(|| {
-                    flame_core::Error::InvalidOperation(
-                        "Missing skip connection bias".to_string(),
-                    )
+                    flame_core::Error::InvalidOperation("Missing skip connection bias".to_string())
                 })?;
             conv2d(x, skip_weight, skip_bias, 1, 1)?
         } else {

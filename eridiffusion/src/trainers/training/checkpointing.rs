@@ -41,10 +41,7 @@ impl CheckpointManager {
         let checkpoint_dir = self.output_dir.join(format!("checkpoint-{}", step));
         std::fs::create_dir_all(&checkpoint_dir)
             .map_err(|e| {
-                flame_core::Error::InvalidOperation(format!(
-                    "Failed to create directory: {}",
-                    e
-                ))
+                flame_core::Error::InvalidOperation(format!("Failed to create directory: {}", e))
             })
             .map_err(|e| flame_core::Error::InvalidOperation(e.to_string()))?;
 
@@ -208,12 +205,10 @@ pub fn load_checkpoint(
 
     // Load metadata
     let metadata_path = checkpoint_path.join("metadata.json");
-    let metadata_str = std::fs::read_to_string(&metadata_path).map_err(|e| {
-        flame_core::Error::InvalidOperation(format!("Failed to read file: {}", e))
-    })?;
-    let metadata: CheckpointMetadata = serde_json::from_str(&metadata_str).map_err(|e| {
-        flame_core::Error::InvalidOperation(format!("Failed to parse JSON: {}", e))
-    })?;
+    let metadata_str = std::fs::read_to_string(&metadata_path)
+        .map_err(|e| flame_core::Error::InvalidOperation(format!("Failed to read file: {}", e)))?;
+    let metadata: CheckpointMetadata = serde_json::from_str(&metadata_str)
+        .map_err(|e| flame_core::Error::InvalidOperation(format!("Failed to parse JSON: {}", e)))?;
 
     Ok((lora_weights, metadata))
 }
@@ -247,10 +242,7 @@ fn save_optimizer_state(
         tensors.insert(
             name.clone(),
             TensorView::new(SafeDtype::F32, shape.clone(), data).map_err(|e| {
-                flame_core::Error::InvalidOperation(format!(
-                    "Failed to create TensorView: {}",
-                    e
-                ))
+                flame_core::Error::InvalidOperation(format!("Failed to create TensorView: {}", e))
             })?,
         );
     }
@@ -258,8 +250,7 @@ fn save_optimizer_state(
     let data = serialize(tensors, &None).map_err(|e| {
         flame_core::Error::InvalidOperation(format!("Failed to serialize tensors: {}", e))
     })?;
-    std::fs::write(path, data)
-        .map_err(|e| flame_core::Error::InvalidOperation(e.to_string()))?;
+    std::fs::write(path, data).map_err(|e| flame_core::Error::InvalidOperation(e.to_string()))?;
 
     Ok(())
 }

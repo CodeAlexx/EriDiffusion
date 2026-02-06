@@ -142,40 +142,44 @@ impl DoubleStreamBlockFixed {
             modulation.shape().dims()
         );
         // Extract layer norm weights
-        let img_norm1_weight = norm_weights.get("img_norm1.weight").ok_or(
-            flame_core::Error::InvalidOperation("Missing img_norm1.weight".into()),
-        )?;
+        let img_norm1_weight = norm_weights
+            .get("img_norm1.weight")
+            .ok_or(flame_core::Error::InvalidOperation("Missing img_norm1.weight".into()))?;
         let img_norm1_bias = norm_weights.get("img_norm1.bias").copied();
 
-        let txt_norm1_weight = norm_weights.get("txt_norm1.weight").ok_or(
-            flame_core::Error::InvalidOperation("Missing txt_norm1.weight".into()),
-        )?;
+        let txt_norm1_weight = norm_weights
+            .get("txt_norm1.weight")
+            .ok_or(flame_core::Error::InvalidOperation("Missing txt_norm1.weight".into()))?;
         let txt_norm1_bias = norm_weights.get("txt_norm1.bias").copied();
 
-        let img_norm2_weight = norm_weights.get("img_norm2.weight").ok_or(
-            flame_core::Error::InvalidOperation("Missing img_norm2.weight".into()),
-        )?;
+        let img_norm2_weight = norm_weights
+            .get("img_norm2.weight")
+            .ok_or(flame_core::Error::InvalidOperation("Missing img_norm2.weight".into()))?;
         let img_norm2_bias = norm_weights.get("img_norm2.bias").copied();
 
-        let txt_norm2_weight = norm_weights.get("txt_norm2.weight").ok_or(
-            flame_core::Error::InvalidOperation("Missing txt_norm2.weight".into()),
-        )?;
+        let txt_norm2_weight = norm_weights
+            .get("txt_norm2.weight")
+            .ok_or(flame_core::Error::InvalidOperation("Missing txt_norm2.weight".into()))?;
         let txt_norm2_bias = norm_weights.get("txt_norm2.bias").copied();
 
         // Step 1: Project modulation to get scale/shift parameters
-        let img_mod_weight = self.weights.get("img_mod.lin.weight").ok_or(
-            flame_core::Error::InvalidOperation("Missing img_mod.lin.weight".into()),
-        )?;
-        let img_mod_bias = self.weights.get("img_mod.lin.bias").ok_or(
-            flame_core::Error::InvalidOperation("Missing img_mod.lin.bias".into()),
-        )?;
+        let img_mod_weight = self
+            .weights
+            .get("img_mod.lin.weight")
+            .ok_or(flame_core::Error::InvalidOperation("Missing img_mod.lin.weight".into()))?;
+        let img_mod_bias = self
+            .weights
+            .get("img_mod.lin.bias")
+            .ok_or(flame_core::Error::InvalidOperation("Missing img_mod.lin.bias".into()))?;
 
-        let txt_mod_weight = self.weights.get("txt_mod.lin.weight").ok_or(
-            flame_core::Error::InvalidOperation("Missing txt_mod.lin.weight".into()),
-        )?;
-        let txt_mod_bias = self.weights.get("txt_mod.lin.bias").ok_or(
-            flame_core::Error::InvalidOperation("Missing txt_mod.lin.bias".into()),
-        )?;
+        let txt_mod_weight = self
+            .weights
+            .get("txt_mod.lin.weight")
+            .ok_or(flame_core::Error::InvalidOperation("Missing txt_mod.lin.weight".into()))?;
+        let txt_mod_bias = self
+            .weights
+            .get("txt_mod.lin.bias")
+            .ok_or(flame_core::Error::InvalidOperation("Missing txt_mod.lin.bias".into()))?;
 
         // Project modulation: [batch, mod_dim] -> [batch, 6 * hidden_size]
         let img_mod_params = modulation.matmul(&img_mod_weight.transpose()?)?.add(&img_mod_bias)?;
@@ -354,9 +358,7 @@ impl DoubleStreamBlockFixed {
                 img_gate_mlp_unsqueezed.expand(&[1, img_seq_len, self.hidden_size])?;
             mlp_out.reshape(&[shape[0], shape[1], self.hidden_size])?.mul(&img_gate_mlp_expanded)?
         } else {
-            return Err(flame_core::Error::InvalidOperation(
-                "Missing MLP weights".to_string(),
-            ));
+            return Err(flame_core::Error::InvalidOperation("Missing MLP weights".to_string()));
         };
 
         let txt_mlp = if let (Some(fc1_w), Some(fc2_w)) =
@@ -389,9 +391,7 @@ impl DoubleStreamBlockFixed {
                 txt_gate_mlp_unsqueezed.expand(&[1, txt_seq_len, self.hidden_size])?;
             mlp_out.reshape(&[shape[0], shape[1], self.hidden_size])?.mul(&txt_gate_mlp_expanded)?
         } else {
-            return Err(flame_core::Error::InvalidOperation(
-                "Missing MLP weights".to_string(),
-            ));
+            return Err(flame_core::Error::InvalidOperation("Missing MLP weights".to_string()));
         };
 
         // Final residual
@@ -511,12 +511,14 @@ impl SingleStreamBlockFixed {
         let norm2_bias = norm_weights.get("norm2.bias").copied();
 
         // Step 1: Project modulation to get scale/shift parameters
-        let mod_weight = self.weights.get("modulation.lin.weight").ok_or(
-            flame_core::Error::InvalidOperation("Missing modulation.lin.weight".into()),
-        )?;
-        let mod_bias = self.weights.get("modulation.lin.bias").ok_or(
-            flame_core::Error::InvalidOperation("Missing modulation.lin.bias".into()),
-        )?;
+        let mod_weight = self
+            .weights
+            .get("modulation.lin.weight")
+            .ok_or(flame_core::Error::InvalidOperation("Missing modulation.lin.weight".into()))?;
+        let mod_bias = self
+            .weights
+            .get("modulation.lin.bias")
+            .ok_or(flame_core::Error::InvalidOperation("Missing modulation.lin.bias".into()))?;
 
         // Project modulation: [batch, mod_dim] -> [batch, 6 * hidden_size]
         let mod_params = modulation.matmul(&mod_weight.transpose()?)?.add(&mod_bias)?;

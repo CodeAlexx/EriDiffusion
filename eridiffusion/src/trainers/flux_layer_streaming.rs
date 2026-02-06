@@ -421,12 +421,14 @@ impl FluxLayerStreamer {
         }
 
         // CRITICAL FIX: Use cached data instead of re-opening file!
-        let mmap = self.cached_mmap.as_ref().ok_or_else(|| {
-            flame_core::Error::InvalidOperation("Model file not cached!".into())
-        })?;
-        let tensor_info = self.cached_tensor_info.as_ref().ok_or_else(|| {
-            flame_core::Error::InvalidOperation("Tensor info not cached!".into())
-        })?;
+        let mmap = self
+            .cached_mmap
+            .as_ref()
+            .ok_or_else(|| flame_core::Error::InvalidOperation("Model file not cached!".into()))?;
+        let tensor_info = self
+            .cached_tensor_info
+            .as_ref()
+            .ok_or_else(|| flame_core::Error::InvalidOperation("Tensor info not cached!".into()))?;
 
         // Only print first time loading
         if self.loaded_layers_once.insert(layer_name.to_string()) {
@@ -919,22 +921,16 @@ impl FluxLayerStreamer {
 
         // Load time_in MLP weights
         let mlp0_weight = time_in_weights.get("time_in.in_layer.weight").ok_or(
-            flame_core::Error::InvalidOperation(
-                "time_in.in_layer.weight not found".to_string(),
-            ),
+            flame_core::Error::InvalidOperation("time_in.in_layer.weight not found".to_string()),
         )?;
-        let mlp0_bias = time_in_weights.get("time_in.in_layer.bias").ok_or(
-            flame_core::Error::InvalidOperation("time_in.in_layer.bias not found".into()),
-        )?;
+        let mlp0_bias = time_in_weights
+            .get("time_in.in_layer.bias")
+            .ok_or(flame_core::Error::InvalidOperation("time_in.in_layer.bias not found".into()))?;
         let mlp2_weight = time_in_weights.get("time_in.out_layer.weight").ok_or(
-            flame_core::Error::InvalidOperation(
-                "time_in.out_layer.weight not found".to_string(),
-            ),
+            flame_core::Error::InvalidOperation("time_in.out_layer.weight not found".to_string()),
         )?;
         let mlp2_bias = time_in_weights.get("time_in.out_layer.bias").ok_or(
-            flame_core::Error::InvalidOperation(
-                "time_in.out_layer.bias not found".to_string(),
-            ),
+            flame_core::Error::InvalidOperation("time_in.out_layer.bias not found".to_string()),
         )?;
 
         // Create timestep embeddings: MLP(sinusoidal_embed(timesteps) + pooled_clip)
@@ -1767,12 +1763,12 @@ impl StreamingFluxModel {
         let img_in_weights = self.streamer.load_layer("img_in")?;
         let txt_in_weights = self.streamer.load_layer("txt_in")?;
 
-        let img_in = img_in_weights.get("img_in.weight").ok_or(
-            flame_core::Error::InvalidOperation("img_in.weight not found".into()),
-        )?;
-        let txt_in = txt_in_weights.get("txt_in.weight").ok_or(
-            flame_core::Error::InvalidOperation("txt_in.weight not found".into()),
-        )?;
+        let img_in = img_in_weights
+            .get("img_in.weight")
+            .ok_or(flame_core::Error::InvalidOperation("img_in.weight not found".into()))?;
+        let txt_in = txt_in_weights
+            .get("txt_in.weight")
+            .ok_or(flame_core::Error::InvalidOperation("txt_in.weight not found".into()))?;
 
         // Project inputs: [B, C, H, W] -> [B, H*W, hidden_dim]
         let b = img.shape().dims()[0];
@@ -1797,22 +1793,16 @@ impl StreamingFluxModel {
         let time_in_weights = self.streamer.load_layer("time_in")?;
 
         let mlp0_weight = time_in_weights.get("time_in.in_layer.weight").ok_or(
-            flame_core::Error::InvalidOperation(
-                "time_in.in_layer.weight not found".to_string(),
-            ),
+            flame_core::Error::InvalidOperation("time_in.in_layer.weight not found".to_string()),
         )?;
-        let mlp0_bias = time_in_weights.get("time_in.in_layer.bias").ok_or(
-            flame_core::Error::InvalidOperation("time_in.in_layer.bias not found".into()),
-        )?;
+        let mlp0_bias = time_in_weights
+            .get("time_in.in_layer.bias")
+            .ok_or(flame_core::Error::InvalidOperation("time_in.in_layer.bias not found".into()))?;
         let mlp2_weight = time_in_weights.get("time_in.out_layer.weight").ok_or(
-            flame_core::Error::InvalidOperation(
-                "time_in.out_layer.weight not found".to_string(),
-            ),
+            flame_core::Error::InvalidOperation("time_in.out_layer.weight not found".to_string()),
         )?;
         let mlp2_bias = time_in_weights.get("time_in.out_layer.bias").ok_or(
-            flame_core::Error::InvalidOperation(
-                "time_in.out_layer.bias not found".to_string(),
-            ),
+            flame_core::Error::InvalidOperation("time_in.out_layer.bias not found".to_string()),
         )?;
 
         // Timestep embedding: MLP(timesteps)

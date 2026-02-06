@@ -10,7 +10,7 @@ serde = { version = "1.0", features = ["derive"] }
 safetensors = "0.4"
 thiserror = "1.0"
 
-flame-core = {path = "../../../../flame/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels"]}
+flame-core = {path = "/home/alex/EriDiffusion/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels"]}
 eridiffusion-common-weights = { path = "../../common/weights" }
 
 [dev-dependencies]

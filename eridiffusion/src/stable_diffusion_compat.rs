@@ -1,4 +1,4 @@
-use crate::models::clip::Config;
+use crate::models::text_encoder_complete::CLIPConfig as Config;
 use crate::models::text_encoder_complete::CLIPTextEncoder;
 use crate::models::vae_complete::AutoEncoderKL;
 use crate::models::{

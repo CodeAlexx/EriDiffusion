@@ -1,8 +1,8 @@
-use eridiffusion_core::Result;
-use eridiffusion_common_weights::strict_loader::StrictMmapLoader;
+use crate::sd35::keymap::Sd35KeyMap;
 use crate::sd35::{registry::LayerRegistry, weights::Sd35WeightProvider};
 use crate::streaming::{KeyMap, WeightProvider};
-use crate::sd35::keymap::Sd35KeyMap;
+use eridiffusion_common_weights::strict_loader::StrictMmapLoader;
+use eridiffusion_core::Result;
 use flame_core::Device as FlameDevice;
 use std::sync::Arc;
 

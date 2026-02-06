@@ -29,7 +29,7 @@ use crate::loaders::PrefixedWeightLoader;
 
 impl SDXLUNet2DConditionModel {
     pub fn from_weights(weights: HashMap<String, Tensor>, device: &Device) -> Result<Self> {
-        let wl = WeightLoader { weights, device: device.clone() };
+        let wl = WeightLoader::from_tensor_map(weights, device.clone());
         let config = SDXLConfig::default();
         Self::new(wl, config)
     }

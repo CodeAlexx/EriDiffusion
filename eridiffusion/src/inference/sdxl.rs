@@ -156,10 +156,7 @@ impl SDXLInference {
         })?;
         let tokenizer2 =
             Tokenizer::from_file(config.tokenizer2_path.as_ref().unwrap()).map_err(|e| {
-                flame_core::Error::InvalidOperation(format!(
-                    "Failed to load tokenizer2: {}",
-                    e
-                ))
+                flame_core::Error::InvalidOperation(format!("Failed to load tokenizer2: {}", e))
             })?;
 
         // Create scheduler
@@ -231,9 +228,10 @@ impl SDXLInference {
         use_guide_scale: bool,
     ) -> flame_core::Result<Tensor> {
         // Get pad token ID
-        let pad_id = *tokenizer.get_vocab(true).get("<|endoftext|>").ok_or_else(|| {
-            flame_core::Error::InvalidOperation("No pad token found".into())
-        })?;
+        let pad_id = *tokenizer
+            .get_vocab(true)
+            .get("<|endoftext|>")
+            .ok_or_else(|| flame_core::Error::InvalidOperation("No pad token found".into()))?;
 
         // Encode prompt
         let mut tokens = tokenizer
@@ -401,7 +399,7 @@ impl DiffusionInference for SDXLInference {
         Ok(())
     }
 
-    fn encode_prompt(&self, prompt: &str) -> flame_core::Result<Tensor> {
+    fn encode_prompt(&mut self, prompt: &str) -> flame_core::Result<Tensor> {
         // Use empty unconditional prompt for simple interface
         self.encode_prompt_with_cfg(prompt, "", 7.5)
     }
@@ -464,9 +462,7 @@ impl DiffusionInference for SDXLInference {
         }
 
         if lora_weights.is_empty() {
-            return Err(flame_core::Error::InvalidOperation(
-                "No LoRA weights provided".into(),
-            ));
+            return Err(flame_core::Error::InvalidOperation("No LoRA weights provided".into()));
         }
 
         Ok(())
@@ -557,9 +553,8 @@ pub fn generate_sdxl_image(
     let img = RgbImage::from_fn(width as u32, height as u32, |x, y| {
         Rgb([((x * 255) / width as u32) as u8, ((y * 255) / height as u32) as u8, 128u8])
     });
-    img.save(output_path).map_err(|e| {
-        flame_core::Error::InvalidOperation(format!("Failed to save image: {}", e))
-    })?;
+    img.save(output_path)
+        .map_err(|e| flame_core::Error::InvalidOperation(format!("Failed to save image: {}", e)))?;
 
     Ok(())
 }

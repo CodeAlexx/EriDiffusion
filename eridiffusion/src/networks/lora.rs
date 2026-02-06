@@ -216,20 +216,14 @@ impl LoRAModule {
         let lora_a = tensors
             .get(&format!("{}.lora_A.weight", prefix))
             .ok_or_else(|| {
-                flame_core::Error::InvalidOperation(format!(
-                    "Missing {}.lora_A.weight",
-                    prefix
-                ))
+                flame_core::Error::InvalidOperation(format!("Missing {}.lora_A.weight", prefix))
             })?
             .to_dtype(dtype)?;
 
         let lora_b = tensors
             .get(&format!("{}.lora_B.weight", prefix))
             .ok_or_else(|| {
-                flame_core::Error::InvalidOperation(format!(
-                    "Missing {}.lora_B.weight",
-                    prefix
-                ))
+                flame_core::Error::InvalidOperation(format!("Missing {}.lora_B.weight", prefix))
             })?
             .to_dtype(dtype)?;
 
@@ -471,7 +465,7 @@ impl LoRABuilder {
             for (k, v) in weights {
                 wl_weights.insert(k, v);
             }
-            let wl = WeightLoader { weights: wl_weights, device: self.device.clone() };
+            let wl = WeightLoader::from_tensor_map(wl_weights, self.device.clone());
             LoRAModule::new_from_vb(in_features, out_features, self.rank, self.alpha, &wl)
         } else {
             LoRAModule::new(

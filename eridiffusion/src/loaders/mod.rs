@@ -8,6 +8,11 @@ use std::path::Path;
 // Weight loader module
 pub mod weight_loader;
 pub use weight_loader::{PrefixedWeightLoader, WeightLoader};
+pub mod mmdit_weights;
+pub use mmdit_weights::{
+    dry_run_mmdit_weights, infer_mmdit_structure, load_mmdit_weights,
+    load_mmdit_weights_with_report, MmditLoadReport, MmditStructure,
+};
 
 // FLAME loaders
 
@@ -31,7 +36,9 @@ pub mod unified_checkpoint_loader;
 pub use flame_loader::{FlameCheckpointLoader, FlameWeightLoader};
 
 // Legacy exports
-pub use lazy_safetensors::{create_lazy_tensor_provider, LazySafetensorsLoader};
+pub use lazy_safetensors::{
+    create_lazy_tensor_provider, LazyPrefixedLoader, LazySafetensorsLoader,
+};
 pub use tensor_remapper::{create_flux_remapper, TensorRemapper};
 // pub use memory_efficient_loader::{MemoryEfficientFluxLoader, LazyHashMap<String, Tensor>, create_memory_efficient_flux_model}; // Temporarily disabled
 pub use sd_to_diffusers_converter::{convert_sdxl_checkpoint_to_diffusers, SDToDiffusersConverter};

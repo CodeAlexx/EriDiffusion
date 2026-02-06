@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-flame-core = {path = "../../../flame/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels"]}
+flame-core = {path = "/home/alex/EriDiffusion/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels"]}
 eridiffusion-core = { path = "../core" }
 eridiffusion-models = { path = "../models" }
 eridiffusion-common-vae = { path = "../common/vae" }

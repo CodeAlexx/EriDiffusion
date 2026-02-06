@@ -274,9 +274,7 @@ impl FluxDataLoader {
     /// Get next sample, moving to next bucket if needed
     fn get_next_sample(&mut self) -> flame_core::Result<&TrainingSample> {
         if self.buckets.is_empty() {
-            return Err(flame_core::Error::InvalidOperation(
-                "No samples available".to_string(),
-            ));
+            return Err(flame_core::Error::InvalidOperation("No samples available".to_string()));
         }
 
         // Get current bucket

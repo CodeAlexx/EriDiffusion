@@ -128,10 +128,7 @@ impl ValidationDataset {
             if item.latent.is_none() {
                 print!("\rCaching validation latent {}/{}", i + 1, total_items);
                 std::io::stdout().flush().map_err(|e| {
-                    flame_core::Error::InvalidOperation(format!(
-                        "Failed to flush stdout: {}",
-                        e
-                    ))
+                    flame_core::Error::InvalidOperation(format!("Failed to flush stdout: {}", e))
                 })?;
 
                 let latent = encode_fn(&item.image_path)?;
@@ -272,10 +269,7 @@ pub fn compute_loss(prediction: &Tensor, target: &Tensor) -> flame_core::Result<
 pub fn create_sample_directory(name: &str) -> flame_core::Result<PathBuf> {
     let dir = PathBuf::from(format!("samples/{}", name));
     std::fs::create_dir_all(&dir).map_err(|e| {
-        flame_core::Error::InvalidOperation(format!(
-            "Failed to create sample directory: {}",
-            e
-        ))
+        flame_core::Error::InvalidOperation(format!("Failed to create sample directory: {}", e))
     })?;
     Ok(dir)
 }

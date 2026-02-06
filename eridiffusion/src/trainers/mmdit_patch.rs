@@ -1,4 +1,4 @@
-use crate::loaders::WeightLoader;
+use crate::loaders::{load_mmdit_weights, WeightLoader};
 use anyhow::anyhow;
 use flame_core::device::Device;
 use flame_core::optimizers::{Adam, SGD};
@@ -80,10 +80,12 @@ pub fn load_mmdit_with_patched_rms_norm(
     println!("Loading MMDiT with patched RMS norm for CUDA support...");
 
     // Create the model normally
-    // SD3.5 Large has a conditioning dimension of 4096 (T5-XXL hidden size)
-    let cond_dim = 4096;
     let device = Device::cuda(0)?;
-    let model = MMDiT::new(config.clone(), cond_dim, &device)?;
+    let mut config = config.clone();
+    config.context_dim = 4096;
+    config.pooled_dim = Some(2048);
+    let mut model = MMDiT::new(config, &device)?;
+    load_mmdit_weights(&mut model, &wl)?;
 
     // The model is already created, we can't easily patch it
     // So we'll use a different approach - wrap the forward pass
@@ -107,19 +109,9 @@ impl MMDiTWrapper {
         context: &Tensor,
         skip_layers: Option<&[usize]>,
     ) -> flame_core::Result<Tensor> {
-        // Process timestep to embeddings
-        let time_emb = get_timestep_embedding(t, 256)?;
-
-        // Create simple position embeddings
-        let batch_size = x.shape().dims()[0];
-        let seq_len = x.shape().dims()[1];
-        let positions =
-            Tensor::arange(0.0, seq_len as f32, 1.0, self.device.cuda_device().clone())?
-                .unsqueeze(0)?
-                .expand(&[batch_size, seq_len])?;
-
+        let pooled = if y.shape().elem_count() == 0 { None } else { Some(y) };
         // Call the inner MMDiT forward pass
-        let (output, _) = self.inner.forward(x, context, &time_emb, &positions)?;
+        let output = self.inner.forward(x, t, context, pooled)?;
 
         // Apply any skip layer logic if provided
         if let Some(skip_layers) = skip_layers {
@@ -132,19 +124,6 @@ impl MMDiTWrapper {
 
         Ok(output)
     }
-}
-
-/// Generate sinusoidal timestep embeddings
-fn get_timestep_embedding(timesteps: &Tensor, embedding_dim: usize) -> flame_core::Result<Tensor> {
-    let device = Device::from(timesteps.device().clone());
-    let half_dim = embedding_dim / 2;
-    let emb = (0..half_dim).map(|i| -(i as f32 * 2.0 / embedding_dim as f32)).collect::<Vec<_>>();
-    let emb = Tensor::from_vec(emb, Shape::from_dims(&[half_dim]), device.cuda_device().clone())?;
-    let emb = emb.mul_scalar(10000f32.ln())?.exp()?;
-    let emb = timesteps.unsqueeze(1)?.mul(&emb.unsqueeze(0)?)?;
-    let sin = emb.sin()?;
-    let cos = emb.cos()?;
-    Tensor::cat(&[&sin, &cos], 1)
 }
 
 /// Test if the patch works

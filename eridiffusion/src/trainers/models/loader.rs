@@ -177,9 +177,7 @@ impl ModelLoader {
     pub fn validate_models(&self, models: &LoadedModels) -> flame_core::Result<()> {
         // Check UNet has expected structure
         if models.unet_weights.is_empty() {
-            return Err(flame_core::Error::InvalidOperation(
-                "No UNet weights loaded".to_string(),
-            ));
+            return Err(flame_core::Error::InvalidOperation("No UNet weights loaded".to_string()));
         }
 
         // Validate VAE if present

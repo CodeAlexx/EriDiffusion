@@ -526,7 +526,13 @@ impl SdxlInferencePipeline {
                     let eps_cond_1 =
                         self.denoise(&latents_euler, &t_next, &cond_ctx, &cond_pooled, &time_ids)?;
                     let eps_uncond_1 = if guidance_scale > 1.0 {
-                        self.denoise(&latents_euler, &t_next, &uncond_ctx, &uncond_pooled, &time_ids)?
+                        self.denoise(
+                            &latents_euler,
+                            &t_next,
+                            &uncond_ctx,
+                            &uncond_pooled,
+                            &time_ids,
+                        )?
                     } else {
                         eps_cond_1.clone()
                     };
@@ -584,8 +590,7 @@ impl SdxlInferencePipeline {
             eprintln!("[denoise] transition idx4 present={}", has_transition);
         }
         let prefilled_skips = [lowres_skip.clone_result()?];
-        let (mut h, mut skip_bank) =
-            self.infer_runtime.forward(h, ctx, &cond, &prefilled_skips)?;
+        let (mut h, mut skip_bank) = self.infer_runtime.forward(h, ctx, &cond, &prefilled_skips)?;
         let stage_debug = matches!(std::env::var("SDXL_STAGE_DEBUG").as_deref(), Ok("1"));
         if stage_debug {
             eprintln!("[denoise] runtime out {:?} skip_bank={}", h.shape().dims(), skip_bank.len());

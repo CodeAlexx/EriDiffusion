@@ -424,10 +424,7 @@ pub fn train_loop(cfg: &Config) -> Result<()> {
             let inner = ImageDataset::new(cfg, device.clone())?;
             Ok(Self { inner, idx: 0, device })
         }
-        fn next_batch(
-            &mut self,
-            bs: usize,
-        ) -> Result<(Tensor /*images NHWC BF16*/, Vec<String>)> {
+        fn next_batch(&mut self, bs: usize) -> Result<(Tensor /*images NHWC BF16*/, Vec<String>)> {
             let len = self.inner.len();
             let mut images: Vec<Tensor> = Vec::with_capacity(bs);
             let mut caps: Vec<String> = Vec::with_capacity(bs);
@@ -506,7 +503,7 @@ pub fn train_loop(cfg: &Config) -> Result<()> {
             let take = seq.min(target_seq);
             let mut h = hidden.narrow(1, 0, take)?;
             if take < target_seq {
-            let pad = zeros_on(
+                let pad = zeros_on(
                     shape3(b as i64, (target_seq - take) as i64, d as i64),
                     device,
                     DType::BF16,
@@ -1071,8 +1068,7 @@ pub fn train_loop(cfg: &Config) -> Result<()> {
                 (features, text_hidden, captions)
             } else {
                 let dataset = data_sources.dataset.as_mut().expect("dataset unavailable");
-                let (images_nhwc_bf16, captions) =
-                    dataset.next_batch(cfg.train.batch_size)?;
+                let (images_nhwc_bf16, captions) = dataset.next_batch(cfg.train.batch_size)?;
                 let features_3d = if let Some(spec) = &vae_spec_opt {
                     if io_logs {
                         let d = images_nhwc_bf16.shape().dims().to_vec();
@@ -1769,8 +1765,7 @@ pub fn train_loop(cfg: &Config) -> Result<()> {
     let total_duration = run_start.elapsed();
     println!(
         "[chroma] training complete in {:.2?} across {} steps",
-        total_duration,
-        cfg.train.steps
+        total_duration, cfg.train.steps
     );
     Ok(())
 }

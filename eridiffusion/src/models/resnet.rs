@@ -112,7 +112,7 @@ impl ResnetBlock2D {
 
         let norm1_weight = weights.tensor("norm1.weight", &[channels])?;
         let norm1_bias = weights.tensor("norm1.bias", &[channels])?;
-        let mut norm1 = GroupNorm::new(32, channels, 1e-6, true, norm1_weight.device().clone())?;
+        let mut norm1 = GroupNorm::new(32, channels, 1e-6, true, DType::F32, norm1_weight.device().clone())?;
         norm1.weight = Some(norm1_weight);
         norm1.bias = Some(norm1_bias);
 
@@ -139,7 +139,7 @@ impl ResnetBlock2D {
 
         let norm2_weight = prefixed_weights.tensor("norm2.weight", &[channels])?;
         let norm2_bias = prefixed_weights.tensor("norm2.bias", &[channels])?;
-        let mut norm2 = GroupNorm::new(32, channels, 1e-6, true, norm2_weight.device().clone())?;
+        let mut norm2 = GroupNorm::new(32, channels, 1e-6, true, DType::F32, norm2_weight.device().clone())?;
         norm2.weight = Some(norm2_weight);
         norm2.bias = Some(norm2_bias);
 
@@ -224,10 +224,10 @@ impl ResnetBlock2D {
         groups: usize,
         device: Device,
     ) -> Result<Self> {
-        let norm1 = GroupNorm::new(groups, in_channels, 1e-6, true, device.cuda_device().clone())?;
+        let norm1 = GroupNorm::new(groups, in_channels, 1e-6, true, DType::F32, device.cuda_device().clone())?;
         let conv1 = Conv2d::new(in_channels, out_channels, 3, 1, 1, device.cuda_device().clone())?;
 
-        let norm2 = GroupNorm::new(groups, out_channels, 1e-6, true, device.cuda_device().clone())?;
+        let norm2 = GroupNorm::new(groups, out_channels, 1e-6, true, DType::F32, device.cuda_device().clone())?;
         let conv2 = Conv2d::new(out_channels, out_channels, 3, 1, 1, device.cuda_device().clone())?;
 
         let conv_shortcut = if in_channels != out_channels {

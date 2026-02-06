@@ -276,24 +276,22 @@ impl TrainingPipeline for FluxPipeline {
         let batch_size = noisy_latents.shape().dims()[0];
 
         // Handle control conditioning by splitting channels and reorganizing
-        let meta_has_control = batch
-            .metadata
-            .get("has_control")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let meta_has_control =
+            batch.metadata.get("has_control").and_then(|v| v.as_bool()).unwrap_or(false);
 
-        let (latent_input, has_control) = if meta_has_control || noisy_latents.shape().dims()[1] == 32 {
-            // Split concatenated latents: [batch, 32, h, w] -> [batch, 16, h, w] + [batch, 16, h, w]
-            let chunks = noisy_latents.chunk(2, 1)?;
-            let main_latents = chunks[0].clone();
-            let control_latents = chunks[1].clone();
+        let (latent_input, has_control) =
+            if meta_has_control || noisy_latents.shape().dims()[1] == 32 {
+                // Split concatenated latents: [batch, 32, h, w] -> [batch, 16, h, w] + [batch, 16, h, w]
+                let chunks = noisy_latents.chunk(2, 1)?;
+                let main_latents = chunks[0].clone();
+                let control_latents = chunks[1].clone();
 
-            // Stack on batch dimension for packing: [2*batch, 16, h, w]
-            let combined = Tensor::cat(&[&main_latents, &control_latents], 0)?;
-            (combined, true)
-        } else {
-            (noisy_latents.clone(), meta_has_control)
-       };
+                // Stack on batch dimension for packing: [2*batch, 16, h, w]
+                let combined = Tensor::cat(&[&main_latents, &control_latents], 0)?;
+                (combined, true)
+            } else {
+                (noisy_latents.clone(), meta_has_control)
+            };
 
         // Pack latents for transformer: [batch, seq_len, channels*patch_size]
         let packed_latents = self.pack_latents(&latent_input)?;

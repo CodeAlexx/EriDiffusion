@@ -87,9 +87,7 @@ pub fn find_real_device_zero() -> flame_core::Result<Device> {
         }
     }
 
-    Err(flame_core::Error::InvalidOperation(
-        "Could not find any working CUDA device".to_string(),
-    ))
+    Err(flame_core::Error::InvalidOperation("Could not find any working CUDA device".to_string()))
 }
 
 /// Load safetensors with aggressive device forcing

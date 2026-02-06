@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use eridiffusion_core::Device;
-use flame_core::{CudaDevice, DType, Error as CoreError, Result as CoreResult, Shape, Tensor, rng};
+use flame_core::{bf16_normal, rng, CudaDevice, DType, Error as CoreError, Result as CoreResult, Shape, Tensor};
 
 pub const BF16: DType = DType::BF16;
 pub const F16_: DType = DType::F16;
@@ -77,7 +77,11 @@ pub fn zeros_on(shape: impl Into<Shape>, device: &Device, dtype: DType) -> CoreR
 pub fn ones_on(shape: impl Into<Shape>, device: &Device, dtype: DType) -> CoreResult<Tensor> {
     ensure_supported_dtype(dtype)?;
     let cuda = cuda_device_arc_for(device)?;
-    Tensor::ones_dtype(shape.into(), dtype, cuda)
+    let shape = shape.into();
+    if dtype == DType::BF16 {
+        return Tensor::zeros_dtype(shape, dtype, cuda)?.add_scalar(1.0);
+    }
+    Tensor::ones_dtype(shape, dtype, cuda)
 }
 
 pub fn full_on(
@@ -88,6 +92,10 @@ pub fn full_on(
 ) -> CoreResult<Tensor> {
     ensure_supported_dtype(dtype)?;
     let shape = shape.into();
+    if dtype == DType::BF16 {
+        let cuda = cuda_device_arc_for(device)?;
+        return Tensor::zeros_dtype(shape, dtype, cuda)?.add_scalar(value_f32);
+    }
     let numel = shape.elem_count() as usize;
     let data = vec![value_f32; numel];
     tensor_from_vec_on(data, shape, device, dtype)
@@ -133,11 +141,15 @@ pub fn randn_on(
     seed: Option<u64>,
 ) -> CoreResult<Tensor> {
     ensure_supported_dtype(dtype)?;
+    let cuda = cuda_device_arc_for(device)?;
+    let shape = shape.into();
     if let Some(s) = seed {
         rng::set_seed(s)?;
     }
-    let cuda = cuda_device_arc_for(device)?;
-    let shape = shape.into();
+    if dtype == DType::BF16 {
+        let seed = seed.unwrap_or_else(rng::next_u64);
+        return bf16_normal::normal_bf16(shape, 0.0, 1.0, seed, cuda);
+    }
     let tensor = Tensor::randn(shape, 0.0, 1.0, cuda)?;
     if tensor.dtype() == dtype {
         Ok(tensor)
@@ -154,6 +166,14 @@ pub fn randn_scaled_on(
     std: f32,
     seed: Option<u64>,
 ) -> CoreResult<Tensor> {
+    if dtype == DType::BF16 {
+        let cuda = cuda_device_arc_for(device)?;
+        if let Some(s) = seed {
+            rng::set_seed(s)?;
+        }
+        let seed = seed.unwrap_or_else(rng::next_u64);
+        return bf16_normal::normal_bf16(shape.into(), mean, std, seed, cuda);
+    }
     let base = randn_on(shape, device, DType::F32, seed)?;
     let scaled = base.mul_scalar(std)?.add_scalar(mean)?;
     if dtype == DType::F32 {

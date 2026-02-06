@@ -8,7 +8,7 @@ name = "eridiffusion_inference"
 path = "src/lib.rs"
 
 [dependencies]
-flame-core = { path = "../../flame/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels", "bf16_conv", "flash_attn"] }
+flame-core = { path = "/home/alex/EriDiffusion/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels", "bf16_conv", "flash_attn"] }
 eridiffusion-core = { path = "../crates/core" }
 eridiffusion-training = { path = "../crates/training", default-features = false, features = ["sdxl", "cond_sinusoidal", "real", "bf16_conv"] }
 eridiffusion-common-text = { path = "../crates/common/text" }

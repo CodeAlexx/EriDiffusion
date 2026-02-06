@@ -441,6 +441,7 @@ impl UNet2DConditionModel {
             block_out_channels[0],
             1e-5,
             true,
+            DType::F32,
             device.cuda_device().clone(),
         )?;
         let conv_out = Conv2d::new(

@@ -57,17 +57,6 @@ impl LoadableModel for super::flame_vae::VAE {
     }
 }
 
-impl LoadableModel for super::flame_unet::UNet2DConditionModel {
-    fn load(weights: &WeightLoader) -> Result<Self> {
-        super::flame_unet::UNet2DConditionModel::load(weights)
-    }
-}
-
-impl LoadableModel for super::flame_clip::CLIPTextModel {
-    fn load(weights: &WeightLoader) -> Result<Self> {
-        super::flame_clip::CLIPTextModel::load(weights)
-    }
-}
 
 /// Trait for models that can collect their parameters
 pub trait CollectParameters {

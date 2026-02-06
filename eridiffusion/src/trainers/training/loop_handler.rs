@@ -202,10 +202,7 @@ impl TrainingLoop {
         let checkpoint_dir = output_dir.join(format!("checkpoint-{}", self.state.global_step));
         std::fs::create_dir_all(&checkpoint_dir)
             .map_err(|e| {
-                flame_core::Error::InvalidOperation(format!(
-                    "Failed to create directory: {}",
-                    e
-                ))
+                flame_core::Error::InvalidOperation(format!("Failed to create directory: {}", e))
             })
             .map_err(|e| flame_core::Error::InvalidOperation(e.to_string()))?;
 

@@ -128,10 +128,11 @@ impl ResnetBlock {
         norm_groups: usize,
         device: &flame_core::device::Device,
     ) -> Result<Self> {
-        let norm1 = GroupNorm::new(norm_groups, in_channels, 1e-6, true, device.cuda_device_arc())?;
+        println!("ResnetBlock::new in_channels={} out_channels={}", in_channels, out_channels);
+        let norm1 = GroupNorm::new(norm_groups, in_channels, 1e-6, true, DType::BF16, device.cuda_device_arc())?;
         let conv1 = Conv2d::new(in_channels, out_channels, 3, 1, 1, device.cuda_device_arc())?;
         let norm2 =
-            GroupNorm::new(norm_groups, out_channels, 1e-6, true, device.cuda_device_arc())?;
+            GroupNorm::new(norm_groups, out_channels, 1e-6, true, DType::BF16, device.cuda_device_arc())?;
         let conv2 = Conv2d::new(out_channels, out_channels, 3, 1, 1, device.cuda_device_arc())?;
 
         let conv_shortcut = if in_channels != out_channels {
@@ -144,15 +145,16 @@ impl ResnetBlock {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        println!("ResnetBlock::forward x.shape={:?}", x.shape());
         let residual: Tensor = x.clone();
-
-        let h = self.norm1.forward(x)?;
-        let h = h.silu()?;
-        let h = self.conv1.forward(&h)?;
-
-        let h = self.norm2.forward(&h)?;
-        let h = h.silu()?;
-        let h = self.conv2.forward(&h)?;
+        let mut h = self.norm1.forward_nchw(x)?;
+        h = h.silu()?;
+        h = self.conv1.forward(&h)?;
+        println!("ResnetBlock::forward after conv1: {:?}", h.shape());
+        h = self.norm2.forward_nchw(&h)?;
+        h = h.silu()?;
+        h = self.conv2.forward(&h)?;
+        println!("ResnetBlock::forward after conv2: {:?}", h.shape());
 
         let skip_connection =
             if let Some(conv) = &self.conv_shortcut { conv.forward(&residual)? } else { residual };
@@ -169,7 +171,7 @@ impl AttentionBlock {
         norm_groups: usize,
         device: &flame_core::device::Device,
     ) -> Result<Self> {
-        let norm = GroupNorm::new(norm_groups, channels, 1e-6, true, device.cuda_device_arc())?;
+        let norm = GroupNorm::new(norm_groups, channels, 1e-6, true, DType::BF16, device.cuda_device_arc())?;
         let q = Conv2d::new(channels, channels, 1, 1, 0, device.cuda_device_arc())?;
         let k = Conv2d::new(channels, channels, 1, 1, 0, device.cuda_device_arc())?;
         let v = Conv2d::new(channels, channels, 1, 1, 0, device.cuda_device_arc())?;
@@ -181,7 +183,7 @@ impl AttentionBlock {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let residual: Tensor = x.clone();
-        let x = self.norm.forward(x)?;
+        let x = self.norm.forward_nchw(x)?;
 
         let shape = x.shape().dims();
         let (b, c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
@@ -192,12 +194,12 @@ impl AttentionBlock {
         let v = self.v.forward(&x)?.reshape(&[b, c, h * w])?.transpose_dims(1, 2)?;
 
         // Attention scores
-        let scores = q.matmul(&k)?;
+        let scores = q.bmm(&k)?;
         let scores = scores.mul_scalar(self.scale as f32)?;
         let attn = scores.softmax(-1)?;
 
         // Apply attention
-        let out = attn.matmul(&v)?.transpose_dims(1, 2)?.reshape(&[b, c, h, w])?;
+        let out = attn.bmm(&v)?.transpose_dims(1, 2)?.reshape(&[b, c, h, w])?;
 
         let out = self.proj_out.forward(&out)?;
 
@@ -467,7 +469,7 @@ impl Encoder {
 
         // Output layers
         let norm_out =
-            GroupNorm::new(config.norm_num_groups, ch, 1e-6, true, device.cuda_device_arc())?;
+            GroupNorm::new(config.norm_num_groups, ch, 1e-6, true, DType::BF16, device.cuda_device_arc())?;
 
         let weight = weights.get("encoder.conv_out.weight").ok_or_else(|| {
             flame_core::Error::InvalidOperation("Missing encoder.conv_out.weight".into())
@@ -497,7 +499,7 @@ impl Encoder {
         h = self.mid_block.forward(&h)?;
 
         // Output
-        h = self.norm_out.forward(&h)?;
+        h = self.norm_out.forward_nchw(&h)?;
         h = h.silu()?;
         self.conv_out.forward(&h)
     }
@@ -515,6 +517,7 @@ impl Decoder {
             flame_core::Error::InvalidOperation("Missing decoder.conv_in.weight".into())
         })?;
         let weight_shape = weight.shape().dims();
+        println!("Decoder::new conv_in weight_shape: {:?}", weight_shape);
         let conv_in = Conv2d::new(
             weight_shape[1],
             weight_shape[0],
@@ -523,10 +526,12 @@ impl Decoder {
             1,
             device.cuda_device_arc(),
         )?;
+        println!("Decoder::new conv_in config: in={} out={}", conv_in.config.in_channels, conv_in.config.out_channels);
 
         // Create up blocks (reversed order)
         let mut up_blocks = Vec::new();
         let block_out_channels: Vec<_> = config.block_out_channels.iter().rev().cloned().collect();
+        println!("Decoder::new block_out_channels (reversed): {:?}", block_out_channels);
         let mut ch = block_out_channels[0];
 
         // Mid block
@@ -551,7 +556,7 @@ impl Decoder {
 
         // Output layers
         let norm_out =
-            GroupNorm::new(config.norm_num_groups, ch, 1e-6, true, device.cuda_device_arc())?;
+            GroupNorm::new(config.norm_num_groups, ch, 1e-6, true, DType::BF16, device.cuda_device_arc())?;
 
         let weight = weights.get("decoder.conv_out.weight").ok_or_else(|| {
             flame_core::Error::InvalidOperation("Missing decoder.conv_out.weight".into())
@@ -571,6 +576,7 @@ impl Decoder {
 
     fn forward(&self, z: &Tensor) -> Result<Tensor> {
         let mut h = self.conv_in.forward(z)?;
+        println!("Decoder::forward after conv_in: {:?}", h.shape());
 
         // Middle block
         h = self.mid_block.forward(&h)?;
@@ -581,7 +587,7 @@ impl Decoder {
         }
 
         // Output
-        h = self.norm_out.forward(&h)?;
+        h = self.norm_out.forward_nchw(&h)?;
         h = h.silu()?;
         self.conv_out.forward(&h)
     }
@@ -595,6 +601,7 @@ impl MidBlock {
         norm_groups: usize,
         device: &flame_core::device::Device,
     ) -> Result<Self> {
+        println!("MidBlock::new channels={}", channels);
         Ok(Self {
             resnet1: ResnetBlock::new(channels, channels, norm_groups, device)?,
             attn: AttentionBlock::new(channels, norm_groups, device)?,
@@ -603,6 +610,7 @@ impl MidBlock {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        println!("MidBlock::forward x.shape={:?}", x.shape());
         let h = self.resnet1.forward(x)?;
         let h = self.attn.forward(&h)?;
         self.resnet2.forward(&h)

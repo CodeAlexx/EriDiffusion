@@ -83,10 +83,7 @@ fn self_attention_block(
         640 => 10,  // 640 / 64 = 10
         1280 => 20, // 1280 / 64 = 20
         _ => {
-            return Err(Error::InvalidOperation(format!(
-                "Unexpected channel count: {}",
-                channels
-            )))
+            return Err(Error::InvalidOperation(format!("Unexpected channel count: {}", channels)))
         }
     };
     let head_dim = channels / num_heads;
@@ -108,10 +105,7 @@ fn self_attention_block(
         ))
     })?;
     let norm_bias = weights.get(&norm_bias_key).ok_or_else(|| {
-        Error::InvalidOperation(format!(
-            "Missing self-attention norm bias at {}",
-            norm_bias_key
-        ))
+        Error::InvalidOperation(format!("Missing self-attention norm bias at {}", norm_bias_key))
     })?;
 
     let norm_hidden = layer_norm(&hidden_states_seq, norm_weight, norm_bias)?;
@@ -207,10 +201,7 @@ fn cross_attention_block(
         640 => 10,  // 640 / 64 = 10
         1280 => 20, // 1280 / 64 = 20
         _ => {
-            return Err(Error::InvalidOperation(format!(
-                "Unexpected channel count: {}",
-                channels
-            )))
+            return Err(Error::InvalidOperation(format!("Unexpected channel count: {}", channels)))
         }
     };
     let head_dim = channels / num_heads;
@@ -231,10 +222,7 @@ fn cross_attention_block(
         ))
     })?;
     let norm_bias = weights.get(&norm_bias_key).ok_or_else(|| {
-        Error::InvalidOperation(format!(
-            "Missing cross-attention norm bias at {}",
-            norm_bias_key
-        ))
+        Error::InvalidOperation(format!("Missing cross-attention norm bias at {}", norm_bias_key))
     })?;
 
     let norm_hidden = layer_norm(&hidden_states_seq, norm_weight, norm_bias)?;

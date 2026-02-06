@@ -44,9 +44,7 @@ pub fn init_single_device() -> flame_core::Result<Device> {
         }
     }
 
-    Err(flame_core::Error::InvalidOperation(
-        "Could not find any working CUDA device".to_string(),
-    ))
+    Err(flame_core::Error::InvalidOperation("Could not find any working CUDA device".to_string()))
 }
 
 /// Get the one true device - ALWAYS returns the same device

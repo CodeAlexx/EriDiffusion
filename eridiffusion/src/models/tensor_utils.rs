@@ -41,7 +41,7 @@ pub fn to_dtype_aligned(tensor: &Tensor, target_dtype: DType) -> Result<Tensor> 
 /// Check if a tensor size might cause CUDA alignment issues
 pub fn needs_alignment(size: usize) -> bool {
     // Known problematic sizes from CUDA alignment errors
-    const PROBLEMATIC_SIZES: &[usize] = &[3456, 147456, 12288, 16384, 295936];
+    const PROBLEMATIC_SIZES: &[usize] = &[3456, 12288, 16384, 295936];
 
     // Check if it's a known problematic size or if it doesn't align well
     // CUDA prefers sizes that are multiples of 512 for F16/BF16 (1KB alignment)

@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context};
+use eridiffusion_core::Device as CoreDevice;
 use flame_core::device::Device;
 use flame_core::optimizers::{Adam, SGD};
 use flame_core::{DType, Error, Result, Shape, Tensor};
@@ -11,7 +12,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use std::{collections::HashMap, fs, path::PathBuf};
-use eridiffusion_core::Device as CoreDevice;
 
 use super::adam8bit::Adam8bit;
 use super::cpu_offload_manager::CPUOffloadManager;
@@ -40,15 +40,15 @@ use super::sampling::{generate_samples, SDXLSampler, SamplerConfig};
 use super::training::{compute_loss, LossType, TrainingLoop, TrainingState};
 use crate::config::trainer_config::TreadConfig;
 use crate::inference::sdxl::{SDXLConfig as InferenceConfig, SDXLInference};
+use crate::trainers::adapters_util;
 use eridiffusion_training::sdxl::registry::SdxlLayerRegistry;
 use eridiffusion_training::sdxl::runtime::AttnChunkConfig;
 use eridiffusion_training::sdxl::weights::SdxlWeightProvider;
 use eridiffusion_training::sdxl::RuntimeMode;
-use crate::trainers::adapters_util;
+use eridiffusion_training::streaming::WeightProvider;
 use eridiffusion_training::telemetry::TelemetryCsv;
 use eridiffusion_training::tread;
 use eridiffusion_training::tread::TreadMetrics;
-use eridiffusion_training::streaming::WeightProvider;
 
 const SDXL_LYCO_ALLOW: &[&str] = &[
     "unet.*.st.tb*.xattn.to_q",
@@ -166,16 +166,18 @@ impl SDXLLoRATrainerFixed {
             std::env::var("USE_REGISTRY_STREAMING").ok().map(|v| v == "1").unwrap_or(false);
         let (sdxl_registry, sdxl_provider) = if use_registry_streaming {
             let model_path = config.model.name_or_path.clone();
-            let loader = Arc::new(StrictMmapLoader::open(std::path::Path::new(&model_path)).map_err(
-                |e| {
+            let loader = Arc::new(
+                StrictMmapLoader::open(std::path::Path::new(&model_path)).map_err(|e| {
                     flame_core::Error::InvalidOperation(format!(
                         "open sdxl shard {}: {}",
-                        model_path.display(), e
+                        model_path.display(),
+                        e
                     ))
-                },
-            )?);
+                })?,
+            );
             let provider = Arc::new(SdxlWeightProvider::new(loader.clone(), device.clone()));
-            let registry = Arc::new(SdxlLayerRegistry::build(provider.clone(), RuntimeMode::Streamed)?);
+            let registry =
+                Arc::new(SdxlLayerRegistry::build(provider.clone(), RuntimeMode::Streamed)?);
             (Some(registry), Some(provider))
         } else {
             (None, None)
@@ -390,8 +392,7 @@ impl SDXLLoRATrainerFixed {
             if let Some(ref weights) = self.unet_weights {
                 let device_core = CoreDevice::cuda(self.device.ordinal())
                     .map_err(|e| Error::InvalidOperation(e.to_string()))?;
-                let bs =
-                    adapters_util::base_shapes_from_weights(weights);
+                let bs = adapters_util::base_shapes_from_weights(weights);
                 let set = adapters::loader::safetensors_lyco::load_lycoris_dir(
                     std::path::Path::new(&dir),
                     &device_core,
@@ -400,11 +401,7 @@ impl SDXLLoRATrainerFixed {
                 )
                 .map_err(|e| Error::InvalidOperation(e.to_string()))?;
                 let allow: Vec<String> = SDXL_LYCO_ALLOW.iter().map(|s| s.to_string()).collect();
-                let filtered = adapters_util::filter_adapters(
-                    &set,
-                    &allow,
-                    &vec![],
-                );
+                let filtered = adapters_util::filter_adapters(&set, &allow, &vec![]);
                 info!("Attached LyCORIS adapters: {} targets", filtered.by_target.len());
                 self.lyco_adapters = Some(filtered);
             } else {
@@ -428,7 +425,7 @@ impl SDXLLoRATrainerFixed {
         // Initialize gradient checkpointing if enabled
         if self.config.train.gradient_checkpointing {
             info!("Enabling gradient checkpointing...");
-            self.gradient_checkpoint = Some(SDXLGradientCheckpoint::new(true));
+            self.gradient_checkpoint = Some(SDXLGradientCheckpoint::new(true, &self.device));
         }
 
         // Training loop
@@ -533,23 +530,22 @@ impl SDXLLoRATrainerFixed {
                 flame_core::Error::InvalidOperation(format!("VAE encode failed: {}", e))
             })?
         } else {
-            return Err(flame_core::Error::InvalidOperation(
-                "VAE encoder not loaded".to_string(),
-            ));
+            return Err(flame_core::Error::InvalidOperation("VAE encoder not loaded".to_string()));
         };
 
         // Encode text
-        let (encoder_hidden_states, pooled_output) = if let Some(text_encoders) = &mut self.text_encoders {
-            // For SDXL we need both CLIP encoders
-            // TODO: Convert input_ids tensor to strings for encoding
-            // For now, use placeholder
-            let texts = vec!["placeholder text".to_string(); batch_size];
-            text_encoders.encode_batch(&texts, 77)?
-        } else {
-            return Err(flame_core::Error::InvalidOperation(
-                "Text encoders not loaded".to_string(),
-            ));
-        };
+        let (encoder_hidden_states, pooled_output) =
+            if let Some(text_encoders) = &mut self.text_encoders {
+                // For SDXL we need both CLIP encoders
+                // TODO: Convert input_ids tensor to strings for encoding
+                // For now, use placeholder
+                let texts = vec!["placeholder text".to_string(); batch_size];
+                text_encoders.encode_batch(&texts, 77)?
+            } else {
+                return Err(flame_core::Error::InvalidOperation(
+                    "Text encoders not loaded".to_string(),
+                ));
+            };
 
         // Sample noise
         let noise =
@@ -607,13 +603,12 @@ impl SDXLLoRATrainerFixed {
             if let Some(reg) = &self.sdxl_registry {
                 let dims = noisy_latents.shape().dims().to_vec();
                 let (b, _c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
-                let latents_nhwc = noisy_latents
-                    .permute(&[0, 2, 3, 1])?
-                    .to_dtype(DType::BF16)?;
+                let latents_nhwc = noisy_latents.permute(&[0, 2, 3, 1])?.to_dtype(DType::BF16)?;
                 let ctx = encoder_hidden_states.to_dtype(DType::BF16)?;
                 let cond = reg.make_conditioning(&pooled_output, &timesteps, &time_ids)?;
                 let attn_cfg = AttnChunkConfig::default();
-                let streamed = reg.forward_blocks(latents_nhwc, &ctx, &cond, attn_cfg)
+                let streamed = reg
+                    .forward_blocks(latents_nhwc, &ctx, &cond, attn_cfg)
                     .map_err(|e| flame_core::Error::InvalidOperation(e.to_string()))?;
                 let restored = streamed
                     .permute(&[0, 3, 1, 2])?

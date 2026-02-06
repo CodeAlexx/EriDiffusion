@@ -471,9 +471,7 @@ impl TrainingPipeline for SDXLPipeline {
                         .mul(noise)?
                         .sub(&sqrt_one_minus_alpha_cumprod.mul(latents)?)?
                 } else {
-                    return Err(
-                        Error::Training("No latents found for v_prediction".into()).into()
-                    );
+                    return Err(Error::Training("No latents found for v_prediction".into()).into());
                 }
             }
             "sample" => {

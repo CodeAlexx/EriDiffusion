@@ -221,8 +221,7 @@ impl TrainingPipeline for SD3Pipeline {
             if let Some(ref latents) = batch.latents {
                 self.compute_mean_flow_loss(model, latents, noise, timesteps, prompt_embeds, batch)
             } else {
-                Err(Error::Training("No latents found in batch for mean flow loss".into())
-                    .into())
+                Err(Error::Training("No latents found in batch for mean flow loss".into()).into())
             }
         } else {
             Ok(weighted_loss)

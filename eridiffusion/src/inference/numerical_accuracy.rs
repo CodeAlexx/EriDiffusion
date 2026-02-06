@@ -210,8 +210,8 @@ impl AccuracyTestSuite {
     }
 
     pub fn save_to_file(&self, path: &str) -> flame_core::Result<()> {
-        let mut file = File::create(path)
-            .map_err(|e| flame_core::Error::InvalidOperation(e.to_string()))?;
+        let mut file =
+            File::create(path).map_err(|e| flame_core::Error::InvalidOperation(e.to_string()))?;
 
         // Write summary
         writeln!(file, "{}", self.generate_summary())

@@ -73,7 +73,7 @@ impl TextEncoders {
 
         // Get weights from WeightLoader
         let weights = wl.weights;
-        self.clip_l = Some(clip::ClipTextTransformer::new(config, &self.device, weights)?);
+        self.clip_l = Some(clip::ClipTextTransformer::new(config, self.device.clone(), weights)?);
         println!("✅ CLIP-L loaded successfully with FP16 precision");
         Ok(())
     }
@@ -92,7 +92,7 @@ impl TextEncoders {
 
         // Get weights from WeightLoader
         let weights = wl.weights;
-        self.clip_g = Some(clip::ClipTextTransformer::new(config, &self.device, weights)?);
+        self.clip_g = Some(clip::ClipTextTransformer::new(config, self.device.clone(), weights)?);
         println!("✅ CLIP-G loaded successfully with FP16 precision");
         Ok(())
     }
@@ -107,22 +107,12 @@ impl TextEncoders {
         )?;
 
         // Create T5-XXL config
-        let config = crate::models::text_encoder::T5Config {
-            vocab_size: 32128,
-            d_model: 4096,
-            d_ff: 10240,
-            num_layers: 24,
-            num_heads: 64,
-            relative_attention_num_buckets: 32,
-            relative_attention_max_distance: 128,
-            dropout_rate: 0.1,
-            layer_norm_epsilon: 1e-6,
-        };
+        let config = crate::models::text_encoder::T5Config::t5_xxl();
 
         // Load T5 model using the T5Encoder from text_encoder module
         // T5Encoder::new expects (config, device, weights)
         self.t5 =
-            Some(crate::models::text_encoder::T5Encoder::new(config, &self.device, wl.weights)?);
+            Some(crate::models::text_encoder::T5Encoder::new(config, self.device.clone(), &wl)?);
         println!("✅ T5-XXL loaded successfully with streaming loader");
         Ok(())
     }
@@ -134,10 +124,7 @@ impl TextEncoders {
     ) -> flame_core::Result<()> {
         // Load CLIP tokenizer
         self.tokenizer_clip = Some(Tokenizer::from_file(clip_tokenizer_path).map_err(|e| {
-            flame_core::Error::InvalidOperation(format!(
-                "Failed to load CLIP tokenizer: {}",
-                e
-            ))
+            flame_core::Error::InvalidOperation(format!("Failed to load CLIP tokenizer: {}", e))
         })?);
 
         // Load T5 tokenizer
@@ -152,10 +139,7 @@ impl TextEncoders {
     pub fn load_clip_tokenizer(&mut self, tokenizer_path: &str) -> flame_core::Result<()> {
         // Load just CLIP tokenizer for SDXL
         self.tokenizer_clip = Some(Tokenizer::from_file(tokenizer_path).map_err(|e| {
-            flame_core::Error::InvalidOperation(format!(
-                "Failed to load CLIP tokenizer: {}",
-                e
-            ))
+            flame_core::Error::InvalidOperation(format!("Failed to load CLIP tokenizer: {}", e))
         })?);
         println!("CLIP tokenizer loaded successfully");
         Ok(())
@@ -179,9 +163,7 @@ impl TextEncoders {
         }
 
         if self.tokenizer_clip.is_none() || self.tokenizer_t5.is_none() {
-            return Err(flame_core::Error::InvalidOperation(
-                "Tokenizers not loaded".to_string(),
-            ));
+            return Err(flame_core::Error::InvalidOperation("Tokenizers not loaded".to_string()));
         }
 
         // Handle empty prompts for unconditional generation
@@ -355,9 +337,10 @@ impl TextEncoders {
     }
 
     pub fn tokenize_t5(&self, text: &str, max_length: usize) -> flame_core::Result<Tensor> {
-        let tokenizer = self.tokenizer_t5.as_ref().ok_or_else(|| {
-            flame_core::Error::InvalidOperation("T5 tokenizer not loaded".into())
-        })?;
+        let tokenizer = self
+            .tokenizer_t5
+            .as_ref()
+            .ok_or_else(|| flame_core::Error::InvalidOperation("T5 tokenizer not loaded".into()))?;
         let encoding = tokenizer.encode(text, true).map_err(|e| {
             flame_core::Error::InvalidOperation(format!("Tokenization failed: {:?}", e))
         })?;
@@ -497,9 +480,7 @@ impl TextEncoders {
     /// Encode only with T5 (for memory-efficient sequential encoding)
     pub fn encode_t5_only(&self, text: &str, max_length: usize) -> flame_core::Result<Tensor> {
         if self.t5.is_none() {
-            return Err(flame_core::Error::InvalidOperation(
-                "T5 encoder not loaded".to_string(),
-            ));
+            return Err(flame_core::Error::InvalidOperation("T5 encoder not loaded".to_string()));
         }
 
         let t5_tokens = self.tokenize_t5(text, max_length)?;

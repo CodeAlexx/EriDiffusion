@@ -79,7 +79,7 @@ impl QuantoWeightLoader {
         let var_map = HashMap::new();
 
         // Return a standard WeightLoader
-        Ok(WeightLoader { weights: var_map, device: self.device.clone() })
+        Ok(WeightLoader::from_tensor_map(var_map, self.device.clone()))
     }
 
     /// Get a weight on-demand

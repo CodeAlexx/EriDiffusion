@@ -340,9 +340,8 @@ impl CheckpointManager {
         params: &mut HashMap<String, &mut Parameter>,
         path: &Path,
     ) -> flame_core::Result<()> {
-        let data = fs::read(path).map_err(|e| {
-            Error::InvalidOperation(format!("Failed to read checkpoint: {}", e))
-        })?;
+        let data = fs::read(path)
+            .map_err(|e| Error::InvalidOperation(format!("Failed to read checkpoint: {}", e)))?;
         let tensors = SafeTensors::deserialize(&data).map_err(|e| {
             Error::InvalidOperation(format!("Failed to deserialize checkpoint: {}", e))
         })?;
@@ -404,9 +403,8 @@ impl CheckpointManager {
     ) -> flame_core::Result<()> {
         let data = fs::read(path)
             .map_err(|e| flame_core::Error::Io(format!("Failed to read file: {}", e)))?;
-        let tensors = SafeTensors::deserialize(&data).map_err(|e| {
-            flame_core::Error::Io(format!("Failed to deserialize tensors: {}", e))
-        })?;
+        let tensors = SafeTensors::deserialize(&data)
+            .map_err(|e| flame_core::Error::Io(format!("Failed to deserialize tensors: {}", e)))?;
 
         for (name, layer) in lora_layers {
             // Load lora_down
@@ -474,9 +472,8 @@ impl CheckpointManager {
         .map_err(|e| {
             flame_core::Error::InvalidOperation(format!("Failed to serialize JSON: {}", e))
         })?;
-        fs::write(meta_path, meta).map_err(|e| {
-            flame_core::Error::Io(format!("Failed to write EMA metadata: {}", e))
-        })?;
+        fs::write(meta_path, meta)
+            .map_err(|e| flame_core::Error::Io(format!("Failed to write EMA metadata: {}", e)))?;
 
         Ok(())
     }
@@ -492,9 +489,8 @@ impl CheckpointManager {
 
         // Load metadata
         let meta_path = path.with_extension("json");
-        let meta_data = fs::read_to_string(meta_path).map_err(|e| {
-            flame_core::Error::Io(format!("Failed to read EMA metadata: {}", e))
-        })?;
+        let meta_data = fs::read_to_string(meta_path)
+            .map_err(|e| flame_core::Error::Io(format!("Failed to read EMA metadata: {}", e)))?;
         let meta: EMAMetadata = serde_json::from_str(&meta_data)
             .map_err(|e| {
                 flame_core::Error::InvalidOperation(format!("Failed to parse JSON: {}", e))

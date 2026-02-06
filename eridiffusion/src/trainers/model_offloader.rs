@@ -100,10 +100,7 @@ impl ModelOffloader {
         let offloaded = {
             let offloaded_models = self.offloaded_models.lock().unwrap();
             offloaded_models.get(name).cloned().ok_or_else(|| {
-                Error::InvalidOperation(format!(
-                    "Model '{}' not found in offloaded storage",
-                    name
-                ))
+                Error::InvalidOperation(format!("Model '{}' not found in offloaded storage", name))
             })?
         };
 

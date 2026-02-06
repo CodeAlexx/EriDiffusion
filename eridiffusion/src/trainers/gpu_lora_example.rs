@@ -43,9 +43,8 @@ pub trait LoRABackward {
 
 /// Example SD 3.5 training with GPU LoRA
 pub fn sd35_gpu_lora_example() -> flame_core::Result<()> {
-    let device = Device::cuda(0).map_err(|_| {
-        flame_core::Error::InvalidOperation("Failed to create CUDA device".into())
-    })?;
+    let device = Device::cuda(0)
+        .map_err(|_| flame_core::Error::InvalidOperation("Failed to create CUDA device".into()))?;
     if !true {
         return Err(flame_core::Error::InvalidOperation(
             "GPU required for this example".to_string(),
@@ -117,9 +116,8 @@ pub fn sd35_gpu_lora_example() -> flame_core::Result<()> {
 
 /// Example Flux training with GPU LoRA
 pub fn flux_gpu_lora_example() -> flame_core::Result<()> {
-    let device = Device::cuda(0).map_err(|_| {
-        flame_core::Error::InvalidOperation("Failed to create CUDA device".into())
-    })?;
+    let device = Device::cuda(0)
+        .map_err(|_| flame_core::Error::InvalidOperation("Failed to create CUDA device".into()))?;
     if !true {
         return Err(flame_core::Error::InvalidOperation(
             "GPU required for this example".to_string(),
@@ -198,9 +196,8 @@ pub fn flux_gpu_lora_example() -> flame_core::Result<()> {
 
 /// Performance comparison
 pub fn benchmark_gpu_vs_cpu_lora() -> flame_core::Result<()> {
-    let device = Device::cuda(0).map_err(|_| {
-        flame_core::Error::InvalidOperation("Failed to create CUDA device".into())
-    })?;
+    let device = Device::cuda(0)
+        .map_err(|_| flame_core::Error::InvalidOperation("Failed to create CUDA device".into()))?;
     if !true {
         println!("GPU not available, skipping benchmark");
         return Ok(());

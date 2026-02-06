@@ -227,14 +227,16 @@ impl DiffusionInference for FluxInference {
         Ok(())
     }
 
-    fn encode_prompt(&self, prompt: &str) -> flame_core::Result<Tensor> {
+    fn encode_prompt(&mut self, prompt: &str) -> flame_core::Result<Tensor> {
         // Now actually encode - will fail if encoders not loaded
-        let clip_encoder = self.clip_encoder.as_ref().ok_or_else(|| {
-            flame_core::Error::InvalidOperation("CLIP encoder not loaded".into())
-        })?;
-        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
-            flame_core::Error::InvalidOperation("Tokenizer not loaded".into())
-        })?;
+        let clip_encoder = self
+            .clip_encoder
+            .as_ref()
+            .ok_or_else(|| flame_core::Error::InvalidOperation("CLIP encoder not loaded".into()))?;
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| flame_core::Error::InvalidOperation("Tokenizer not loaded".into()))?;
 
         // Actually tokenize and encode
         let encoding = tokenizer
@@ -281,9 +283,10 @@ impl DiffusionInference for FluxInference {
         steps: usize,
         cfg_scale: f64,
     ) -> flame_core::Result<Tensor> {
-        let model = self.model.as_ref().ok_or_else(|| {
-            flame_core::Error::InvalidOperation("Model not loaded".into())
-        })?;
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| flame_core::Error::InvalidOperation("Model not loaded".into()))?;
 
         let mut current_latents = latents.clone();
         let dims = current_latents.shape().dims();
@@ -344,9 +347,10 @@ impl DiffusionInference for FluxInference {
     }
 
     fn decode_vae(&self, latents: &Tensor) -> flame_core::Result<Tensor> {
-        let vae = self.vae.as_ref().ok_or_else(|| {
-            flame_core::Error::InvalidOperation("VAE not loaded".into())
-        })?;
+        let vae = self
+            .vae
+            .as_ref()
+            .ok_or_else(|| flame_core::Error::InvalidOperation("VAE not loaded".into()))?;
 
         // Flux uses a scaling factor for latents
         let scaling_factor = 0.3611; // Flux-specific VAE scaling
@@ -373,10 +377,7 @@ impl DiffusionInference for FluxInference {
         println!("Applying {} LoRA weights with scale {}", lora_weights.len(), scale);
 
         // Get model reference
-        let model = self
-            .model
-            .as_mut()
-            .ok_or_else(|| anyhow::Error::msg("Model not loaded"))?;
+        let model = self.model.as_mut().ok_or_else(|| anyhow::Error::msg("Model not loaded"))?;
 
         // Apply LoRA weights to the model
         // This would need to be implemented in FluxWrapper

@@ -1,76 +1,95 @@
-// Imports moved to re-exports section below
 use flame_core::device::Device;
 use flame_core::{DType, Shape, Tensor};
-// backward is a method on Tensor, not a standalone function
-// GradientMap needs to be imported differently
-use flame_core::optimizers::{Adam, SGD};
 
-pub mod flame_clip;
-pub mod flame_migration_helpers;
-pub mod flame_unet;
-pub mod flame_unet_lora;
-pub mod flame_vae;
+// --- FLAME model implementations for diffusion models ---
 
-// FLAME model implementations for diffusion models
-
+// Core building blocks
 pub mod attention;
 pub mod resnet;
-pub mod sdxl_unet_complete;
-pub mod text_encoder;
-pub mod text_encoder_complete;
-pub mod unet_2d;
-pub mod vae;
-pub mod vae_complete;
-// pub mod sd35_mmdit_complete;  // Commented out - using mmdit_blocks instead
-pub mod autoencoder_kl;
-pub mod clip;
-pub mod fast_vae;
+pub mod tensor_utils;
+pub mod aligned_image_processor;
+
+// Flux
+pub mod flux_model_complete;
 pub mod flux_blocks;
 pub mod flux_blocks_fixed;
-pub mod flux_complete;
-pub mod flux_lora_wrapper;
-pub mod flux_model_complete;
 pub mod flux_vae;
-pub mod mmdit_blocks;
-pub mod sdxl_time_ids;
+
+// SDXL
+pub mod sdxl_unet_complete;
 pub mod sdxl_unet;
-pub mod sdxl_unet_fixed;
 pub mod sdxl_vae;
-pub mod tensor_utils;
-pub mod unified_vae;
-// pub mod efficient_attention;
-pub mod aligned_image_processor;
-pub mod bucket_alignment;
-pub mod bucket_aware_vae;
-pub mod bucket_config;
-pub mod cuda_alignment;
+pub mod sdxl_time_ids;
+
+// SD3.5 / MMDiT
+pub mod mmdit_blocks;
+pub mod mmdit_cpu;
+
+// Text encoders
+pub mod text_encoder_complete;
+pub mod text_encoders_cpu;
+
+// VAE
+pub mod vae_complete;
+
+// LoRA
 pub mod lora;
-pub mod streaming_t5; // GPU-only streaming T5 encoder with cuDNN optimization
-pub mod t5; // T5 text encoder model
+// pub mod lora_attention; // Disabled: uses candle-style API, only referenced by disabled lora_transformer/lora_unet_blocks
+// pub mod lora_transformer; // Disabled: depends on lora_with_gradients (corrupted)
+// pub mod lora_unet_blocks; // Disabled: corrupted/incomplete file with syntax errors
+// pub mod lora_with_gradients; // Disabled: corrupted/incomplete file with syntax errors
+
+// Flux LoRA wrapper (used by production trainers)
+pub mod flux_lora_wrapper;
+
+// Legacy FLAME wrappers (still used by production binaries)
+pub mod flame_migration_helpers;
+pub mod flame_vae;
+
+// Other
+pub mod unet_2d;
+
+// --- Re-exports ---
 
 pub use resnet::{
     Downsample2D, ResNetTensorExt, ResNetTensorExt as TensorExt, ResnetBlock2D, Upsample2D,
 };
-// Conv2d and GroupNorm come from flame_core, import them directly from there
-pub use attention::{Attention, BasicTransformerBlock, SpatialTransformer};
+pub use attention::{Attention, AttentionBlock, BasicTransformerBlock, FeedForward, SpatialTransformer};
 pub use sdxl_unet_complete::{
     UNet2DConditionModel as SDXLUNet, UNet2DConditionModel, UNet2DConditionModelConfig,
+    UNet2DConditionModelConfig as UNet2DConfig,
 };
 pub use text_encoder_complete::{CLIPConfig, CLIPTextEncoder, T5Config, T5Encoder};
-pub use unified_vae::{VAEConfig as UnifiedVAEConfig, VAE as UnifiedVAE, VAE as AutoencoderKL};
 pub use vae_complete::{AutoEncoderKL, VAEConfig};
-// pub use sd35_mmdit_complete::{SD35MMDiT, SD35Config};
-pub use flux_complete::{FluxConfig, FluxModel as FluxComplete};
 pub use flux_model_complete::{patchify_for_flux, FluxModel, FluxModelConfig};
-pub use mmdit_blocks::{MMDiT as SD35MMDiT, MMDiTConfig as SD35Config};
-// Re-export from sdxl_unet if needed
-pub mod direct_var_builder;
-pub use attention::{AttentionBlock, FeedForward};
-pub use mmdit_blocks::{MMDiT, MMDiTConfig};
-pub use sdxl_unet_complete::UNet2DConditionModelConfig as UNet2DConfig;
-pub use text_encoder::{
-    CLIPConfig as ClipConfig, T5Config as TextEncoderT5Config, T5Encoder as T5EncoderModel,
-};
+pub use mmdit_blocks::{MMDiT, MMDiTConfig, MMDiT as SD35MMDiT, MMDiTConfig as SD35Config};
+
+// Compatibility aliases for old import paths (clip.rs, t5.rs, text_encoder.rs, vae.rs were consolidated)
+pub mod clip {
+    pub use super::text_encoder_complete::{
+        CLIPConfig as Config,
+        CLIPTextEncoder as ClipTextTransformer,
+        CLIPTextEncoderOutput,
+        CLIPConfig,
+        CLIPTextEncoder,
+    };
+}
+pub mod t5 {
+    pub use super::text_encoder_complete::{T5Config, T5Encoder as T5EncoderModel, T5Output};
+}
+pub mod text_encoder {
+    pub use super::text_encoder_complete::*;
+}
+pub mod vae {
+    pub use super::vae_complete::*;
+}
+pub mod flux_complete {
+    pub use super::flux_model_complete::{FluxModel, FluxModelConfig as FluxConfig, FluxModelConfig};
+    pub use super::flux_model_complete::*;
+}
+
+// Top-level alias so `use crate::models::T5EncoderModel` works
+pub use text_encoder_complete::T5Encoder as T5EncoderModel;
 
 // BlockConfig for backwards compatibility
 #[derive(Debug, Clone)]
@@ -78,5 +97,3 @@ pub struct BlockConfig {
     pub out_channels: usize,
     pub use_cross_attn: Option<usize>,
 }
-pub use text_encoder::CLIPTextEncoder as ClipTextTransformer;
-pub use vae::{AutoEncoderKL as VAE, VAEConfig as BasicVAEConfig};

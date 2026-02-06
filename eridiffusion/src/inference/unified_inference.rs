@@ -5,6 +5,7 @@ use half::{bf16, f16};
 use safetensors::{SafeTensors, tensor::Dtype as SafeDtype};
 use std::{collections::HashMap, path::PathBuf};
 use std::path::Path;
+use crate::models::mmdit_blocks::ArenaScratch;
 
 pub struct MemoryConfig {
     pub max_gpu_memory_gb: f32,
@@ -550,11 +551,32 @@ pooled.clone()
 };
 
 // Forward pass
+let timestep_scratch = if timestep.dtype() == DType::BF16 && timestep.storage_dtype() == DType::BF16 {
+    Some(ArenaScratch::from_tensor(&timestep).copy_from(&timestep)?)
+} else {
+    None
+};
+let context_scratch = if context.dtype() == DType::BF16 && context.storage_dtype() == DType::BF16 {
+    Some(ArenaScratch::from_tensor(&context).copy_from(&context)?)
+} else {
+    None
+};
+let pooled_scratch = if pooled_input.dtype() == DType::BF16
+    && pooled_input.storage_dtype() == DType::BF16
+{
+    Some(ArenaScratch::from_tensor(&pooled_input).copy_from(&pooled_input)?)
+} else {
+    None
+};
+let timestep_ref = timestep_scratch.as_ref().unwrap_or(&timestep);
+let context_ref = context_scratch.as_ref().unwrap_or(&context);
+let pooled_ref = pooled_scratch.as_ref().unwrap_or(&pooled_input);
+
 let noise_pred = self.mmdit.forward(
-&latent_input,
-&timestep,
-&context,
-&pooled_input,
+    &latent_input,
+    timestep_ref,
+    context_ref,
+    Some(pooled_ref),
 )?;
 
 // Apply guidance

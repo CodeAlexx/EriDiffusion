@@ -1,13 +1,21 @@
-use anyhow::Result;
-use flame_core::{Tensor, DType, Shape};
 use crate::chroma::lora::LoRALinear;
+use anyhow::Result;
+use flame_core::{DType, Shape, Tensor};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy)]
-pub enum MaskType { TopKNorm, AttnTopK, Random, Uniform }
+pub enum MaskType {
+    TopKNorm,
+    AttnTopK,
+    Random,
+    Uniform,
+}
 
 #[derive(Debug, Clone, Copy)]
-pub enum ReinjectMode { Residual, Concat }
+pub enum ReinjectMode {
+    Residual,
+    Concat,
+}
 
 #[derive(Debug, Clone)]
 pub struct TreadCfg {
@@ -45,8 +53,20 @@ pub struct TreadState {
 }
 
 impl TreadState {
-    pub fn new() -> Self { Self { shelves: BTreeMap::new(), kept_tokens_sum: 0, kept_tokens_cnt: 0, kept_frac_per_layer: BTreeMap::new(), route_miss: 0, route_lambda: 0.0 } }
-    pub fn log_kept(&mut self, kept: usize) { self.kept_tokens_sum += kept; self.kept_tokens_cnt += 1; }
+    pub fn new() -> Self {
+        Self {
+            shelves: BTreeMap::new(),
+            kept_tokens_sum: 0,
+            kept_tokens_cnt: 0,
+            kept_frac_per_layer: BTreeMap::new(),
+            route_miss: 0,
+            route_lambda: 0.0,
+        }
+    }
+    pub fn log_kept(&mut self, kept: usize) {
+        self.kept_tokens_sum += kept;
+        self.kept_tokens_cnt += 1;
+    }
 }
 
 /// Runtime routing context built from config/env for quick checks in hot paths
@@ -63,12 +83,20 @@ pub struct TreadCtx {
 
 impl TreadCtx {
     pub fn disabled() -> Self {
-        Self { enabled: false, mask_type: MaskType::TopKNorm, k_abs: None, k_frac: Some(0.25), schedule: BTreeMap::new(), reinject_mode: ReinjectMode::Residual, lambda: 0.0 }
+        Self {
+            enabled: false,
+            mask_type: MaskType::TopKNorm,
+            k_abs: None,
+            k_frac: Some(0.25),
+            schedule: BTreeMap::new(),
+            reinject_mode: ReinjectMode::Residual,
+            lambda: 0.0,
+        }
     }
 
     /// Build from environment variables (compat shim for current trainers)
     pub fn from_env() -> Self {
-        let enabled = std::env::var("TREAD_ENABLED").ok().map(|v| v=="1").unwrap_or(false);
+        let enabled = std::env::var("TREAD_ENABLED").ok().map(|v| v == "1").unwrap_or(false);
         let k_abs = std::env::var("TREAD_K").ok().and_then(|s| s.parse::<usize>().ok());
         let k_frac = std::env::var("TREAD_K_FRAC").ok().and_then(|s| s.parse::<f32>().ok());
         let mask_type = match std::env::var("TREAD_MASK_TYPE").ok().as_deref() {
@@ -81,12 +109,14 @@ impl TreadCtx {
             Some("concat") => ReinjectMode::Concat,
             _ => ReinjectMode::Residual,
         };
-        let lambda = std::env::var("TREAD_LAMBDA").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+        let lambda =
+            std::env::var("TREAD_LAMBDA").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
         let mut schedule: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         if let Ok(env) = std::env::var("TREAD_SCHEDULE") {
             for pair in env.split(',') {
-                if let Some((a,b)) = pair.split_once(':') {
-                    if let (Ok(oi), Ok(ii)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+                if let Some((a, b)) = pair.split_once(':') {
+                    if let (Ok(oi), Ok(ii)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>())
+                    {
                         schedule.entry(oi).or_default().push(ii);
                     }
                 }
@@ -98,7 +128,9 @@ impl TreadCtx {
 
 /// Resolve k given absolute or fractional request; clamps to [1, T]
 pub fn resolve_k(k_abs: Option<usize>, k_frac: Option<f32>, t: usize) -> usize {
-    if let Some(k) = k_abs { return k.clamp(1, t.max(1)); }
+    if let Some(k) = k_abs {
+        return k.clamp(1, t.max(1));
+    }
     let frac = k_frac.unwrap_or(0.25).clamp(0.0, 1.0);
     let k = ((t as f32) * frac).round() as usize;
     k.clamp(1, t.max(1))
@@ -117,7 +149,12 @@ pub fn build_mask(x: &Tensor, mask_type: MaskType, k: usize) -> Result<Tensor> {
             for _ in 0..b {
                 let mut count = 0usize;
                 for j in 0..t {
-                    if count < k && j % stride == 0 { out.push(1.0); count += 1; } else { out.push(0.0); }
+                    if count < k && j % stride == 0 {
+                        out.push(1.0);
+                        count += 1;
+                    } else {
+                        out.push(0.0);
+                    }
                 }
             }
             Ok(Tensor::from_vec(out, Shape::from_dims(&[b, t]), dev)?)
@@ -130,11 +167,15 @@ pub fn build_mask(x: &Tensor, mask_type: MaskType, k: usize) -> Result<Tensor> {
             let sc = scores.to_dtype(DType::F32)?.to_vec()?; // host thresholding per batch
             let mut mask_host: Vec<f32> = Vec::with_capacity(b * t);
             for bi in 0..b {
-                let row = &sc[bi*t..(bi+1)*t];
+                let row = &sc[bi * t..(bi + 1) * t];
                 let mut idxs: Vec<usize> = (0..t).collect();
-                idxs.sort_unstable_by(|&i,&j| row[j].partial_cmp(&row[i]).unwrap_or(std::cmp::Ordering::Equal));
+                idxs.sort_unstable_by(|&i, &j| {
+                    row[j].partial_cmp(&row[i]).unwrap_or(std::cmp::Ordering::Equal)
+                });
                 let mut row_mask = vec![0.0f32; t];
-                for &ix in idxs.iter().take(k) { row_mask[ix] = 1.0f32; }
+                for &ix in idxs.iter().take(k) {
+                    row_mask[ix] = 1.0f32;
+                }
                 mask_host.extend(row_mask);
             }
             Ok(Tensor::from_vec(mask_host, Shape::from_dims(&[b, t]), dev)?)
@@ -158,17 +199,30 @@ pub fn gather_bf16(x: &Tensor, mask_bt: &Tensor) -> Result<Tensor> {
 }
 
 /// Reinjection: Residual add or Concat(+proj) of shelf `r` into `x` at layer `in_layer`.
-pub fn reinject(x: &Tensor, r: &Tensor, mode: ReinjectMode, proj_w: Option<&Tensor>) -> Result<Tensor> {
+pub fn reinject(
+    x: &Tensor,
+    r: &Tensor,
+    mode: ReinjectMode,
+    proj_w: Option<&Tensor>,
+) -> Result<Tensor> {
     match mode {
         ReinjectMode::Residual => {
             // Add back BF16 shelf after padding to match T if needed (pad/truncate to T along dim=1)
             let dims = x.shape().dims().to_vec();
             let (b, t, d) = (dims[0], dims[1], dims[2]);
             let r_dims = r.shape().dims().to_vec();
-            let rr = if r_dims[1] == t { r.clone() } else if r_dims[1] > t { r.narrow(1, 0, t)? } else {
+            let rr = if r_dims[1] == t {
+                r.clone()
+            } else if r_dims[1] > t {
+                r.narrow(1, 0, t)?
+            } else {
                 // pad along T with zeros
                 let need = t - r_dims[1];
-                let pad = Tensor::zeros_dtype(Shape::from_dims(&[b, need, d]), x.dtype(), x.device().clone())?;
+                let pad = Tensor::zeros_dtype(
+                    Shape::from_dims(&[b, need, d]),
+                    x.dtype(),
+                    x.device().clone(),
+                )?;
                 Tensor::cat(&[r, &pad], 1)?
             };
             Ok(x.add(&rr)?)
@@ -179,8 +233,12 @@ pub fn reinject(x: &Tensor, r: &Tensor, mode: ReinjectMode, proj_w: Option<&Tens
                 // [B,T2,D] x [D,Do] → [B,T2,Do]
                 let dims = concat.shape().dims().to_vec();
                 let (b, tt, dd) = (dims[0], dims[1], dims[2]);
-                let flat = concat.reshape(&[b*tt, dd])?;
-                let out = if flat.dtype() == DType::BF16 && w.dtype() == DType::BF16 { flat.matmul_bf16(w)? } else { flat.matmul(w)? };
+                let flat = concat.reshape(&[b * tt, dd])?;
+                let out = if flat.dtype() == DType::BF16 && w.dtype() == DType::BF16 {
+                    flat.matmul_bf16(w)?
+                } else {
+                    flat.matmul(w)?
+                };
                 Ok(out.reshape(&[b, tt, out.shape().dims()[1]])?)
             } else {
                 Ok(concat)
@@ -215,26 +273,37 @@ pub fn route_out_if_scheduled(
     ctx: &TreadCtx,
     state: &mut TreadState,
 ) -> Result<()> {
-    if !ctx.enabled { return Ok(()); }
-    if !ctx.schedule.contains_key(&layer_idx) { return Ok(()); }
+    if !ctx.enabled {
+        return Ok(());
+    }
+    if !ctx.schedule.contains_key(&layer_idx) {
+        return Ok(());
+    }
     let t = x.shape().dims()[1];
     let k = resolve_k(ctx.k_abs, ctx.k_frac, t);
     // build mask; AttnTopK uses attention mass if provided
     let mask = if matches!(ctx.mask_type, MaskType::AttnTopK) {
         if let Some(attn) = attn_opt {
             // scores: sum over last dim: [B,T,T] -> [B,T]
-            let sc = attn.to_dtype(DType::F32)?.sum_dim_keepdim(attn.shape().dims().len()-1)?.squeeze(None)?;
+            let sc = attn
+                .to_dtype(DType::F32)?
+                .sum_dim_keepdim(attn.shape().dims().len() - 1)?
+                .squeeze(None)?;
             // host select exact top-k per batch
             let b = sc.shape().dims()[0];
             let tlen = sc.shape().dims()[1];
             let host = sc.to_vec()?;
             let mut mask_host: Vec<f32> = Vec::with_capacity(b * tlen);
             for bi in 0..b {
-                let row = &host[bi*tlen..(bi+1)*tlen];
+                let row = &host[bi * tlen..(bi + 1) * tlen];
                 let mut idxs: Vec<usize> = (0..tlen).collect();
-                idxs.sort_unstable_by(|&i,&j| row[j].partial_cmp(&row[i]).unwrap_or(std::cmp::Ordering::Equal));
+                idxs.sort_unstable_by(|&i, &j| {
+                    row[j].partial_cmp(&row[i]).unwrap_or(std::cmp::Ordering::Equal)
+                });
                 let mut row_mask = vec![0.0f32; tlen];
-                for &ix in idxs.iter().take(k) { row_mask[ix] = 1.0f32; }
+                for &ix in idxs.iter().take(k) {
+                    row_mask[ix] = 1.0f32;
+                }
                 mask_host.extend(row_mask);
             }
             Tensor::from_vec(mask_host, Shape::from_dims(&[b, tlen]), x.device().clone())?
@@ -249,7 +318,9 @@ pub fn route_out_if_scheduled(
     state.log_kept(kept);
     // record kept fraction for this layer
     let t = x.shape().dims()[1] as f32;
-    if t > 0.0 { state.kept_frac_per_layer.insert(layer_idx, (k as f32) / t); }
+    if t > 0.0 {
+        state.kept_frac_per_layer.insert(layer_idx, (k as f32) / t);
+    }
     // echo current lambda for metrics
     state.route_lambda = ctx.lambda;
     state.shelves.insert(layer_idx, r);
@@ -263,7 +334,9 @@ pub fn reinject_if_scheduled(
     ctx: &TreadCtx,
     state: &mut TreadState,
 ) -> Result<Tensor> {
-    if !ctx.enabled { return Ok(x.clone()); }
+    if !ctx.enabled {
+        return Ok(x.clone());
+    }
     // Collect all shelves whose out layer maps to current layer_idx
     let mut cats: Vec<Tensor> = Vec::new();
     let mut expected: usize = 0;
@@ -277,9 +350,17 @@ pub fn reinject_if_scheduled(
             }
         }
     }
-    if expected > found { state.route_miss = state.route_miss.saturating_add((expected - found) as u32); }
-    if cats.is_empty() { return Ok(x.clone()); }
-    let r_all = if cats.len()==1 { cats.remove(0) } else { Tensor::cat(&cats.iter().collect::<Vec<_>>(), 1)? };
+    if expected > found {
+        state.route_miss = state.route_miss.saturating_add((expected - found) as u32);
+    }
+    if cats.is_empty() {
+        return Ok(x.clone());
+    }
+    let r_all = if cats.len() == 1 {
+        cats.remove(0)
+    } else {
+        Tensor::cat(&cats.iter().collect::<Vec<_>>(), 1)?
+    };
     reinject(x, &r_all, ctx.reinject_mode, None)
 }
 
@@ -302,15 +383,24 @@ impl TreadState {
             s / (self.kept_frac_per_layer.len() as f32)
         };
         // ordered per-layer fractions
-        let kept_frac: Vec<f32> = self.kept_frac_per_layer.iter().map(|(_k,v)| *v).collect();
+        let kept_frac: Vec<f32> = self.kept_frac_per_layer.iter().map(|(_k, v)| *v).collect();
         // sum shelves bytes
         let mut bytes: usize = 0;
         for (_k, t) in self.shelves.iter() {
             let ne = t.shape().elem_count();
-            let bpe = match t.dtype() { DType::BF16 | DType::F16 => 2usize, _ => 4usize };
+            let bpe = match t.dtype() {
+                DType::BF16 | DType::F16 => 2usize,
+                _ => 4usize,
+            };
             bytes = bytes.saturating_add(ne * bpe);
         }
         let shelves_mb = (bytes as f32) / (1024.0 * 1024.0);
-        TreadMetrics { kept_avg, kept_frac, shelves_mb, route_miss: self.route_miss, route_lambda: self.route_lambda }
+        TreadMetrics {
+            kept_avg,
+            kept_frac,
+            shelves_mb,
+            route_miss: self.route_miss,
+            route_lambda: self.route_lambda,
+        }
     }
 }

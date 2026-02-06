@@ -293,10 +293,7 @@ impl BlockSwapManager {
 
         let mut block_data = self.block_data.write().unwrap();
         let data = block_data.get_mut(block_id).ok_or_else(|| {
-            flame_core::Error::InvalidOperation(format!(
-                "Block data not found for {}",
-                block_id
-            ))
+            flame_core::Error::InvalidOperation(format!("Block data not found for {}", block_id))
         })?;
 
         match block_info.location {
@@ -369,10 +366,7 @@ impl BlockSwapManager {
     fn swap_out(&self, block_id: &str) -> flame_core::Result<()> {
         let mut block_data = self.block_data.write().unwrap();
         let data = block_data.get_mut(block_id).ok_or_else(|| {
-            flame_core::Error::InvalidOperation(format!(
-                "Block data not found for {}",
-                block_id
-            ))
+            flame_core::Error::InvalidOperation(format!("Block data not found for {}", block_id))
         })?;
 
         if let Some(tensor) = &data.gpu_tensor {
@@ -461,10 +455,10 @@ impl BlockSwapManager {
     fn save_to_disk(&self, block_id: &str, data: &[u8]) -> flame_core::Result<PathBuf> {
         let path = self.config.swap_dir.join(format!("{}.block", block_id));
 
-        let mut file =
-            BufWriter::new(File::create(&path).map_err(|e| {
-                flame_core::Error::Io(format!("Failed to create file: {}", e))
-            })?);
+        let mut file = BufWriter::new(
+            File::create(&path)
+                .map_err(|e| flame_core::Error::Io(format!("Failed to create file: {}", e)))?,
+        );
         file.write_all(data).map_err(|e| {
             flame_core::Error::InvalidOperation(format!("Failed to write file: {}", e))
         })?;

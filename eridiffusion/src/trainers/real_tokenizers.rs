@@ -124,22 +124,17 @@ impl RealTextEncoder {
         // Use the tokenizers we downloaded
         let tokenizers_dir = "/home/alex/diffusers-rs/tokenizers";
 
-        let clip_tokenizer =
-            Tokenizer::from_file(format!("{}/clip_tokenizer.json", tokenizers_dir)).map_err(
-                |e| {
-                    flame_core::Error::InvalidOperation(format!(
-                        "Failed to load CLIP tokenizer: {:?}",
-                        e
-                    ))
-                },
-            )?;
+        let clip_tokenizer = Tokenizer::from_file(format!(
+            "{}/clip_tokenizer.json",
+            tokenizers_dir
+        ))
+        .map_err(|e| {
+            flame_core::Error::InvalidOperation(format!("Failed to load CLIP tokenizer: {:?}", e))
+        })?;
 
         let t5_tokenizer = Tokenizer::from_file(format!("{}/t5_tokenizer.json", tokenizers_dir))
             .map_err(|e| {
-                flame_core::Error::InvalidOperation(format!(
-                    "Failed to load T5 tokenizer: {:?}",
-                    e
-                ))
+                flame_core::Error::InvalidOperation(format!("Failed to load T5 tokenizer: {:?}", e))
             })?;
 
         info!("Tokenizers loaded successfully!");
@@ -219,7 +214,7 @@ impl RealTextEncoder {
             let wl = WeightLoader::from_safetensors(clip_l_path, self.device.clone())?;
             let config = crate::models::text_encoder::CLIPConfig::clip_l();
             let weights = wl.weights;
-            let model = clip::ClipTextTransformer::new(config, &self.device, weights)?;
+            let model = clip::ClipTextTransformer::new(config, self.device.clone(), weights)?;
 
             let mut embeds = Vec::new();
             let mut pooled = Vec::new();
@@ -264,7 +259,7 @@ impl RealTextEncoder {
             let wl = WeightLoader::from_safetensors(clip_g_path, self.device.clone())?;
             let config = crate::models::text_encoder::CLIPConfig::clip_g();
             let weights = wl.weights;
-            let model = clip::ClipTextTransformer::new(config, &self.device, weights)?;
+            let model = clip::ClipTextTransformer::new(config, self.device.clone(), weights)?;
 
             let mut embeds = Vec::new();
             let mut pooled = Vec::new();
@@ -398,17 +393,7 @@ impl RealTextEncoder {
         let wl = WeightLoader::from_safetensors(t5_path, cpu_device)?;
 
         // T5-XXL config
-        let config = crate::models::text_encoder::T5Config {
-            vocab_size: 32128,
-            d_model: 4096,
-            d_ff: 10240,
-            num_layers: 24,
-            num_heads: 64,
-            relative_attention_num_buckets: 32,
-            relative_attention_max_distance: 128,
-            dropout_rate: 0.1,
-            layer_norm_epsilon: 1e-6,
-        };
+        let config = crate::models::text_encoder::T5Config::t5_xxl();
 
         // TODO: T5EncoderModel not yet implemented
         return Err(flame_core::Error::InvalidOperation(
@@ -482,20 +467,10 @@ impl RealTextEncoder {
                 }
             }
 
-            let wl = WeightLoader { weights: layer_tensors, device: self.device.clone() };
+            let wl = WeightLoader::from_tensor_map(layer_tensors, self.device.clone());
 
             // Minimal T5 config to reduce memory
-            let config = crate::models::text_encoder::T5Config {
-                vocab_size: 32128,
-                d_model: 4096,
-                d_ff: 10240,
-                num_layers: 24,
-                num_heads: 64,
-                relative_attention_num_buckets: 32,
-                relative_attention_max_distance: 128,
-                dropout_rate: 0.0, // No dropout for inference
-                layer_norm_epsilon: 1e-6,
-            };
+            let config = crate::models::text_encoder::T5Config::t5_xxl();
 
             // Try to create and run the model
             // TODO: T5EncoderModel not yet implemented - fail loudly

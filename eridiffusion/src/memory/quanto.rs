@@ -638,10 +638,7 @@ impl QuantoManager {
             }
             Ok(tensor)
         } else {
-            return Err(flame_core::Error::InvalidOperation(format!(
-                "Weight not found: {}",
-                name
-            )));
+            return Err(flame_core::Error::InvalidOperation(format!("Weight not found: {}", name)));
         }
     }
 

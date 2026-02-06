@@ -53,13 +53,9 @@ impl FluxLoraLinear {
         let a = self.a.tensor()?; // [rank, IN]
         let b_w = self.b.tensor()?; // [OUT, rank]
 
-        let x32 = x.to_dtype(DType::F32)?;
-        let a32 = a.to_dtype(DType::F32)?;
-        let b32 = b_w.to_dtype(DType::F32)?;
-
-        let a_t = a32.transpose_dims(0, 1)?; // [IN, rank]
-        let u = x32.matmul(&a_t)?; // [BS, rank]
-        let b_t = b32.transpose_dims(0, 1)?; // [rank, OUT]
+        let a_t = a.transpose_dims(0, 1)?; // [IN, rank]
+        let u = x.matmul(&a_t)?; // [BS, rank]
+        let b_t = b_w.transpose_dims(0, 1)?; // [rank, OUT]
         let delta_flat = u.matmul(&b_t)?; // [BS, OUT]
         let scale = self.alpha / self.rank as f32;
         let delta = delta_flat.affine(scale, 0.0f32)?;

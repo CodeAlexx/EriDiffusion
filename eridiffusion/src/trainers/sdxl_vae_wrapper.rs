@@ -328,14 +328,7 @@ impl SDXLVAEWrapper {
         // The decoder up blocks go from smaller to larger channels (128->512)
         // But FLAME expects them to go from larger to smaller (512->128)
         // So we need to reverse the order
-        let config = crate::stable_diffusion_compat::vae::VAEConfig {
-            block_out_channels: vec![128, 256, 512, 512],
-            layers_per_block: 2,
-            latent_channels: 4,
-            norm_num_groups: 32,
-            use_quant_conv: true,
-            use_post_quant_conv: true,
-        };
+        let config = crate::stable_diffusion_compat::vae::VAEConfig::sdxl();
 
         // Create VAE with WeightLoader
         info!(
@@ -343,7 +336,7 @@ impl SDXLVAEWrapper {
             vec![128, 256, 512, 512]
         );
         let weights = wl.weights;
-        let vae = match crate::models::vae::AutoEncoderKL::new(config, device.clone(), weights) {
+        let vae = match crate::models::vae::AutoEncoderKL::new(config, &device, weights) {
             Ok(vae) => vae,
             Err(e) => {
                 info!("Error creating AutoEncoderKL: {}", e);

@@ -231,9 +231,7 @@ impl SDXLResolutions {
             ));
         }
         if height > 2048 || width > 2048 {
-            return Err(Error::InvalidOperation(
-                "SDXL maximum dimension is 2048px".to_string(),
-            ));
+            return Err(Error::InvalidOperation("SDXL maximum dimension is 2048px".to_string()));
         }
         if (height * width) > (2048 * 2048) {
             return Err(Error::InvalidOperation(

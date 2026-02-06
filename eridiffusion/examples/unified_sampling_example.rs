@@ -75,7 +75,7 @@ async fn sample_sd35() -> Result<()> {
 
     // Mock model components
     let components = ModelComponents::SD35 {
-        mmdit: Box::new(|_latents, _timestep, _text_embeds, _pooled| {
+        mmdit: Box::new(|_latents, _timestep, _text_embeds, _pooled_opt| {
             // Mock MMDiT forward
             Ok(flame_core::Tensor::randn(0.0, 1.0, &[1, 16, 128, 128], device)?)
         }),

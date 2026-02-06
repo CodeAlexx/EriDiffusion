@@ -48,9 +48,8 @@ pub fn save_image(
     prompt: &str,
 ) -> flame_core::Result<PathBuf> {
     // Ensure output directory exists
-    std::fs::create_dir_all(output_dir).map_err(|e| {
-        flame_core::Error::Io(format!("Failed to create output directory: {}", e))
-    })?;
+    std::fs::create_dir_all(output_dir)
+        .map_err(|e| flame_core::Error::Io(format!("Failed to create output directory: {}", e)))?;
 
     // Convert to RGB image
     let image = image_tensor
@@ -184,10 +183,9 @@ pub fn generate_validation_samples(
                 device,
             )
         }
-        _ => Err(flame_core::Error::InvalidOperation(format!(
-            "Unknown model type: {}",
-            model_type
-        ))),
+        _ => {
+            Err(flame_core::Error::InvalidOperation(format!("Unknown model type: {}", model_type)))
+        }
     }
 }
 

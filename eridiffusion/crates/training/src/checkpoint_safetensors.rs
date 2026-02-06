@@ -39,20 +39,30 @@ impl View for OwnedTensorView {
 }
 
 pub fn tensor_to_bf16_bytes(tensor: &Tensor) -> Result<(Vec<usize>, Vec<u8>)> {
-    let f32_tensor = tensor.to_dtype(DType::F32)?;
-    let shape = f32_tensor.shape().dims().to_vec();
-    let values = f32_tensor.to_vec()?;
-    let mut bytes = Vec::with_capacity(values.len() * 2);
-    for v in values {
-        bytes.extend_from_slice(&bf16::from_f32(v).to_le_bytes());
+    let shape = tensor.shape().dims().to_vec();
+    let mut bytes = Vec::with_capacity(shape.iter().product::<usize>() * 2);
+    if tensor.dtype() == DType::BF16 {
+        let raw = tensor.to_vec_bf16()?;
+        for bits in raw {
+            bytes.extend_from_slice(&bits.to_le_bytes());
+        }
+    } else {
+        let values = tensor.to_vec()?;
+        for v in values {
+            bytes.extend_from_slice(&bf16::from_f32(v).to_le_bytes());
+        }
     }
     Ok((shape, bytes))
 }
 
 pub fn tensor_to_f32_bytes(tensor: &Tensor) -> Result<(Vec<usize>, Vec<u8>)> {
-    let f32_tensor = tensor.to_dtype(DType::F32)?;
-    let shape = f32_tensor.shape().dims().to_vec();
-    let values = f32_tensor.to_vec()?;
+    let shape = tensor.shape().dims().to_vec();
+    let values = if tensor.dtype() == DType::BF16 {
+        let raw = tensor.to_vec_bf16()?;
+        raw.into_iter().map(|bits| bf16::from_bits(bits).to_f32()).collect()
+    } else {
+        tensor.to_vec()?
+    };
     let mut bytes = Vec::with_capacity(values.len() * 4);
     for v in values {
         bytes.extend_from_slice(&v.to_le_bytes());
@@ -60,15 +70,20 @@ pub fn tensor_to_f32_bytes(tensor: &Tensor) -> Result<(Vec<usize>, Vec<u8>)> {
     Ok((shape, bytes))
 }
 
-pub fn bf16_bytes_to_f32_vec(bytes: &[u8]) -> Result<Vec<f32>> {
+pub fn bf16_bytes_to_u16_vec(bytes: &[u8]) -> Result<Vec<u16>> {
     if bytes.len() % 2 != 0 {
         bail!("BF16 byte length must be even, got {}", bytes.len());
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
     for chunk in bytes.chunks_exact(2) {
-        out.push(bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32());
+        out.push(u16::from_le_bytes([chunk[0], chunk[1]]));
     }
     Ok(out)
+}
+
+pub fn bf16_bytes_to_f32_vec(bytes: &[u8]) -> Result<Vec<f32>> {
+    let raw = bf16_bytes_to_u16_vec(bytes)?;
+    Ok(raw.into_iter().map(|bits| bf16::from_bits(bits).to_f32()).collect())
 }
 
 pub fn f32_bytes_to_vec(bytes: &[u8]) -> Result<Vec<f32>> {
@@ -128,16 +143,30 @@ pub fn loaded_to_tensor(
     src_dtype: SafeDtype,
     bytes: &[u8],
 ) -> Result<Tensor> {
-    let values_f32 = match src_dtype {
-        SafeDtype::BF16 => bf16_bytes_to_f32_vec(bytes)?,
-        SafeDtype::F32 => f32_bytes_to_vec(bytes)?,
-        other => bail!("unsupported safetensor dtype {:?}", other),
-    };
-    let tensor = tensor_from_slice_on(&values_f32, Shape::from_dims(shape), device, DType::F32)?;
-    if target_dtype == DType::F32 {
-        Ok(tensor)
-    } else {
-        Ok(tensor.to_dtype(target_dtype)?)
+    let shape = Shape::from_dims(shape);
+    match (target_dtype, src_dtype) {
+        (DType::BF16, SafeDtype::BF16) => {
+            let cuda = device.to_flame_cuda()?;
+            Tensor::from_bf16_bytes(bytes, shape, cuda).map_err(Into::into)
+        }
+        (DType::BF16, SafeDtype::F32) => {
+            let values_f32 = f32_bytes_to_vec(bytes)?;
+            let mut bf16_bits = Vec::with_capacity(values_f32.len());
+            for v in values_f32 {
+                bf16_bits.push(bf16::from_f32(v).to_bits());
+            }
+            let cuda = device.to_flame_cuda()?;
+            Tensor::from_bf16_u16_slice(&bf16_bits, shape, cuda).map_err(Into::into)
+        }
+        (DType::F32, SafeDtype::F32) => {
+            let values_f32 = f32_bytes_to_vec(bytes)?;
+            Ok(tensor_from_slice_on(&values_f32, shape, device, DType::F32)?)
+        }
+        (DType::F32, SafeDtype::BF16) => {
+            let values_f32 = bf16_bytes_to_f32_vec(bytes)?;
+            Ok(tensor_from_slice_on(&values_f32, shape, device, DType::F32)?)
+        }
+        other => bail!("unsupported dtype conversion {:?}", other),
     }
 }
 

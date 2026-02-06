@@ -4,8 +4,7 @@
 
 use clap::{Parser, Subcommand};
 use flame_core::device::Device;
-use flame_core::Result;
-use flame_core::{DType, Device};
+use flame_core::{DType, Result};
 use std::path::PathBuf;
 
 /// SD 3.5 CLI - Unified tool for training and inference
@@ -112,9 +111,7 @@ fn train_adapter(
 
     // Load config
     let config_str = std::fs::read_to_string(&config)
-        .map_err(|e| {
-            flame_core::Error::InvalidOperation(format!("Failed to read file: {}", e))
-        })
+        .map_err(|e| flame_core::Error::InvalidOperation(format!("Failed to read file: {}", e)))
         .map_err(|e| flame_core::Error::InvalidOperation(e.to_string()))?;
 
     // Set output directory

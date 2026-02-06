@@ -7,13 +7,68 @@ autobins = false
 [features]
 samples = []
 legacy-bins = []
+cuda = ["flame-core/cuda"]
+bf16_u16 = ["flame-core/bf16_u16"]
+
+[[bin]]
+name = "trainer"
+path = "src/bin/trainer.rs"
+
+[[bin]]
+name = "flux_minimal"
+path = "src/bin/flux_minimal.rs"
+required-features = ["legacy-bins"]
+
+[[bin]]
+name = "sd35"
+path = "src/bin/sd35.rs"
+required-features = ["legacy-bins"]
+
+[[bin]]
+name = "sd35_mmdit_validate"
+path = "src/bin/sd35_mmdit_validate.rs"
+required-features = ["legacy-bins"]
+
+[[bin]]
+name = "sd35_simple"
+path = "src/bin/sd35_simple.rs"
+required-features = ["legacy-bins"]
+
+[[bin]]
+name = "test_permute"
+path = "src/bin/test_permute.rs"
+required-features = ["legacy-bins"]
+
+[[bin]]
+name = "inspect_vae"
+path = "src/bin/inspect_vae.rs"
+required-features = ["legacy-bins"]
+
+[[bin]]
+name = "test_vae_size"
+path = "src/bin/test_vae_size.rs"
+required-features = ["legacy-bins"]
+
+[[bin]]
+name = "verify_vae_conv"
+path = "src/bin/verify_vae_conv.rs"
+required-features = ["legacy-bins"]
+
+[[bin]]
+name = "verify_rms_norm"
+path = "src/bin/verify_rms_norm.rs"
+
+[[bin]]
+name = "verify_attention"
+path = "src/bin/verify_attention.rs"
+required-features = ["legacy-bins"]
 
 [lib]
 name = "eridiffusion"
 path = "src/lib.rs"
 
 [dependencies]
-flame-core = { path = "../flame/flame-core" }
+flame-core = { path = "/home/alex/EriDiffusion/flame-core", features = ["shared_storage"] }
 half = "2.4"
 safetensors = "0.4"
 serde = { version = "1", features = ["derive"] }
@@ -40,6 +95,7 @@ serde_yaml = "0.9.34+deprecated"
 termcolor = "1.4.1"
 thiserror = "1.0.69"
 tokenizers = "0.15.2"
+rayon = "1.8"
 num-traits = "0.2"
 regex = "1.10"
 clap = { version = "4.5", features = ["derive"] }

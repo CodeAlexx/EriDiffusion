@@ -336,10 +336,7 @@ impl Adam8bit {
         };
 
         let data = bincode::serialize(&state).map_err(|e| {
-            flame_core::Error::InvalidOperation(format!(
-                "Failed to serialize optimizer: {}",
-                e
-            ))
+            flame_core::Error::InvalidOperation(format!("Failed to serialize optimizer: {}", e))
         })?;
 
         std::fs::write(path, data).map_err(|e| {
@@ -356,10 +353,7 @@ impl Adam8bit {
         })?;
 
         let state: OptimizerState = bincode::deserialize(&data).map_err(|e| {
-            flame_core::Error::InvalidOperation(format!(
-                "Failed to deserialize optimizer: {}",
-                e
-            ))
+            flame_core::Error::InvalidOperation(format!("Failed to deserialize optimizer: {}", e))
         })?;
 
         self.load_state_dict(state);

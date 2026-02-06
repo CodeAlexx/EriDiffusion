@@ -992,10 +992,7 @@ impl SDXLSampler {
         // Create output directory if needed
         std::fs::create_dir_all(output_dir)
             .map_err(|e| {
-                flame_core::Error::InvalidOperation(format!(
-                    "Failed to create directory: {}",
-                    e
-                ))
+                flame_core::Error::InvalidOperation(format!("Failed to create directory: {}", e))
             })
             .map_err(|e| flame_core::Error::InvalidOperation(e.to_string()))?;
 
@@ -1091,10 +1088,7 @@ impl TrainingSampler {
         let step_dir = self.output_dir.join(format!("step_{:06}", step));
         std::fs::create_dir_all(&step_dir)
             .map_err(|e| {
-                flame_core::Error::InvalidOperation(format!(
-                    "Failed to create directory: {}",
-                    e
-                ))
+                flame_core::Error::InvalidOperation(format!("Failed to create directory: {}", e))
             })
             .map_err(|e| flame_core::Error::InvalidOperation(e.to_string()))?;
 

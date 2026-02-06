@@ -135,9 +135,8 @@ fn create_test_image(width: u32, height: u32) -> Result<()> {
         }
     }
 
-    img.save("flamingo_on_mars_test.png").map_err(|e| {
-        flame_core::Error::InvalidOperation(format!("Failed to save image: {}", e))
-    })?;
+    img.save("flamingo_on_mars_test.png")
+        .map_err(|e| flame_core::Error::InvalidOperation(format!("Failed to save image: {}", e)))?;
 
     println!("✓ Saved test image to flamingo_on_mars_test.png");
 

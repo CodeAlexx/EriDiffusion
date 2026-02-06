@@ -8,10 +8,12 @@ pub mod sdxl;
 pub use flux::generate_flux_image;
 pub mod flame_inference;
 pub mod flux_sampling;
+pub mod mmdit_streaming;
 pub mod numerical_accuracy;
 #[cfg(feature = "experimental")]
 pub mod qwen_image;
 pub mod sd35_sampling;
+pub mod sd35_simple;
 pub mod sdxl_sampling;
 pub mod unified_sampling; // Experimental placeholder for Qwen Image inference
 
@@ -35,7 +37,7 @@ pub trait DiffusionInference {
     fn load_model(&mut self, config: &ModelConfig) -> flame_core::Result<()>;
 
     /// Encode text prompt to embeddings
-    fn encode_prompt(&self, prompt: &str) -> flame_core::Result<Tensor>;
+    fn encode_prompt(&mut self, prompt: &str) -> flame_core::Result<Tensor>;
 
     /// Run denoising process
     fn denoise(

@@ -7,7 +7,7 @@ description = "Network adapters (LoRA, DoRA, etc.) for diffusion models"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-flame-core = {path = "../../../flame/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels"]}
+flame-core = {path = "/home/alex/EriDiffusion/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels"]}
 eridiffusion-core = { path = "../core" }
 
 # ML Framework

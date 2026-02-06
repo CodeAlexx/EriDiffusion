@@ -6,4 +6,4 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 eridiffusion-core = { path = "../../core" }
-flame-core = {path = "../../../../flame/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels"]}
+flame-core = {path = "/home/alex/EriDiffusion/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels"]}

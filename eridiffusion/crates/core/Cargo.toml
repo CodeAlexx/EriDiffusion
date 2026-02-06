@@ -6,7 +6,7 @@ build = "build.rs"
 
 [dependencies]
 # FLAME framework - the only tensor framework we use
-flame-core = {path = "../../../flame/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels"]}
+flame-core = {path = "/home/alex/EriDiffusion/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels"]}
 safetensors = "0.4"
 
 # Async

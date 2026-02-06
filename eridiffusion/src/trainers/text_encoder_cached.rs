@@ -130,10 +130,7 @@ impl CachedTextEncoder {
 
         // Load tokenizer
         let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path).map_err(|e| {
-            flame_core::Error::InvalidOperation(format!(
-                "Failed to load CLIP tokenizer: {:?}",
-                e
-            ))
+            flame_core::Error::InvalidOperation(format!("Failed to load CLIP tokenizer: {:?}", e))
         })?;
 
         // Process CLIP-L
@@ -142,7 +139,7 @@ impl CachedTextEncoder {
             let wl = WeightLoader::from_safetensors(clip_l_path, self.device.clone())?;
             let config = crate::models::text_encoder::CLIPConfig::clip_l();
             let weights = wl.weights;
-            let model = clip::ClipTextTransformer::new(config, &self.device, weights)?;
+            let model = clip::ClipTextTransformer::new(config, self.device.clone(), weights)?;
 
             let mut embeds = Vec::new();
             for (_, text) in texts {
@@ -166,7 +163,7 @@ impl CachedTextEncoder {
             let wl = WeightLoader::from_safetensors(clip_g_path, self.device.clone())?;
             let config = crate::models::text_encoder::CLIPConfig::clip_g();
             let weights = wl.weights;
-            let model = clip::ClipTextTransformer::new(config, &self.device, weights)?;
+            let model = clip::ClipTextTransformer::new(config, self.device.clone(), weights)?;
 
             let mut embeds = Vec::new();
             let mut pooled = Vec::new();
@@ -225,26 +222,13 @@ impl CachedTextEncoder {
 
         // Load tokenizer
         let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path).map_err(|e| {
-            flame_core::Error::InvalidOperation(format!(
-                "Failed to load T5 tokenizer: {:?}",
-                e
-            ))
+            flame_core::Error::InvalidOperation(format!("Failed to load T5 tokenizer: {:?}", e))
         })?;
 
         let wl = WeightLoader::from_safetensors(t5_path, self.device.clone())?;
 
         // T5-XXL config
-        let config = crate::models::text_encoder::T5Config {
-            vocab_size: 32128,
-            d_model: 4096,
-            d_ff: 10240,
-            num_layers: 24,
-            num_heads: 64,
-            relative_attention_num_buckets: 32,
-            relative_attention_max_distance: 128,
-            dropout_rate: 0.1,
-            layer_norm_epsilon: 1e-6,
-        };
+        let config = crate::models::text_encoder::T5Config::t5_xxl();
 
         // TODO: T5EncoderModel not yet implemented
         // let mut model = T5EncoderModel::load(wl, &config)?;
@@ -361,8 +345,8 @@ impl CachedTextEncoder {
         path: &str,
         texts: &[(usize, String)],
     ) -> flame_core::Result<(HashMap<usize, Tensor>, HashMap<usize, Tensor>)> {
-        let data = fs::read(path)
-            .map_err(|e| Error::Io(format!("Failed to read cache file: {}", e)))?;
+        let data =
+            fs::read(path).map_err(|e| Error::Io(format!("Failed to read cache file: {}", e)))?;
         let tensors = SafeTensors::deserialize(&data).map_err(|e| {
             Error::InvalidOperation(format!("Failed to deserialize safetensors: {}", e))
         })?;
