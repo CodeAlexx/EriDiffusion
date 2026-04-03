@@ -126,8 +126,9 @@ fn main() -> anyhow::Result<()> {
             let diff = cond.sub(&uncond)?;
             let guided = uncond.add(&diff.mul_scalar(CFG_SCALE)?)?;
 
-            // Flow matching: denoised = x - guided * sigma
-            // (model already returns negated velocity, so standard formula works)
+            // Flow matching: denoised = x - model_output * sigma
+            // The -v convention is baked into the velocity field — the sampling
+            // formula is the same as Klein's: denoised = x - guided * sigma
             x.sub(&guided.mul_scalar(sigma)?)
         },
         noise,

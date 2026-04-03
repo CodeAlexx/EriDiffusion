@@ -250,38 +250,56 @@ fn build_rope_3d(
     Ok((cos, sin))
 }
 
-/// Apply rotary position embedding using real-valued rotation — all BF16.
+/// Apply rotary position embedding via interleaved complex rotation — BF16.
 ///
 /// `x`: [B, N, H, D] in BF16.
-/// `cos`, `sin`: [N, D/2] in BF16.
+/// `cos`, `sin`: [N, D/2] in F32 (converted to BF16 internally).
 ///
-/// Z-Image uses midpoint split (not interleaved pairs), so the rejoin is
-/// a simple last-dim concatenation. We flatten to 2D for efficient cat.
+/// Python uses `view_as_complex(x.reshape(..., -1, 2))` which treats consecutive
+/// pairs (x[2i], x[2i+1]) as (real, imag). We match this exactly.
+///
+/// Uses Klein's proven pattern: transpose to [B,H,N,D] (GPU permute [0,2,1,3]),
+/// reshape to [BH,N,D], do all ops with dim-0 broadcast only, transpose back.
 ///
 /// Returns [B, N, H, D] in BF16.
 fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let dims = x.shape().dims().to_vec();
     let (b, n, h, d) = (dims[0], dims[1], dims[2], dims[3]);
     let half_d = d / 2;
-    let bnh = b * n * h;
+    let bh = b * h;
+    let total_flat = bh * n * half_d;
 
-    // Split x into two halves along last dim (BF16 narrow — fast)
-    let x1 = x.narrow(3, 0, half_d)?;     // [B, N, H, D/2]
-    let x2 = x.narrow(3, half_d, half_d)?; // [B, N, H, D/2]
+    // Transpose [B, N, H, D] -> [B, H, N, D] (GPU permute [0,2,1,3])
+    let x_t = x.permute(&[0, 2, 1, 3])?;
 
-    // Broadcast cos/sin from [N, D/2] to [1, N, 1, D/2] in BF16
-    let cos_b = cos.to_dtype(DType::BF16)?.reshape(&[1, n, 1, half_d])?;
-    let sin_b = sin.to_dtype(DType::BF16)?.reshape(&[1, n, 1, half_d])?;
+    // Reshape to [BH, N, D/2, 2] to access interleaved pairs
+    let x_pairs = x_t.reshape(&[bh, n, half_d, 2])?;
+    let x_even = x_pairs.narrow(3, 0, 1)?.squeeze(Some(3))?; // [BH, N, D/2]
+    let x_odd = x_pairs.narrow(3, 1, 1)?.squeeze(Some(3))?;  // [BH, N, D/2]
 
-    // Standard rotation: [x1*cos - x2*sin, x1*sin + x2*cos]
-    let out1 = x1.mul(&cos_b)?.sub(&x2.mul(&sin_b)?)?;  // [B, N, H, D/2]
-    let out2 = x1.mul(&sin_b)?.add(&x2.mul(&cos_b)?)?;   // [B, N, H, D/2]
+    // cos/sin: [N, D/2] -> [1, N, D/2] for dim-0 broadcast (proven in Klein)
+    let cos_flat = cos.to_dtype(DType::BF16)?.reshape(&[1, n, half_d])?;
+    let sin_flat = sin.to_dtype(DType::BF16)?.reshape(&[1, n, half_d])?;
 
-    // Rejoin halves: flatten to [BNH, D/2], cat on last dim → [BNH, D], reshape back
-    let o1_flat = out1.reshape(&[bnh, half_d])?;
-    let o2_flat = out2.reshape(&[bnh, half_d])?;
-    let combined = Tensor::cat(&[&o1_flat, &o2_flat], 1)?; // [BNH, D]
-    combined.reshape(&[b, n, h, d])
+    // Complex multiply: (a+bi)(c+di) = (ac-bd) + (ad+bc)i
+    let ac = x_even.mul(&cos_flat)?;
+    let bd = x_odd.mul(&sin_flat)?;
+    let ad = x_even.mul(&sin_flat)?;
+    let bc = x_odd.mul(&cos_flat)?;
+    let new_even = ac.sub(&bd)?; // [BH, N, D/2]
+    let new_odd = ad.add(&bc)?;  // [BH, N, D/2]
+
+    // Interleave even/odd back into [BH, N, D]:
+    // Klein trick: flatten to [1, total], cat on dim 0 -> [2, total],
+    // 2D transpose -> [total, 2] (GPU kernel), reshape.
+    let even_flat = new_even.reshape(&[1, total_flat])?;
+    let odd_flat = new_odd.reshape(&[1, total_flat])?;
+    let combined = Tensor::cat(&[&even_flat, &odd_flat], 0)?; // [2, total]
+    let transposed = combined.permute(&[1, 0])?; // [total, 2] — GPU 2D transpose
+
+    // Reshape to [B, H, N, D] then transpose back to [B, N, H, D]
+    let result_bhnd = transposed.reshape(&[b, h, n, d])?;
+    result_bhnd.permute(&[0, 2, 1, 3]) // [B, N, H, D]
 }
 
 // ---------------------------------------------------------------------------

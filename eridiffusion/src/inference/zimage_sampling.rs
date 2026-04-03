@@ -1,8 +1,8 @@
 //! Z-Image / NextDiT sampling — Euler ODE sampler with SNR time shift.
 //!
 //! Z-Image uses linear sigma schedule with SNR shift (not exponential like Flux).
-//! The model returns negated velocity, so: denoised = x + model_output * sigma
-//! (note the + instead of - compared to Flux/Klein).
+//! Sampling formula is identical to Klein: denoised = x - model_output * sigma.
+//! The -v convention is baked into the velocity field — no sign flip needed.
 
 use flame_core::{Result, Tensor};
 
