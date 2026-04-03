@@ -16,11 +16,12 @@ use std::time::Instant;
 
 const MODEL_PATH: &str = "/home/alex/.serenity/models/checkpoints/z_image_de_turbo_v1_bf16.safetensors";
 const EMBEDDINGS_PATH: &str = "/home/alex/EriDiffusion/eridiffusion/eridiffusion/cached_zimage_embeddings.safetensors";
+const VAE_PATH: &str = "/home/alex/.serenity/models/vaes/ae.safetensors";
 const OUTPUT_LATENTS: &str = "/home/alex/serenity/output/zimage_denoised_latents.safetensors";
 
 const NUM_STEPS: usize = 8;
-const SHIFT: f32 = 3.0;
-const CFG_SCALE: f32 = 4.0;
+const SHIFT: f32 = 1.8;
+const CFG_SCALE: f32 = 0.0;
 const SEED: u64 = 42;
 const WIDTH: usize = 512;
 const HEIGHT: usize = 512;
@@ -105,7 +106,7 @@ fn main() -> anyhow::Result<()> {
     // ------------------------------------------------------------------
     // Stage 4: Denoise
     // ------------------------------------------------------------------
-    println!("\n--- Stage 4: Denoise ({} steps, Euler, CFG={}) ---", NUM_STEPS, CFG_SCALE);
+    println!("\n--- Stage 4: Denoise ({} steps, Euler velocity, CFG={}) ---", NUM_STEPS, CFG_SCALE);
     let t0 = Instant::now();
 
     let denoised = euler_denoise(
@@ -117,19 +118,19 @@ fn main() -> anyhow::Result<()> {
                 device.clone(),
             )?;
 
-            // Conditional (positive prompt)
-            let cond = model.forward(x, &sigma_t, pos_hidden)?;
-            // Unconditional (negative/empty prompt)
-            let uncond = model.forward(x, &sigma_t, neg_hidden)?;
+            // Conditional forward pass — model returns velocity directly
+            // (negation is baked into the model, musubi negates post-hoc)
+            let model_output = model.forward(x, &sigma_t, pos_hidden)?;
 
-            // CFG: uncond + scale * (cond - uncond)
-            let diff = cond.sub(&uncond)?;
-            let guided = uncond.add(&diff.mul_scalar(CFG_SCALE)?)?;
-
-            // Flow matching: denoised = x - model_output * sigma
-            // The -v convention is baked into the velocity field — the sampling
-            // formula is the same as Klein's: denoised = x - guided * sigma
-            x.sub(&guided.mul_scalar(sigma)?)
+            // CFG: turbo uses 0.0 (no guidance). For base model cfg>1:
+            // noise_pred = model_out + cfg * (model_out - uncond_out)
+            if CFG_SCALE > 0.0 {
+                let uncond = model.forward(x, &sigma_t, neg_hidden)?;
+                let diff = model_output.sub(&uncond)?;
+                Ok(model_output.add(&diff.mul_scalar(CFG_SCALE)?)?)
+            } else {
+                Ok(model_output)
+            }
         },
         noise,
         &sigmas,
@@ -140,23 +141,55 @@ fn main() -> anyhow::Result<()> {
     println!("  Output: {:?}", denoised.dims());
 
     // ------------------------------------------------------------------
-    // Stage 5: Save latents
+    // Stage 5: VAE Decode
     // ------------------------------------------------------------------
-    println!("\n--- Stage 5: Save latents ---");
-    let mut save_map = std::collections::HashMap::new();
-    save_map.insert("latents".to_string(), denoised);
-    flame_core::serialization::save_tensors(
-        &save_map,
-        std::path::Path::new(OUTPUT_LATENTS),
-        flame_core::serialization::SerializationFormat::SafeTensors,
-    )?;
-    println!("  Saved to {}", OUTPUT_LATENTS);
+    println!("\n--- Stage 5: VAE Decode ---");
+    let t0 = Instant::now();
+
+    // Free DiT weights to make room for VAE
+    drop(model);
+    println!("  DiT weights freed");
+
+    // Load VAE with Z-Image scaling (scale=0.3611, shift=0.1159)
+    use eridiffusion::models::flux_vae::AutoencoderKL;
+    let vae = AutoencoderKL::from_safetensors(VAE_PATH, 0.3611, 0.1159)?;
+    println!("  VAE loaded");
+
+    let rgb = vae.decode(&denoised)?;
+    println!("  Decoded: {:?} in {:.1}s", rgb.dims(), t0.elapsed().as_secs_f32());
+
+    // ------------------------------------------------------------------
+    // Stage 6: Save PNG
+    // ------------------------------------------------------------------
+    println!("\n--- Stage 6: Save PNG ---");
+    let rgb_f32 = rgb.to_dtype(DType::F32)?;
+    let data = rgb_f32.to_vec()?;
+    let (_, _, out_h, out_w) = {
+        let d = rgb_f32.dims();
+        (d[0], d[1], d[2], d[3])
+    };
+
+    // CHW → HWC, [0,1] → [0,255]
+    let mut pixels = vec![0u8; out_h * out_w * 3];
+    for y in 0..out_h {
+        for x_pos in 0..out_w {
+            for c in 0..3 {
+                let idx = c * out_h * out_w + y * out_w + x_pos;
+                let v = data[idx].clamp(0.0, 1.0);
+                pixels[(y * out_w + x_pos) * 3 + c] = (v * 255.0) as u8;
+            }
+        }
+    }
+
+    let output_path = OUTPUT_LATENTS.replace("_latents.safetensors", ".png");
+    let img = image::RgbImage::from_raw(out_w as u32, out_h as u32, pixels)
+        .ok_or_else(|| anyhow::anyhow!("Failed to create image"))?;
+    img.save(&output_path)?;
 
     let dt_total = t_total.elapsed().as_secs_f32();
     println!("\n============================================================");
-    println!("LATENTS SAVED: {}", OUTPUT_LATENTS);
+    println!("IMAGE SAVED: {}", output_path);
     println!("Total time: {:.1}s", dt_total);
-    println!("Decode with: python decode_zimage_vae.py {}", OUTPUT_LATENTS);
     println!("============================================================");
 
     Ok(())

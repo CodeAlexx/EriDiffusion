@@ -6,6 +6,7 @@ use flame_core::device::Device;
 use flame_core::{DType, Result, Shape, Tensor};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 // flux_vae.rs
 // Flux VAE wrapper with proper configuration and CPU offloading
@@ -20,30 +21,29 @@ pub struct AutoencoderKL {
 }
 
 impl AutoencoderKL {
-    /// Create a new Flux VAE from weights
+    /// Create a new Flux VAE from weights (diffusers format keys).
     pub fn new(wl: &WeightLoader, device: Device, enable_offloading: bool) -> Result<Self> {
-        // Flux VAE config with 16 latent channels instead of 4
         let config = VAEConfig {
             in_channels: 3,
             out_channels: 3,
             block_out_channels: vec![128, 256, 512, 512],
             layers_per_block: 2,
-            latent_channels: 16, // Flux uses 16 channels
+            latent_channels: 16,
             norm_num_groups: 32,
-            use_quant_conv: false,      // Flux VAE doesn't use quant conv
-            use_post_quant_conv: false, // Flux VAE doesn't use post quant conv
-            scaling_factor: 0.3611,     // Flux scaling factor
+            use_quant_conv: false,
+            use_post_quant_conv: false,
+            scaling_factor: 0.3611,
         };
 
-        // DON'T remap weights - pass them directly with original keys
-        let weights = wl.weights.clone();
-
-        // Debug output disabled for performance
-        // println!("Available weight keys (showing first 20):");
-        // for key in weights.keys().take(20) {
-        //     println!("  {}", key);
-        // }
-        // println!("Total weight keys: {}", weights.len());
+        // Auto-detect key format and remap if needed
+        let weights = if wl.weights.contains_key("decoder.mid.block_1.conv1.weight") {
+            // Original/ComfyUI format (ae.safetensors) — remap to diffusers
+            log::info!("[VAE] Detected original key format, remapping to diffusers");
+            Self::remap_original_to_diffusers(&wl.weights)
+        } else {
+            // Already diffusers format (flux2-vae.safetensors)
+            wl.weights.clone()
+        };
 
         let inner = BaseVAE::new(config, &device, weights)?;
 
@@ -52,11 +52,95 @@ impl AutoencoderKL {
 
         Ok(Self {
             inner,
-            scale_factor: 0.13025, // Flux-specific scaling
-            shift_factor: 0.0,     // No shift for standard Flux
+            scale_factor: 0.13025, // Flux 2 default
+            shift_factor: 0.0,
             device,
             offload_manager,
         })
+    }
+
+    /// Remap original/ComfyUI VAE keys (ae.safetensors) to diffusers format.
+    ///
+    /// Key differences:
+    /// - `mid.attn_1.{q,k,v}` → `mid_block.attentions.0.to_{q,k,v}`
+    /// - `mid.attn_1.proj_out` → `mid_block.attentions.0.to_out.0`
+    /// - `mid.attn_1.norm` → `mid_block.attentions.0.group_norm`
+    /// - `mid.block_{1,2}` → `mid_block.resnets.{0,1}`
+    /// - `up.{i}.block.{j}` → `up_blocks.{3-i}.resnets.{j}` (REVERSED)
+    /// - `up.{i}.upsample.conv` → `up_blocks.{3-i}.upsamplers.0.conv`
+    /// - `nin_shortcut` → `conv_shortcut`
+    /// - `down.{i}.block.{j}` → `down_blocks.{i}.resnets.{j}`
+    /// - `down.{i}.downsample.conv` → `down_blocks.{i}.downsamplers.0.conv`
+    /// - `norm_out` → `conv_norm_out`
+    fn remap_original_to_diffusers(
+        weights: &HashMap<String, Tensor>,
+    ) -> HashMap<String, Tensor> {
+        let num_up_blocks: usize = 4; // Standard for [128, 256, 512, 512]
+        let mut remapped = HashMap::new();
+
+        for (key, tensor) in weights {
+            let mut k = key.clone();
+
+            // norm_out → conv_norm_out
+            k = k.replace(".norm_out.", ".conv_norm_out.");
+
+            // Mid block attention
+            k = k.replace(".mid.attn_1.proj_out.", ".mid_block.attentions.0.to_out.0.");
+            k = k.replace(".mid.attn_1.norm.", ".mid_block.attentions.0.group_norm.");
+            k = k.replace(".mid.attn_1.k.", ".mid_block.attentions.0.to_k.");
+            k = k.replace(".mid.attn_1.q.", ".mid_block.attentions.0.to_q.");
+            k = k.replace(".mid.attn_1.v.", ".mid_block.attentions.0.to_v.");
+
+            // Mid block resnets
+            k = k.replace(".mid.block_1.", ".mid_block.resnets.0.");
+            k = k.replace(".mid.block_2.", ".mid_block.resnets.1.");
+
+            // Up blocks (REVERSED index: up.0 → up_blocks.3)
+            // Process from most specific to least specific
+            for i in 0..num_up_blocks {
+                let rev = num_up_blocks - 1 - i;
+                let old_up = format!(".up.{i}.upsample.conv.");
+                let new_up = format!(".up_blocks.{rev}.upsamplers.0.conv.");
+                k = k.replace(&old_up, &new_up);
+
+                // nin_shortcut before general block replacement
+                for j in 0..4 {
+                    let old_ns = format!(".up.{i}.block.{j}.nin_shortcut.");
+                    let new_ns = format!(".up_blocks.{rev}.resnets.{j}.conv_shortcut.");
+                    k = k.replace(&old_ns, &new_ns);
+                }
+
+                for j in 0..4 {
+                    let old_blk = format!(".up.{i}.block.{j}.");
+                    let new_blk = format!(".up_blocks.{rev}.resnets.{j}.");
+                    k = k.replace(&old_blk, &new_blk);
+                }
+            }
+
+            // Down blocks (NOT reversed)
+            for i in 0..num_up_blocks {
+                let old_ds = format!(".down.{i}.downsample.conv.");
+                let new_ds = format!(".down_blocks.{i}.downsamplers.0.conv.");
+                k = k.replace(&old_ds, &new_ds);
+
+                for j in 0..4 {
+                    let old_ns = format!(".down.{i}.block.{j}.nin_shortcut.");
+                    let new_ns = format!(".down_blocks.{i}.resnets.{j}.conv_shortcut.");
+                    k = k.replace(&old_ns, &new_ns);
+                }
+
+                for j in 0..4 {
+                    let old_blk = format!(".down.{i}.block.{j}.");
+                    let new_blk = format!(".down_blocks.{i}.resnets.{j}.");
+                    k = k.replace(&old_blk, &new_blk);
+                }
+            }
+
+            remapped.insert(k, tensor.clone());
+        }
+
+        log::info!("[VAE] Remapped {} keys", remapped.len());
+        remapped
     }
 
     /// Encode image to latents
@@ -284,10 +368,65 @@ impl AutoencoderKL {
         Ok(output)
     }
 
+    /// Load VAE from a safetensors file. Auto-detects key format.
+    ///
+    /// `scale` and `shift` control latent scaling:
+    ///   encode: `model_latent = (vae_latent - shift) * scale`
+    ///   decode: `vae_latent = model_latent / scale + shift`
+    pub fn from_safetensors(
+        path: &str,
+        scale_factor: f64,
+        shift_factor: f64,
+    ) -> Result<Self> {
+        let device = flame_core::global_cuda_device();
+        let dev = Device::from_arc(device.clone());
+        let weights = flame_core::serialization::load_file(
+            Path::new(path),
+            &device,
+        )?;
+
+        let config = VAEConfig {
+            in_channels: 3,
+            out_channels: 3,
+            block_out_channels: vec![128, 256, 512, 512],
+            layers_per_block: 2,
+            latent_channels: 16,
+            norm_num_groups: 32,
+            use_quant_conv: false,
+            use_post_quant_conv: false,
+            scaling_factor: 0.3611,
+        };
+
+        // Auto-detect and remap if needed
+        let weights = if weights.contains_key("decoder.mid.block_1.conv1.weight") {
+            log::info!("[VAE] Detected original key format, remapping to diffusers");
+            Self::remap_original_to_diffusers(&weights)
+        } else {
+            weights
+        };
+
+        let inner = BaseVAE::new(config, &dev, weights)?;
+
+        Ok(Self {
+            inner,
+            scale_factor,
+            shift_factor,
+            device: dev,
+            offload_manager: None,
+        })
+    }
+
+    /// Set Z-Image VAE scaling: encode = (vae - shift) * scale, decode = latent / scale + shift.
+    pub fn set_zimage_scaling(&mut self) {
+        self.scale_factor = 0.3611;
+        self.shift_factor = 0.1159;
+    }
+
     /// Decode latents to image
     pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
-        // Remove scaling
-        let z = z.add_scalar(-(self.shift_factor as f32))?.div_scalar(self.scale_factor as f32)?;
+        // Undo latent scaling: vae_latent = model_latent / scale + shift
+        // (Z-Image convention: encode = (vae - shift) * scale)
+        let z = z.div_scalar(self.scale_factor as f32)?.add_scalar(self.shift_factor as f32)?;
 
         // Decode
         let decoded = self.inner.decode(&z)?;
