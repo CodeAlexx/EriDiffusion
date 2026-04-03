@@ -16,6 +16,7 @@ pub mod sd35_sampling;
 pub mod sd35_simple;
 pub mod sdxl_sampling;
 pub mod klein_sampling;
+pub mod zimage_sampling;
 pub mod unified_sampling; // Experimental placeholder for Qwen Image inference
 
 // FLAME modules - DISABLED: Consolidating with non-flame versions

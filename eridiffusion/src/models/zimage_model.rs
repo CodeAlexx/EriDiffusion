@@ -75,44 +75,38 @@ impl Default for ZImageConfig {
 // Helpers: 3D linear and element-wise ops
 // ---------------------------------------------------------------------------
 
-/// Compute `x @ weight.T` where weight is [out, in] and x is [M, in].
-fn matmul_weight_t(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
-    let wt = flame_core::bf16_elementwise::transpose2d_bf16(weight)?;
-    x.matmul(&wt)
-}
-
-/// `x @ weight.T` for x [B, N, C], weight [out_C, C]. Returns [B, N, out_C].
-fn linear3d(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
+/// `x @ weight_t` where weight_t is ALREADY pre-transposed [in, out].
+fn linear3d(x: &Tensor, weight_t: &Tensor) -> Result<Tensor> {
     let shape = x.shape().dims().to_vec();
     if shape.len() == 2 {
-        return matmul_weight_t(x, weight);
+        return x.matmul(weight_t);
     }
     let b = shape[0];
     let n = shape[1];
     let c = shape[2];
     let x_2d = x.reshape(&[b * n, c])?;
-    let out_2d = matmul_weight_t(&x_2d, weight)?;
+    let out_2d = x_2d.matmul(weight_t)?;
     let out_dim = out_2d.shape().dims()[1];
     out_2d.reshape(&[b, n, out_dim])
 }
 
-/// `x @ weight.T + bias` for x [B, N, C], weight [out_C, C], bias [out_C].
-fn linear3d_bias(x: &Tensor, weight: &Tensor, bias: &Tensor) -> Result<Tensor> {
+/// `x @ weight_t + bias` for x [B, N, C], weight_t pre-transposed [in, out].
+fn linear3d_bias(x: &Tensor, weight_t: &Tensor, bias: &Tensor) -> Result<Tensor> {
     let shape = x.shape().dims().to_vec();
     let b = shape[0];
     let n = shape[1];
     let c = shape[2];
     let x_2d = x.reshape(&[b * n, c])?;
-    let out_2d = matmul_weight_t(&x_2d, weight)?;
+    let out_2d = x_2d.matmul(weight_t)?;
     let out_dim = out_2d.shape().dims()[1];
     let bias_row = bias.reshape(&[1, out_dim])?;
     let out_2d = out_2d.add(&bias_row)?;
     out_2d.reshape(&[b, n, out_dim])
 }
 
-/// `x @ weight.T + bias` for x [B, C], weight [out_C, C], bias [out_C].
-fn linear2d_bias(x: &Tensor, weight: &Tensor, bias: &Tensor) -> Result<Tensor> {
-    let out = matmul_weight_t(x, weight)?;
+/// `x @ weight_t + bias` for x [B, C], weight_t pre-transposed [in, out].
+fn linear2d_bias(x: &Tensor, weight_t: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    let out = x.matmul(weight_t)?;
     let out_dim = out.shape().dims()[1];
     let bias_row = bias.reshape(&[1, out_dim])?;
     out.add(&bias_row)
@@ -256,33 +250,38 @@ fn build_rope_3d(
     Ok((cos, sin))
 }
 
-/// Apply rotary position embedding using real-valued rotation.
+/// Apply rotary position embedding using real-valued rotation — all BF16.
 ///
 /// `x`: [B, N, H, D] in BF16.
-/// `cos`, `sin`: [N, D/2] in F32.
+/// `cos`, `sin`: [N, D/2] in BF16.
+///
+/// Z-Image uses midpoint split (not interleaved pairs), so the rejoin is
+/// a simple last-dim concatenation. We flatten to 2D for efficient cat.
 ///
 /// Returns [B, N, H, D] in BF16.
 fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let dims = x.shape().dims().to_vec();
     let (b, n, h, d) = (dims[0], dims[1], dims[2], dims[3]);
     let half_d = d / 2;
+    let bnh = b * n * h;
 
-    let x_f32 = x.to_dtype(DType::F32)?;
+    // Split x into two halves along last dim (BF16 narrow — fast)
+    let x1 = x.narrow(3, 0, half_d)?;     // [B, N, H, D/2]
+    let x2 = x.narrow(3, half_d, half_d)?; // [B, N, H, D/2]
 
-    // Split x into two halves along last dim
-    let x1 = x_f32.narrow(3, 0, half_d)?;     // [B, N, H, D/2]
-    let x2 = x_f32.narrow(3, half_d, half_d)?; // [B, N, H, D/2]
-
-    // Broadcast cos/sin from [N, D/2] to [1, N, 1, D/2]
-    let cos_b = cos.reshape(&[1, n, 1, half_d])?;
-    let sin_b = sin.reshape(&[1, n, 1, half_d])?;
+    // Broadcast cos/sin from [N, D/2] to [1, N, 1, D/2] in BF16
+    let cos_b = cos.to_dtype(DType::BF16)?.reshape(&[1, n, 1, half_d])?;
+    let sin_b = sin.to_dtype(DType::BF16)?.reshape(&[1, n, 1, half_d])?;
 
     // Standard rotation: [x1*cos - x2*sin, x1*sin + x2*cos]
-    let out1 = x1.mul(&cos_b)?.sub(&x2.mul(&sin_b)?)?;
-    let out2 = x1.mul(&sin_b)?.add(&x2.mul(&cos_b)?)?;
+    let out1 = x1.mul(&cos_b)?.sub(&x2.mul(&sin_b)?)?;  // [B, N, H, D/2]
+    let out2 = x1.mul(&sin_b)?.add(&x2.mul(&cos_b)?)?;   // [B, N, H, D/2]
 
-    let out = Tensor::cat(&[&out1, &out2], 3)?;
-    out.to_dtype(DType::BF16)
+    // Rejoin halves: flatten to [BNH, D/2], cat on last dim → [BNH, D], reshape back
+    let o1_flat = out1.reshape(&[bnh, half_d])?;
+    let o2_flat = out2.reshape(&[bnh, half_d])?;
+    let combined = Tensor::cat(&[&o1_flat, &o2_flat], 1)?; // [BNH, D]
+    combined.reshape(&[b, n, h, d])
 }
 
 // ---------------------------------------------------------------------------
@@ -750,6 +749,22 @@ impl ZImageTransformer {
             patch_size,
             weights.len(),
         );
+
+        // Pre-transpose all 2D weight matrices [out, in] -> [in, out] for faster matmul.
+        log::info!("[ZImage] Pre-transposing weights...");
+        let mut weights = weights;
+        let keys: Vec<String> = weights.keys().cloned().collect();
+        for key in &keys {
+            if key.ends_with(".weight") && !key.contains("norm") {
+                let w = &weights[key];
+                let dims = w.shape().dims();
+                if dims.len() == 2 {
+                    let wt = flame_core::bf16_elementwise::transpose2d_bf16(w)?;
+                    weights.insert(key.clone(), wt);
+                }
+            }
+        }
+        log::info!("[ZImage] Weights pre-transposed.");
 
         Ok(Self { weights, config })
     }

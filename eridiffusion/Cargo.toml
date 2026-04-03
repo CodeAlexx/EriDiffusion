@@ -67,6 +67,10 @@ required-features = ["legacy-bins"]
 name = "klein_generate"
 path = "src/bin/klein_generate.rs"
 
+[[bin]]
+name = "zimage_generate"
+path = "src/bin/zimage_generate.rs"
+
 [lib]
 name = "eridiffusion"
 path = "src/lib.rs"
