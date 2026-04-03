@@ -71,6 +71,10 @@ path = "src/bin/klein_generate.rs"
 name = "zimage_generate"
 path = "src/bin/zimage_generate.rs"
 
+[[bin]]
+name = "ltx2_generate"
+path = "src/bin/ltx2_generate.rs"
+
 [lib]
 name = "eridiffusion"
 path = "src/lib.rs"

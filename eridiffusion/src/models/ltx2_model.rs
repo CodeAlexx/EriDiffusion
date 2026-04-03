@@ -630,6 +630,45 @@ pub struct LTX2TransformerBlock {
 }
 
 impl LTX2TransformerBlock {
+    /// Video-only forward: self-attn → cross-attn (text) → FFN.
+    /// Skips all audio paths, A2V/V2A cross-attention.
+    pub fn forward_video_only(
+        &self,
+        hidden_states: &Tensor,        // [B, N, dim]
+        encoder_hidden_states: &Tensor, // [B, seq, dim]
+        temb: &Tensor,                 // [B, N, 6*dim]
+        video_rotary_emb: Option<(&Tensor, &Tensor)>,
+        encoder_attention_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let b = hidden_states.shape().dims()[0];
+        let dim = hidden_states.shape().dims()[2];
+
+        // Extract 6 AdaLN-Zero params: [shift_sa, scale_sa, gate_sa, shift_ff, scale_ff, gate_ff]
+        let (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp) =
+            self.compute_ada_params(&self.scale_shift_table, temb, b, dim)?;
+
+        // 1. Self-Attention with AdaLN-Zero
+        let norm_h = rms_norm(hidden_states, self.norm1_weight.as_ref(), self.eps)?;
+        let mod_h = norm_h.mul(&scale_msa.add_scalar(1.0)?)?.add(&shift_msa)?;
+        let attn_out = self.attn1.forward(&mod_h, None, None, video_rotary_emb, None)?;
+        let mut hs = hidden_states.add(&attn_out.mul(&gate_msa)?)?;
+
+        // 2. Cross-Attention (text)
+        let norm_h2 = rms_norm(&hs, self.norm2_weight.as_ref(), self.eps)?;
+        let ca_out = self.attn2.forward(
+            &norm_h2, Some(encoder_hidden_states), encoder_attention_mask, None, None,
+        )?;
+        hs = hs.add(&ca_out)?;
+
+        // 3. FeedForward with AdaLN-Zero
+        let norm_ff = rms_norm(&hs, self.norm3_weight.as_ref(), self.eps)?;
+        let mod_ff = norm_ff.mul(&scale_mlp.add_scalar(1.0)?)?.add(&shift_mlp)?;
+        let ff_out = self.ff.forward(&mod_ff)?;
+        hs = hs.add(&ff_out.mul(&gate_mlp)?)?;
+
+        Ok(hs)
+    }
+
     /// Forward pass for one block. Returns (video_hidden, audio_hidden).
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
@@ -1330,6 +1369,336 @@ impl LTX2Model {
 
         proj + caption + te + tables
     }
+}
+
+// ---------------------------------------------------------------------------
+// Video-Only Forward + Loader
+// ---------------------------------------------------------------------------
+
+impl LTX2Model {
+    /// Video-only forward pass. Skips all audio paths.
+    ///
+    /// # Arguments
+    /// * `x` - Spatial video latents [B, C, F, H, W] in BF16
+    /// * `timestep` - Sigma values [B] in [0, 1] (NOT pre-scaled)
+    /// * `context` - Text embeddings [B, seq_len, caption_channels] from Gemma
+    /// * `frame_rate` - Video frame rate (default 25.0), affects temporal RoPE scaling
+    ///
+    /// # Returns
+    /// Model velocity output [B, C, F, H, W] in BF16.
+    pub fn forward_video_only(
+        &self,
+        x: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        frame_rate: f32,
+    ) -> Result<Tensor> {
+        let x_dims = x.shape().dims().to_vec();
+        let (batch_size, channels, num_frames, height, width) =
+            (x_dims[0], x_dims[1], x_dims[2], x_dims[3], x_dims[4]);
+        let inner_dim = self.config.inner_dim();
+        let num_tokens = num_frames * height * width;
+
+        // 1. Patchify: [B, C, F, H, W] → [B, F*H*W, C]
+        // For patch_size=1 this is just a reshape
+        let x_flat = x.reshape(&[batch_size, channels, num_tokens])?
+            .permute(&[0, 2, 1])?; // [B, N, C]
+
+        // 2. Build coordinate grid [B, 3, N, 2] for RoPE
+        let device = x.device().clone();
+        let vae_sf = &self.config.vae_scale_factors;
+        let coords = build_video_coords(
+            batch_size, num_frames, height, width,
+            vae_sf, self.config.causal_offset, frame_rate, device.clone(),
+        )?;
+
+        // 3. Compute RoPE
+        let max_pos = [
+            self.config.pos_embed_max_pos as f64,
+            self.config.base_height as f64,
+            self.config.base_width as f64,
+        ];
+        let (v_cos, v_sin) = compute_rope_frequencies(
+            &coords, inner_dim, &max_pos,
+            self.config.rope_theta, self.config.num_attention_heads,
+        )?;
+
+        // 4. Input projection: [B, N, C] → [B, N, inner_dim]
+        let mut hs = linear3d(&x_flat, &self.proj_in_weight, Some(&self.proj_in_bias))?;
+
+        // 5. Timestep conditioning
+        // Expand sigma to per-token: [B] → [B, N]
+        let ts_expanded = timestep.unsqueeze(1)?
+            .expand(&[batch_size, num_tokens])?;
+        let ts_scaled = ts_expanded.mul_scalar(self.config.timestep_scale_multiplier as f32)?;
+        let ts_flat = ts_scaled.reshape(&[batch_size * num_tokens])?;
+        let (v_timestep, v_embedded) = self.time_embed.forward(&ts_flat)?;
+        // Reshape: [B*N, 6*dim] → [B, N, 6*dim]
+        let v_timestep = v_timestep.reshape(&[batch_size, num_tokens, 6 * inner_dim])?;
+        let v_embedded = v_embedded.reshape(&[batch_size, num_tokens, inner_dim])?;
+
+        // 6. Caption projection: [B, seq, 3840] → [B, seq, inner_dim]
+        let enc_hs = self.caption_projection.forward(context)?;
+
+        // 7. Run transformer blocks (video-only)
+        for block in &self.blocks {
+            hs = block.forward_video_only(
+                &hs, &enc_hs, &v_timestep,
+                Some((&v_cos, &v_sin)),
+                None, // encoder_attention_mask
+            )?;
+        }
+
+        // 8. Output: norm → scale/shift → proj_out
+        let shift_scale = self.scale_shift_table.unsqueeze(0)?.unsqueeze(0)?; // [1, 1, 2, dim]
+        let emb_4d = v_embedded.unsqueeze(2)?; // [B, N, 1, dim]
+        let final_ss = shift_scale.add(&emb_4d)?;
+        let shift = final_ss.narrow(2, 0, 1)?.squeeze_dim(2)?;
+        let scale = final_ss.narrow(2, 1, 1)?.squeeze_dim(2)?;
+
+        let normed = layer_norm_no_affine(&hs, self.config.norm_eps)?;
+        let output = normed.mul(&scale.add_scalar(1.0)?)?.add(&shift)?;
+        let output = linear3d(&output, &self.proj_out_weight, Some(&self.proj_out_bias))?;
+
+        // 9. Unpatchify: [B, N, C] → [B, C, F, H, W]
+        let output = output.permute(&[0, 2, 1])?; // [B, C, N]
+        output.reshape(&[batch_size, channels, num_frames, height, width])
+    }
+}
+
+/// Build 3D video coordinate grid for RoPE.
+///
+/// Returns [B, 3, N, 2] tensor where N = F*H*W, last dim is [start, end).
+/// Coordinates are in pixel space (scaled by VAE factors) with causal fix
+/// and frame_rate scaling applied.
+fn build_video_coords(
+    batch_size: usize,
+    num_frames: usize,
+    height: usize,
+    width: usize,
+    vae_scale_factors: &[usize; 3],
+    causal_offset: usize,
+    frame_rate: f32,
+    device: std::sync::Arc<flame_core::CudaDevice>,
+) -> Result<Tensor> {
+    let num_tokens = num_frames * height * width;
+
+    // Build meshgrid: (f, h, w) for each token
+    let mut coords_data = vec![0.0f32; batch_size * 3 * num_tokens * 2];
+
+    for b in 0..batch_size {
+        for f in 0..num_frames {
+            for h in 0..height {
+                for w in 0..width {
+                    let token_idx = f * height * width + h * width + w;
+                    let base = b * 3 * num_tokens * 2;
+
+                    // Latent coords: [start, end) = [idx, idx+1]
+                    // Pixel coords = latent * vae_scale_factor
+                    let f_start = (f * vae_scale_factors[0]) as f32;
+                    let f_end = ((f + 1) * vae_scale_factors[0]) as f32;
+                    let h_start = (h * vae_scale_factors[1]) as f32;
+                    let h_end = ((h + 1) * vae_scale_factors[1]) as f32;
+                    let w_start = (w * vae_scale_factors[2]) as f32;
+                    let w_end = ((w + 1) * vae_scale_factors[2]) as f32;
+
+                    // Causal fix: temporal coords = (coords + causal_offset - vae_t).clamp(min=0)
+                    let vae_t = vae_scale_factors[0] as f32;
+                    let f_start_causal = (f_start + causal_offset as f32 - vae_t).max(0.0);
+                    let f_end_causal = (f_end + causal_offset as f32 - vae_t).max(0.0);
+
+                    // Frame-rate scaling on temporal dim
+                    let f_start_scaled = f_start_causal / frame_rate;
+                    let f_end_scaled = f_end_causal / frame_rate;
+
+                    // dim 0 = temporal
+                    coords_data[base + 0 * num_tokens * 2 + token_idx * 2] = f_start_scaled;
+                    coords_data[base + 0 * num_tokens * 2 + token_idx * 2 + 1] = f_end_scaled;
+                    // dim 1 = height
+                    coords_data[base + 1 * num_tokens * 2 + token_idx * 2] = h_start;
+                    coords_data[base + 1 * num_tokens * 2 + token_idx * 2 + 1] = h_end;
+                    // dim 2 = width
+                    coords_data[base + 2 * num_tokens * 2 + token_idx * 2] = w_start;
+                    coords_data[base + 2 * num_tokens * 2 + token_idx * 2 + 1] = w_end;
+                }
+            }
+        }
+    }
+
+    Tensor::from_vec_dtype(
+        coords_data,
+        Shape::from_dims(&[batch_size, 3, num_tokens, 2]),
+        device,
+        DType::F32,
+    )
+}
+
+/// Load LTX-2 model with video-only weights (skip all audio keys).
+///
+/// This loads ~16.5B params instead of 22B, saving ~13GB of VRAM.
+/// Audio fields are initialized with zero-sized dummy tensors.
+pub fn load_ltx2_model_video_only(
+    weights: &HashMap<String, Tensor>,
+    config: &LTX2Config,
+) -> Result<LTX2Model> {
+    let get = |key: &str| -> Result<Tensor> {
+        weights.get(key).cloned().ok_or_else(|| {
+            flame_core::Error::InvalidInput(format!("Missing weight: {}", key))
+        })
+    };
+
+    let device = weights.values().next()
+        .map(|t| t.device().clone())
+        .ok_or_else(|| flame_core::Error::InvalidInput("Empty weights".into()))?;
+
+    // Create zero-filled dummy tensors for audio fields
+    let dummy_1d = |size: usize| -> Result<Tensor> {
+        Tensor::zeros_dtype(Shape::from_dims(&[size]), DType::BF16, device.clone())
+    };
+    let dummy_2d = |r: usize, c: usize| -> Result<Tensor> {
+        Tensor::zeros_dtype(Shape::from_dims(&[r, c]), DType::BF16, device.clone())
+    };
+
+    let ad = config.audio_inner_dim();
+    let ahd = config.audio_attention_head_dim;
+    let anh = config.audio_num_attention_heads;
+
+    let dummy_attention = |_prefix: &str| -> Result<LTX2Attention> {
+        Ok(LTX2Attention {
+            to_q_weight: dummy_2d(ad, ad)?,
+            to_q_bias: dummy_1d(ad)?,
+            to_k_weight: dummy_2d(ad, ad)?,
+            to_k_bias: dummy_1d(ad)?,
+            to_v_weight: dummy_2d(ad, ad)?,
+            to_v_bias: dummy_1d(ad)?,
+            norm_q_weight: dummy_1d(ad)?,
+            norm_k_weight: dummy_1d(ad)?,
+            to_out_weight: dummy_2d(ad, ad)?,
+            to_out_bias: dummy_1d(ad)?,
+            num_heads: anh,
+            head_dim: ahd,
+            eps: config.norm_eps,
+        })
+    };
+
+    let dummy_ff = || -> Result<FeedForward> {
+        Ok(FeedForward {
+            gelu_proj_weight: dummy_2d(config.audio_ffn_hidden(), ad)?,
+            gelu_proj_bias: dummy_1d(config.audio_ffn_hidden())?,
+            out_weight: dummy_2d(ad, config.audio_ffn_hidden())?,
+            out_bias: dummy_1d(ad)?,
+        })
+    };
+
+    let dummy_adaln = || -> Result<AdaLayerNormSingle> {
+        Ok(AdaLayerNormSingle {
+            emb: TimestepEmbedderMLP {
+                linear_1_weight: dummy_2d(ad, 256)?,
+                linear_1_bias: dummy_1d(ad)?,
+                linear_2_weight: dummy_2d(ad, ad)?,
+                linear_2_bias: dummy_1d(ad)?,
+            },
+            linear_weight: dummy_2d(ad, ad)?,
+            linear_bias: dummy_1d(ad)?,
+            num_mod_params: 1,
+        })
+    };
+
+    let dummy_caption = || -> Result<CaptionProjection> {
+        Ok(CaptionProjection {
+            linear_1_weight: dummy_2d(ad, config.caption_channels)?,
+            linear_1_bias: dummy_1d(ad)?,
+            linear_2_weight: dummy_2d(ad, ad)?,
+            linear_2_bias: dummy_1d(ad)?,
+        })
+    };
+
+    // Load video-only transformer blocks
+    let eps = config.norm_eps;
+    let num_heads = config.num_attention_heads;
+    let head_dim = config.attention_head_dim;
+
+    let mut blocks = Vec::with_capacity(config.num_layers);
+    for i in 0..config.num_layers {
+        let prefix = format!("transformer_blocks.{i}");
+        let get_opt = |key: &str| -> Option<Tensor> { weights.get(key).cloned() };
+
+        blocks.push(LTX2TransformerBlock {
+            // Video self-attention (real weights)
+            norm1_weight: get_opt(&format!("{prefix}.norm1.weight")),
+            attn1: load_attention(weights, &format!("{prefix}.attn1"), num_heads, head_dim, eps)?,
+
+            // Audio self-attention (dummy)
+            audio_norm1_weight: None,
+            audio_attn1: dummy_attention("")?,
+
+            // Video cross-attention (real weights)
+            norm2_weight: get_opt(&format!("{prefix}.norm2.weight")),
+            attn2: load_attention(weights, &format!("{prefix}.attn2"), num_heads, head_dim, eps)?,
+
+            // Audio cross-attention (dummy)
+            audio_norm2_weight: None,
+            audio_attn2: dummy_attention("")?,
+
+            // A2V/V2A cross-attention (dummy)
+            audio_to_video_norm_weight: None,
+            audio_to_video_attn: dummy_attention("")?,
+            video_to_audio_norm_weight: None,
+            video_to_audio_attn: dummy_attention("")?,
+
+            // Video FFN (real weights)
+            norm3_weight: get_opt(&format!("{prefix}.norm3.weight")),
+            ff: load_feed_forward(weights, &format!("{prefix}.ff"))?,
+
+            // Audio FFN (dummy)
+            audio_norm3_weight: None,
+            audio_ff: dummy_ff()?,
+
+            // Video modulation table (real), audio (dummy)
+            scale_shift_table: get(&format!("{prefix}.scale_shift_table"))?,
+            audio_scale_shift_table: dummy_2d(6, ad)?,
+            video_a2v_cross_attn_scale_shift_table: dummy_2d(5, config.inner_dim())?,
+            audio_a2v_cross_attn_scale_shift_table: dummy_2d(5, ad)?,
+
+            eps,
+        });
+
+        if (i + 1) % 12 == 0 {
+            log::info!("[LTX2] Loaded block {}/{}", i + 1, config.num_layers);
+        }
+    }
+
+    log::info!("[LTX2] All {} blocks loaded (video-only)", config.num_layers);
+
+    Ok(LTX2Model {
+        config: config.clone(),
+
+        proj_in_weight: get("proj_in.weight")?,
+        proj_in_bias: get("proj_in.bias")?,
+        audio_proj_in_weight: dummy_2d(ad, config.audio_in_channels)?,
+        audio_proj_in_bias: dummy_1d(ad)?,
+
+        caption_projection: load_caption_projection(weights, "caption_projection")?,
+        audio_caption_projection: dummy_caption()?,
+
+        time_embed: load_ada_layer_norm_single(weights, "time_embed", 6)?,
+        audio_time_embed: dummy_adaln()?,
+
+        av_cross_attn_video_scale_shift: dummy_adaln()?,
+        av_cross_attn_audio_scale_shift: dummy_adaln()?,
+        av_cross_attn_video_a2v_gate: dummy_adaln()?,
+        av_cross_attn_audio_v2a_gate: dummy_adaln()?,
+
+        scale_shift_table: get("scale_shift_table")?,
+        audio_scale_shift_table: dummy_2d(2, ad)?,
+
+        blocks,
+
+        proj_out_weight: get("proj_out.weight")?,
+        proj_out_bias: get("proj_out.bias")?,
+        audio_proj_out_weight: dummy_2d(config.audio_out_channels, ad)?,
+        audio_proj_out_bias: dummy_1d(config.audio_out_channels)?,
+    })
 }
 
 // ---------------------------------------------------------------------------
