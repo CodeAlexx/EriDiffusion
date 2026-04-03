@@ -554,23 +554,15 @@ fn final_layer(
 
 /// (B, C, H, W) -> (B, N, patch_dim) where N = (H/p)*(W/p), patch_dim = p*p*C.
 /// Returns (patches, ph, pw).
+///
+/// Uses fused GPU kernel — no 6D permute, no F32 round-trip, stays in BF16.
 fn patchify(x: &Tensor, patch_size: usize) -> Result<(Tensor, usize, usize)> {
-    let dims = x.shape().dims().to_vec();
-    let (b, c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
-    let p = patch_size;
-    let ph = h / p;
-    let pw = w / p;
-
-    // [B, C, ph, p, pw, p]
-    let x = x.reshape(&[b, c, ph, p, pw, p])?;
-    // [B, ph, pw, p, p, C]
-    let x = x.permute(&[0, 2, 4, 3, 5, 1])?;
-    // [B, ph*pw, p*p*C]
-    let x = x.reshape(&[b, ph * pw, p * p * c])?;
-    Ok((x, ph, pw))
+    flame_core::bf16_elementwise::patchify_bf16(x, patch_size)
 }
 
 /// (B, N, patch_dim) -> (B, C, H, W).
+///
+/// Uses fused GPU kernel — no 6D permute, no F32 round-trip, stays in BF16.
 fn unpatchify(
     x: &Tensor,
     ph: usize,
@@ -578,16 +570,7 @@ fn unpatchify(
     patch_size: usize,
     in_channels: usize,
 ) -> Result<Tensor> {
-    let b = x.shape().dims()[0];
-    let p = patch_size;
-    let c = in_channels;
-
-    // [B, ph, pw, p, p, C]
-    let x = x.reshape(&[b, ph, pw, p, p, c])?;
-    // [B, C, ph, p, pw, p]
-    let x = x.permute(&[0, 5, 1, 3, 2, 4])?;
-    // [B, C, ph*p, pw*p]
-    x.reshape(&[b, c, ph * p, pw * p])
+    flame_core::bf16_elementwise::unpatchify_bf16(x, ph, pw, patch_size, in_channels)
 }
 
 /// Pad token sequence to next multiple. Returns (padded, pad_len).
