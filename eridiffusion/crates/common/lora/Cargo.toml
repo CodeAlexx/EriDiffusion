@@ -1,0 +1,13 @@
+[package]
+name = "eridiffusion-common-lora"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+flame-core = { path = "/home/alex/EriDiffusion/flame-core" , features = ["cuda", "bf16_u16", "bf16_kernels"]}
+eridiffusion-core = { path = "../../core" }
+eridiffusion-common-weights = { path = "../weights" }
+
+[lib]
+crate-type = ["rlib"]

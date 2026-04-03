@@ -1,0 +1,26 @@
+[package]
+name = "eridiffusion-common-weights"
+version = "0.1.0"
+edition = "2021"
+description = "Shared strict safetensors loader, layout helpers, prefix guard, and ParamRegistry for EriDiffusion"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1.0"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+hashbrown = "0.14"
+safetensors = "0.4"
+half = "2.4"
+tracing = "0.1"
+nvml-wrapper = { version = "0.9", optional = true }
+bytemuck = { version = "1.16", features = ["extern_crate_alloc"] }
+
+flame-core = {path = "/home/alex/EriDiffusion/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels"]}
+
+[features]
+nvml = ["nvml-wrapper"]
+
+[dev-dependencies]
+tempfile = "3.10"

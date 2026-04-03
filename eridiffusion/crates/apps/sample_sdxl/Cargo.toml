@@ -1,0 +1,24 @@
+[package]
+name = "sample_sdxl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+flame-core = { path = "/home/alex/EriDiffusion/flame-core" , features = ["cuda", "bf16_u16", "bf16_kernels"]}
+eridiffusion-common-config = { path = "../../common/config" }
+eridiffusion-common-weights = { path = "../../common/weights" }
+eridiffusion-common-sampler = { path = "../../common/sampler" }
+eridiffusion-common-text = { path = "../../common/text" }
+eridiffusion-common-vae = { path = "../../common/vae" }
+eridiffusion-models-sdxl = { path = "../../models/sdxl" }
+image = "0.24"
+
+[[bin]]
+name = "sample_sdxl"
+path = "src/main.rs"

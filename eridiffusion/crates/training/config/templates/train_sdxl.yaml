@@ -1,0 +1,13 @@
+model_kind: sdxl
+bf16_params: true
+steps: 10
+batch_size: 1
+grad_accum_steps: 1
+lr: 0.0001
+optimizer: adamw
+sdxl_unet_path: "/path/to/sdxl_unet.safetensors"
+sdxl_vae_path: "/path/to/sdxl_vae.safetensors"
+sdxl_clip_l_path: "/path/to/clip_l.safetensors"
+sdxl_clip_g_path: "/path/to/clip_g.safetensors"
+sdxl_clip_l_tokenizer: "/path/to/clip_l_tokenizer.json"
+sdxl_clip_g_tokenizer: "/path/to/clip_g_tokenizer.json"

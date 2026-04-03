@@ -1,0 +1,19 @@
+[package]
+name = "eridiffusion-models-sdxl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+tracing = "0.1"
+regex = "1"
+clap = { version = "4", features = ["derive"] }
+flame-core = { path = "/home/alex/EriDiffusion/flame-core" , features = ["cuda", "bf16_u16", "bf16_kernels"]}
+eridiffusion-common-weights = { path = "../../common/weights" }
+eridiffusion-common-text = { path = "../../common/text" }
+adapters = { path = "../../adapters" }
+
+[dev-dependencies]
+tempfile = "3.10"

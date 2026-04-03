@@ -1,0 +1,15 @@
+model_kind: sd3
+bf16_params: true
+steps: 10
+batch_size: 1
+grad_accum_steps: 1
+lr: 0.0001
+optimizer: adamw
+sd35_model_path: "/path/to/sd35_model.safetensors"
+sd35_vae_path: "/path/to/sd35_vae.safetensors"
+sd35_clip_l_path: "/path/to/clip_l.safetensors"
+sd35_clip_g_path: "/path/to/clip_g.safetensors"
+sd35_t5_path: "/path/to/t5.safetensors"
+sd35_clip_l_tokenizer: "/path/to/clip_l_tokenizer.json"
+sd35_clip_g_tokenizer: "/path/to/clip_g_tokenizer.json"
+sd35_t5_tokenizer: "/path/to/t5_tokenizer.json"

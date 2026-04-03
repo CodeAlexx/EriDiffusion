@@ -1,0 +1,12 @@
+[package]
+name = "eridiffusion-models-lumina"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+flame-core = {path = "/home/alex/EriDiffusion/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels"]}
+eridiffusion-common-weights = { path = "../../common/weights" }
+eridiffusion-model-registry = { path = "../../common/model_registry" }
+inventory = "0.3"
+serde_yaml = "0.9"

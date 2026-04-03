@@ -1,0 +1,21 @@
+[package]
+name = "eridiffusion-common-vae"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+vae_debug_stats = []
+bf16_u16 = []
+
+[dependencies]
+anyhow = "1"
+half = "2.3"
+tracing = "0.1"
+flame-core = { path = "/home/alex/EriDiffusion/flame-core" , features = ["cuda", "bf16_u16", "bf16_kernels"]}
+eridiffusion-common-weights = { path = "../weights" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+cudarc = { version = "0.11.9", features = ["driver", "nvrtc"] }
+
+[dev-dependencies]

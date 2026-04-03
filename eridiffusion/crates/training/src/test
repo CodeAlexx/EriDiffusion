@@ -1,0 +1,1 @@
+flame’s whole point is single-responsibility, GPU-first, no-bloat. you don’t want a swiss-army-crate that tries to please pytorch/candle/burn/etc. — you want a lean, predictable, high-performance engine. that’s exactly the right instinct

@@ -1,0 +1,11 @@
+[package]
+name = "eridiffusion-common-blockswap"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+tracing = "0.1"
+crossbeam-channel = "0.5"
+eridiffusion-common-weights = { path = "../weights" }
+

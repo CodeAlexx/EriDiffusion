@@ -1,0 +1,63 @@
+[package]
+name = "eridiffusion-core"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+# FLAME framework - the only tensor framework we use
+flame-core = {path = "/home/alex/EriDiffusion/flame-core", default-features = false, features = ["cuda", "bf16_u16", "bf16_kernels"]}
+safetensors = "0.4"
+
+# Async
+async-trait = "0.1"
+tokio = { version = "1.40", features = ["sync", "rt", "fs"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Utils
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+parking_lot = "0.12"
+indexmap = "2.2"
+dashmap = "6.0"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5.0"
+sys-info = "0.9"
+toml = "0.8"
+serde_yaml = "0.9"
+
+# Plugin system
+libloading = "0.8"
+once_cell = "1.19"
+
+[features]
+default = []
+cuda = ["flame-core/cuda"]
+# Enable raw CUDA allocation stubs using cudarc directly
+cuda-raw = ["cudarc"]
+alloc-debug = []
+nvrtc-fill = ["cudarc"]
+# Legacy cfg gates still referenced in the codebase. Declare them so
+# `cargo check` doesn't warn when they appear.
+flash_attn = []
+external-wrap = []
+legacy-tests = []
+
+[dependencies.cudarc]
+version = "0.11.9"
+default-features = false
+features = ["driver","nvrtc"]
+optional = true
+
+[dev-dependencies]
+tempfile = "3.10"
+tokio = { version = "1.40", features = ["rt", "macros"] }
+
+[build-dependencies]
+cc = "1.0"
