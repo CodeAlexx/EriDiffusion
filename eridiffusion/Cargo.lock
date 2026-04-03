@@ -1003,6 +1003,7 @@ dependencies = [
  "lazy_static",
  "libloading",
  "log",
+ "memmap2",
  "num-traits",
  "once_cell",
  "rand 0.8.5",

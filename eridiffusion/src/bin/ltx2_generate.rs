@@ -8,7 +8,7 @@
 //! 5. Save denoised latents as safetensors
 //! 6. Decode with Python VAE (separate step)
 
-use eridiffusion::models::ltx2_model::{load_ltx2_model_video_only, LTX2Config};
+use eridiffusion::models::ltx2_model::{LTX2Config, LTX2StreamingModel};
 use eridiffusion::inference::ltx2_sampling::{euler_denoise_ltx2, LTX2_DISTILLED_SIGMAS};
 use flame_core::{global_cuda_device, DType, Shape, Tensor};
 use std::time::Instant;
@@ -73,26 +73,9 @@ fn main() -> anyhow::Result<()> {
              config.num_attention_heads, config.attention_head_dim,
              config.num_attention_heads, config.num_layers);
 
-    // Load only video keys from checkpoint
-    println!("  Loading safetensors (filtering video-only keys)...");
-    let all_weights = flame_core::serialization::load_file(
-        std::path::Path::new(MODEL_PATH),
-        &device,
-    )?;
-
-    // Filter: keep only non-audio keys
-    let video_weights: std::collections::HashMap<String, Tensor> = all_weights
-        .into_iter()
-        .filter(|(k, _)| !k.contains("audio"))
-        .collect();
-    println!("  Video-only keys: {}", video_weights.len());
-
-    let model = load_ltx2_model_video_only(&video_weights, &config)?;
-    drop(video_weights);  // Free weight map
-    println!("  Model loaded in {:.1}s", t0.elapsed().as_secs_f32());
-    println!("  Blocks: {}, ~{:.1} GB video-only",
-             model.num_blocks(),
-             model.total_vram_bytes() as f64 / 1e9);
+    // Load only global params to GPU (~400MB). Blocks stream from disk.
+    let model = LTX2StreamingModel::load_globals(MODEL_PATH, &config)?;
+    println!("  Global params loaded in {:.1}s (blocks stream on demand)", t0.elapsed().as_secs_f32());
 
     // ------------------------------------------------------------------
     // Stage 3: Create noise + sigma schedule

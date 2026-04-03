@@ -1169,8 +1169,10 @@ fn load_attention(
         to_k_bias: get(&format!("{prefix}.to_k.bias"))?,
         to_v_weight: get(&format!("{prefix}.to_v.weight"))?,
         to_v_bias: get(&format!("{prefix}.to_v.bias"))?,
-        norm_q_weight: get(&format!("{prefix}.norm_q.weight"))?,
-        norm_k_weight: get(&format!("{prefix}.norm_k.weight"))?,
+        norm_q_weight: get(&format!("{prefix}.norm_q.weight"))
+            .or_else(|_| get(&format!("{prefix}.q_norm.weight")))?,
+        norm_k_weight: get(&format!("{prefix}.norm_k.weight"))
+            .or_else(|_| get(&format!("{prefix}.k_norm.weight")))?,
         to_out_weight: get(&format!("{prefix}.to_out.0.weight"))?,
         to_out_bias: get(&format!("{prefix}.to_out.0.bias"))?,
         num_heads,
@@ -1531,6 +1533,297 @@ fn build_video_coords(
         device,
         DType::F32,
     )
+}
+
+/// LTX-2 model with only global params loaded (blocks streamed from disk).
+///
+/// This struct holds the non-block parameters on GPU (~400MB) and loads
+/// each of the 48 blocks from the safetensors file on demand during
+/// forward pass. This is essential for fitting 33GB of video-only
+/// weights into 24GB VRAM.
+pub struct LTX2StreamingModel {
+    pub config: LTX2Config,
+    checkpoint_path: String,
+
+    // Global params on GPU
+    proj_in_weight: Tensor,
+    proj_in_bias: Tensor,
+    caption_projection: CaptionProjection,
+    time_embed: AdaLayerNormSingle,
+    scale_shift_table: Tensor,  // [2, inner_dim]
+    proj_out_weight: Tensor,
+    proj_out_bias: Tensor,
+}
+
+impl LTX2StreamingModel {
+    /// Load global (non-block) params from checkpoint. Blocks are NOT loaded.
+    ///
+    /// Auto-detects key prefix (`model.diffusion_model.` for ComfyUI format)
+    /// and strips it. Supports both diffusers and ComfyUI checkpoints.
+    pub fn load_globals(path: &str, config: &LTX2Config) -> Result<Self> {
+        let device = flame_core::global_cuda_device();
+        log::info!("[LTX2] Loading global params (non-block)...");
+
+        // Detect key prefix by checking for known global keys
+        let prefix = detect_key_prefix(path)?;
+        log::info!("[LTX2] Detected key prefix: '{}'", prefix);
+
+        let globals = flame_core::serialization::load_file_filtered(
+            path, &device,
+            |key| {
+                // Strip prefix for matching
+                let k = key.strip_prefix(&prefix).unwrap_or(key);
+                !k.contains("audio")
+                    && !k.starts_with("transformer_blocks.")
+            },
+        )?;
+
+        // Remap keys: strip prefix
+        let globals: HashMap<String, Tensor> = globals.into_iter()
+            .map(|(k, v)| {
+                let stripped = k.strip_prefix(&prefix).unwrap_or(&k).to_string();
+                (stripped, v)
+            })
+            .collect();
+
+        let get = |key: &str| -> Result<Tensor> {
+            globals.get(key).cloned()
+                .ok_or_else(|| flame_core::Error::InvalidInput(format!("Missing: {}", key)))
+        };
+
+        log::info!("[LTX2] Global params loaded: {} keys", globals.len());
+
+        // Support both diffusers and ComfyUI key names
+        let get_alt = |k1: &str, k2: &str| -> Result<Tensor> {
+            get(k1).or_else(|_| get(k2))
+        };
+
+        // proj_in / patchify_proj
+        let proj_in_w = get_alt("proj_in.weight", "patchify_proj.weight")?;
+        let proj_in_b = get_alt("proj_in.bias", "patchify_proj.bias")?;
+
+        // caption_projection / prompt_adaln_single (different structure in 2.3)
+        let caption_proj = load_caption_projection(&globals, "caption_projection")
+            .or_else(|_| {
+                // LTX-2.3 uses different caption projection structure
+                // For now, try the prompt_adaln_single path
+                load_caption_projection(&globals, "prompt_projection")
+            })?;
+
+        // time_embed / adaln_single
+        let time_emb = load_ada_layer_norm_single(&globals, "time_embed", 6)
+            .or_else(|_| load_ada_layer_norm_single(&globals, "adaln_single", 6))?;
+
+        Ok(Self {
+            config: config.clone(),
+            checkpoint_path: path.to_string(),
+            proj_in_weight: proj_in_w,
+            proj_in_bias: proj_in_b,
+            caption_projection: caption_proj,
+            time_embed: time_emb,
+            scale_shift_table: get("scale_shift_table")?,
+            proj_out_weight: get("proj_out.weight")?,
+            proj_out_bias: get("proj_out.bias")?,
+        })
+    }
+
+    /// Load a single block's video-only weights from checkpoint.
+    fn load_block(&self, block_idx: usize) -> Result<LTX2TransformerBlock> {
+        let device = flame_core::global_cuda_device();
+        let key_prefix = detect_key_prefix(&self.checkpoint_path)?;
+        let prefix = format!("{key_prefix}transformer_blocks.{block_idx}.");
+
+        let raw_weights = flame_core::serialization::load_file_filtered(
+            &self.checkpoint_path, &device,
+            |key| key.starts_with(&prefix) && !key.contains("audio"),
+        )?;
+
+        // Strip key prefix so load_attention/load_feed_forward find keys
+        let block_weights: HashMap<String, Tensor> = raw_weights.into_iter()
+            .map(|(k, v)| {
+                let stripped = k.strip_prefix(&key_prefix).unwrap_or(&k).to_string();
+                (stripped, v)
+            })
+            .collect();
+
+        let eps = self.config.norm_eps;
+        let num_heads = self.config.num_attention_heads;
+        let head_dim = self.config.attention_head_dim;
+        let ad = self.config.audio_inner_dim();
+
+        let get_opt = |key: &str| -> Option<Tensor> { block_weights.get(key).cloned() };
+
+        // Dummy tensors for audio fields
+        let dummy_1d = |sz: usize| Tensor::zeros_dtype(
+            Shape::from_dims(&[sz]), DType::BF16, device.clone(),
+        );
+        let dummy_2d = |r: usize, c: usize| Tensor::zeros_dtype(
+            Shape::from_dims(&[r, c]), DType::BF16, device.clone(),
+        );
+
+        let dummy_attn = || -> Result<LTX2Attention> {
+            Ok(LTX2Attention {
+                to_q_weight: dummy_2d(ad, ad)?, to_q_bias: dummy_1d(ad)?,
+                to_k_weight: dummy_2d(ad, ad)?, to_k_bias: dummy_1d(ad)?,
+                to_v_weight: dummy_2d(ad, ad)?, to_v_bias: dummy_1d(ad)?,
+                norm_q_weight: dummy_1d(ad)?, norm_k_weight: dummy_1d(ad)?,
+                to_out_weight: dummy_2d(ad, ad)?, to_out_bias: dummy_1d(ad)?,
+                num_heads: self.config.audio_num_attention_heads,
+                head_dim: self.config.audio_attention_head_dim, eps,
+            })
+        };
+
+        let dummy_ff = || -> Result<FeedForward> {
+            Ok(FeedForward {
+                gelu_proj_weight: dummy_2d(self.config.audio_ffn_hidden(), ad)?,
+                gelu_proj_bias: dummy_1d(self.config.audio_ffn_hidden())?,
+                out_weight: dummy_2d(ad, self.config.audio_ffn_hidden())?,
+                out_bias: dummy_1d(ad)?,
+            })
+        };
+
+        let pfx = format!("transformer_blocks.{block_idx}");
+        Ok(LTX2TransformerBlock {
+            norm1_weight: get_opt(&format!("{pfx}.norm1.weight")),
+            attn1: load_attention(&block_weights, &format!("{pfx}.attn1"), num_heads, head_dim, eps)?,
+            audio_norm1_weight: None,
+            audio_attn1: dummy_attn()?,
+            norm2_weight: get_opt(&format!("{pfx}.norm2.weight")),
+            attn2: load_attention(&block_weights, &format!("{pfx}.attn2"), num_heads, head_dim, eps)?,
+            audio_norm2_weight: None,
+            audio_attn2: dummy_attn()?,
+            audio_to_video_norm_weight: None,
+            audio_to_video_attn: dummy_attn()?,
+            video_to_audio_norm_weight: None,
+            video_to_audio_attn: dummy_attn()?,
+            norm3_weight: get_opt(&format!("{pfx}.norm3.weight")),
+            ff: load_feed_forward(&block_weights, &format!("{pfx}.ff"))?,
+            audio_norm3_weight: None,
+            audio_ff: dummy_ff()?,
+            scale_shift_table: block_weights.get(&format!("{pfx}.scale_shift_table"))
+                .cloned()
+                .ok_or_else(|| flame_core::Error::InvalidInput(format!("Missing: {pfx}.scale_shift_table")))?,
+            audio_scale_shift_table: dummy_2d(6, ad)?,
+            video_a2v_cross_attn_scale_shift_table: dummy_2d(5, self.config.inner_dim())?,
+            audio_a2v_cross_attn_scale_shift_table: dummy_2d(5, ad)?,
+            eps,
+        })
+    }
+
+    /// Video-only forward with block streaming from disk.
+    ///
+    /// Each block is loaded from the safetensors checkpoint, executed,
+    /// and immediately dropped to free GPU memory. Only 1 block + global
+    /// params are on GPU at any time (~1GB total).
+    pub fn forward_video_only(
+        &self,
+        x: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        frame_rate: f32,
+    ) -> Result<Tensor> {
+        let x_dims = x.shape().dims().to_vec();
+        let (batch_size, channels, num_frames, height, width) =
+            (x_dims[0], x_dims[1], x_dims[2], x_dims[3], x_dims[4]);
+        let inner_dim = self.config.inner_dim();
+        let num_tokens = num_frames * height * width;
+
+        // 1. Patchify: [B, C, F, H, W] → [B, F*H*W, C]
+        let x_flat = x.reshape(&[batch_size, channels, num_tokens])?
+            .permute(&[0, 2, 1])?;
+
+        // 2. Build coordinate grid for RoPE
+        let device = x.device().clone();
+        let vae_sf = &self.config.vae_scale_factors;
+        let coords = build_video_coords(
+            batch_size, num_frames, height, width,
+            vae_sf, self.config.causal_offset, frame_rate, device.clone(),
+        )?;
+
+        // 3. Compute RoPE
+        let max_pos = [
+            self.config.pos_embed_max_pos as f64,
+            self.config.base_height as f64,
+            self.config.base_width as f64,
+        ];
+        let (v_cos, v_sin) = compute_rope_frequencies(
+            &coords, inner_dim, &max_pos,
+            self.config.rope_theta, self.config.num_attention_heads,
+        )?;
+
+        // 4. Input projection
+        let mut hs = linear3d(&x_flat, &self.proj_in_weight, Some(&self.proj_in_bias))?;
+
+        // 5. Timestep conditioning
+        let ts_expanded = timestep.unsqueeze(1)?.expand(&[batch_size, num_tokens])?;
+        let ts_scaled = ts_expanded.mul_scalar(self.config.timestep_scale_multiplier as f32)?;
+        let ts_flat = ts_scaled.reshape(&[batch_size * num_tokens])?;
+        let (v_timestep, v_embedded) = self.time_embed.forward(&ts_flat)?;
+        let v_timestep = v_timestep.reshape(&[batch_size, num_tokens, 6 * inner_dim])?;
+        let v_embedded = v_embedded.reshape(&[batch_size, num_tokens, inner_dim])?;
+
+        // 6. Caption projection
+        let enc_hs = self.caption_projection.forward(context)?;
+
+        // 7. Stream blocks: load → run → drop
+        for i in 0..self.config.num_layers {
+            let block = self.load_block(i)?;
+            hs = block.forward_video_only(
+                &hs, &enc_hs, &v_timestep,
+                Some((&v_cos, &v_sin)),
+                None,
+            )?;
+            drop(block);  // Free ~536MB immediately
+
+            if (i + 1) % 12 == 0 || i + 1 == self.config.num_layers {
+                log::info!("[LTX2] Block {}/{} done", i + 1, self.config.num_layers);
+            }
+        }
+
+        // 8. Output
+        let shift_scale = self.scale_shift_table.unsqueeze(0)?.unsqueeze(0)?;
+        let emb_4d = v_embedded.unsqueeze(2)?;
+        let final_ss = shift_scale.add(&emb_4d)?;
+        let shift = final_ss.narrow(2, 0, 1)?.squeeze_dim(2)?;
+        let scale = final_ss.narrow(2, 1, 1)?.squeeze_dim(2)?;
+
+        let normed = layer_norm_no_affine(&hs, self.config.norm_eps)?;
+        let output = normed.mul(&scale.add_scalar(1.0)?)?.add(&shift)?;
+        let output = linear3d(&output, &self.proj_out_weight, Some(&self.proj_out_bias))?;
+
+        // 9. Unpatchify
+        let output = output.permute(&[0, 2, 1])?;
+        output.reshape(&[batch_size, channels, num_frames, height, width])
+    }
+}
+
+/// Detect key prefix in a safetensors checkpoint.
+///
+/// Returns `"model.diffusion_model."` for ComfyUI format, `""` for diffusers.
+fn detect_key_prefix(path: &str) -> Result<String> {
+    use serde_json::Value;
+    use std::io::Read;
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| flame_core::Error::Io(format!("Failed to open: {}", e)))?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| flame_core::Error::Io(format!("mmap: {}", e)))?;
+
+    let header_size = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
+    let metadata: Value = serde_json::from_slice(&mmap[8..8 + header_size])
+        .map_err(|e| flame_core::Error::Io(format!("json: {}", e)))?;
+
+    if let Some(obj) = metadata.as_object() {
+        for key in obj.keys() {
+            if key.starts_with("model.diffusion_model.") {
+                return Ok("model.diffusion_model.".to_string());
+            }
+            if key.starts_with("transformer_blocks.") || key == "proj_in.weight" {
+                return Ok(String::new());
+            }
+        }
+    }
+    Ok(String::new())
 }
 
 /// Load LTX-2 model with video-only weights (skip all audio keys).
