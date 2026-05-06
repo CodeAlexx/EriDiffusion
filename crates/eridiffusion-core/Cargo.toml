@@ -1,0 +1,21 @@
+[package]
+name = "eridiffusion-core"
+version = "0.1.0"
+edition = "2021"
+description = "EriDiffusion Rust port — core training framework"
+
+[dependencies]
+flame-core = { workspace = true }
+cudarc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+rand = { workspace = true }
+rand_distr = { workspace = true }
+image = { workspace = true }
+safetensors = { workspace = true }
+parking_lot = { workspace = true }
+lazy_static = { workspace = true }
+memmap2 = "0.9"

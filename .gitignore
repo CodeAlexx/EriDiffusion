@@ -1,0 +1,17 @@
+/target
+/flame
+Cargo.lock
+*.rs.bk
+.DS_Store
+reference/
+
+# Runtime artifacts — contain external (OT Python) self-references that we
+# don't author and shouldn't track.
+/output/
+/cache/
+/Samples/
+
+# Markdown — only README.md ships with the public repo. Local design /
+# audit / handoff notes stay on disk but aren't tracked.
+*.md
+!README.md

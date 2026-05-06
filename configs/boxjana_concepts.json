@@ -1,0 +1,37 @@
+[
+  {
+    "name": "boxjana",
+    "path": "/home/alex/datasets/boxjana",
+    "seed": 42,
+    "enabled": true,
+    "type": "STANDARD",
+    "include_subdirectories": false,
+    "image_variations": 1,
+    "text_variations": 1,
+    "balancing": 1.0,
+    "balancing_strategy": "REPEATS",
+    "loss_weight": 1.0,
+    "text": {
+      "prompt_source": "concept",
+      "prompt_path": "",
+      "enable_tag_shuffling": false,
+      "tag_delimiter": ",",
+      "keep_tags_count": 0,
+      "prompt_prefix": "",
+      "prompt_suffix": ""
+    },
+    "image": {
+      "enable_crop_jitter": false,
+      "enable_random_flip": false,
+      "enable_random_rotate": false,
+      "enable_random_brightness": false,
+      "enable_random_contrast": false,
+      "enable_random_saturation": false,
+      "enable_random_hue": false,
+      "enable_fixed_flip": false,
+      "enable_fixed_rotate": false,
+      "random_rotate_max_angle": 0.0,
+      "enable_resolution_override": false
+    }
+  }
+]

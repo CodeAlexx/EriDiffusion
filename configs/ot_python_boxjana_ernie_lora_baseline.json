@@ -1,0 +1,76 @@
+{
+  "__version": 10,
+  "base_model_name": "/home/alex/models/ERNIE-Image",
+  "model_type": "ERNIE",
+  "training_method": "LORA",
+  "train_dtype": "BFLOAT_16",
+  "weight_dtype": "BFLOAT_16",
+  "output_dtype": "BFLOAT_16",
+
+  "batch_size": 1,
+  "gradient_accumulation_steps": 1,
+  "resolution": "256",
+  "epochs": 100,
+  "stop_training_after": 100,
+  "stop_training_after_unit": "STEP",
+
+  "learning_rate": 0.0003,
+  "lr_scheduler": "CONSTANT",
+  "learning_rate_warmup_steps": 0.0,
+  "clip_grad_norm": 1.0,
+  "seed": 42,
+
+  "transformer": {
+    "train": true,
+    "weight_dtype": "BFLOAT_16",
+    "stop_training_after": 0,
+    "stop_training_after_unit": "NEVER"
+  },
+  "text_encoder": {
+    "train": false,
+    "weight_dtype": "BFLOAT_16",
+    "dropout_probability": 0.0
+  },
+  "vae": {
+    "weight_dtype": "FLOAT_32"
+  },
+
+  "lora_rank": 16,
+  "lora_alpha": 1.0,
+  "lora_decompose": false,
+  "lora_weight_dtype": "FLOAT_32",
+  "layer_filter": "self_attention,mlp",
+  "layer_filter_preset": "attn-mlp",
+  "peft_type": "LORA",
+  "compile": false,
+
+  "timestep_distribution": "LOGIT_NORMAL",
+  "timestep_shift": 1.0,
+  "min_noising_strength": 0.0,
+  "max_noising_strength": 1.0,
+  "noising_bias": 0.0,
+  "noising_weight": 0.0,
+  "mse_strength": 1.0,
+  "mae_strength": 0.0,
+  "loss_weight_fn": "CONSTANT",
+  "loss_weight_strength": 5.0,
+  "offset_noise_weight": 0.0,
+  "perturbation_noise_weight": 0.0,
+  "dynamic_timestep_shifting": false,
+
+  "ema": "OFF",
+  "gradient_checkpointing": "OFF",
+  "dataloader_threads": 1,
+
+  "concept_file_name": "/home/alex/EriDiffusion-v2/configs/boxjana_concepts.json",
+  "workspace_dir": "/home/alex/EriDiffusion-v2/cache/ot_python_baseline_workspace",
+  "cache_dir": "/home/alex/EriDiffusion-v2/cache/ot_python_baseline_cache",
+  "output_model_destination": "/home/alex/EriDiffusion-v2/output/ot_python_ernie_boxjana_lora.safetensors",
+
+  "sample_after": 0,
+  "sample_after_unit": "NEVER",
+  "save_every": 0,
+  "save_every_unit": "NEVER",
+  "backup_after": 0,
+  "backup_after_unit": "NEVER"
+}

@@ -1,0 +1,18 @@
+{
+  "base_model_name": "/home/alex/models/ERNIE-Image",
+  "training_method": "LORA",
+  "peft_type": "LORA",
+  "lora_rank": 16,
+  "lora_alpha": 1.0,
+  "learning_rate": 0.0003,
+  "batch_size": 1,
+  "epochs": 1,
+  "timestep_distribution": "LOGIT_NORMAL",
+  "timestep_shift": 1.0,
+  "min_noising_strength": 0.0,
+  "max_noising_strength": 1.0,
+  "mse_strength": 1.0,
+  "mae_strength": 0.0,
+  "loss_weight_fn": "CONSTANT",
+  "clip_grad_norm": 1.0
+}
