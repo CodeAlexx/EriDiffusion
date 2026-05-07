@@ -182,9 +182,21 @@ fn main() -> anyhow::Result<()> {
 
     // 1. Load encoders
     log::info!("[1/4] Loading text encoders...");
+    // CLIP-L safetensors from HF ship as F32; the encoder calls
+    // `layer_norm_bf16` directly which is BF16-strict. Cast at load so
+    // every weight (token_embedding, position_embedding, all linear
+    // weights, layer_norms) is BF16. Same fix sample_flux.rs applies.
     let clip_l_w = load_one_or_dir(&args.clip_l_ckpt, &device)?;
+    let clip_l_w: std::collections::HashMap<String, flame_core::Tensor> = clip_l_w
+        .into_iter()
+        .map(|(k, t)| Ok::<_, anyhow::Error>((k, t.to_dtype(DType::BF16)?)))
+        .collect::<anyhow::Result<_>>()?;
     let clip_l = ClipEncoder::new(clip_l_w, ClipConfig::default(), device.clone());
     let clip_g_w = load_one_or_dir(&args.clip_g_ckpt, &device)?;
+    let clip_g_w: std::collections::HashMap<String, flame_core::Tensor> = clip_g_w
+        .into_iter()
+        .map(|(k, t)| Ok::<_, anyhow::Error>((k, t.to_dtype(DType::BF16)?)))
+        .collect::<anyhow::Result<_>>()?;
     let clip_g = ClipGEncoder::new(clip_g_w, device.clone());
     let tok_l = tokenizers::Tokenizer::from_file(&args.clip_l_tokenizer)
         .map_err(|e| anyhow::anyhow!("clip_l tokenizer: {e}"))?;

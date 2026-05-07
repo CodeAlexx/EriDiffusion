@@ -190,9 +190,19 @@ fn main() -> anyhow::Result<()> {
 
     // 1. Load text encoders + tokenizers
     log::info!("[1/5] Loading text encoders...");
+    // CLIP-L from HF ships as F32; layer_norm_bf16 is BF16-strict.
+    // Cast at load (same fix as sample_flux/sample_sdxl).
     let clip_l_w = load_one_or_dir(&args.clip_l_ckpt, &device)?;
+    let clip_l_w: std::collections::HashMap<String, flame_core::Tensor> = clip_l_w
+        .into_iter()
+        .map(|(k, t)| Ok::<_, anyhow::Error>((k, t.to_dtype(DType::BF16)?)))
+        .collect::<anyhow::Result<_>>()?;
     let clip_l = ClipEncoder::new(clip_l_w, ClipConfig::default(), device.clone());
     let clip_g_w = load_one_or_dir(&args.clip_g_ckpt, &device)?;
+    let clip_g_w: std::collections::HashMap<String, flame_core::Tensor> = clip_g_w
+        .into_iter()
+        .map(|(k, t)| Ok::<_, anyhow::Error>((k, t.to_dtype(DType::BF16)?)))
+        .collect::<anyhow::Result<_>>()?;
     let clip_g = ClipGEncoder::new(clip_g_w, device.clone());
     let mut t5 = T5Encoder::load(
         args.t5_ckpt.to_str().ok_or_else(|| anyhow::anyhow!("t5 path utf8"))?,
@@ -236,18 +246,22 @@ fn main() -> anyhow::Result<()> {
 
     // 2. Encode prompts (cond × N + uncond if CFG enabled). Encoders all
     // load once and stay resident until every prompt is encoded.
+    // T5-XXL leaves heavy intermediate activations in the alloc pool;
+    // clear between encodes so they're recycled (prior loop OOM'd at
+    // ~3 prompts × T5-XXL on a 24 GB card).
     log::info!("[2/5] Encoding {} prompt(s) + uncond...", prompts.len());
-    let conds: Vec<(Tensor, Tensor)> = prompts.iter().enumerate()
-        .map(|(i, p)| {
-            let pair = encode_sd3_prompt(
-                p, &clip_l, &clip_g, &mut t5,
-                &tok_l, &tok_g, &tok_t5, args.t5_max_len, &device,
-            )?;
-            log::info!("  prompt {}/{}: ctx={:?} pool={:?}",
-                i + 1, prompts.len(), pair.0.shape().dims(), pair.1.shape().dims());
-            Ok(pair)
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut conds: Vec<(Tensor, Tensor)> = Vec::with_capacity(prompts.len());
+    for (i, p) in prompts.iter().enumerate() {
+        let pair = encode_sd3_prompt(
+            p, &clip_l, &clip_g, &mut t5,
+            &tok_l, &tok_g, &tok_t5, args.t5_max_len, &device,
+        )?;
+        log::info!("  prompt {}/{}: ctx={:?} pool={:?}",
+            i + 1, prompts.len(), pair.0.shape().dims(), pair.1.shape().dims());
+        conds.push(pair);
+        flame_core::cuda_alloc_pool::clear_pool_cache();
+        flame_core::trim_cuda_mempool(0);
+    }
     let do_cfg = args.cfg_scale > 1.0;
     let uncond = if do_cfg {
         Some(encode_sd3_prompt(
