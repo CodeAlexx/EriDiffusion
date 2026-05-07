@@ -42,9 +42,20 @@ const AE_SHIFT_FACTOR: f32 = 0.1159;
 #[derive(Parser, Debug)]
 #[command(about = "Chroma image generation")]
 struct Args {
-    #[arg(long)] prompt: String,
+    /// Single prompt. Mutually exclusive with `--prompts-file`.
+    #[arg(long)] prompt: Option<String>,
+    /// Newline-separated prompts file for batch sampling. Blank lines and
+    /// `#`-prefixed comments are skipped. Requires `--output-dir`. The
+    /// text encoder is loaded once, every prompt is encoded, the TE is
+    /// dropped, then the DiT loads once and serves all prompts; the VAE
+    /// loads once at the end and decodes every collected latent.
+    #[arg(long)] prompts_file: Option<PathBuf>,
     #[arg(long, default_value = "")] negative: String,
+    /// Single-prompt output path. Used when `--prompt` is given.
     #[arg(long, default_value = "output/chroma_sample.png")] output: PathBuf,
+    /// Multi-prompt output directory. Required with `--prompts-file`.
+    /// Files are written as `sample_001.png`, `sample_002.png`, ...
+    #[arg(long)] output_dir: Option<PathBuf>,
     /// Chroma transformer: directory of shards OR single safetensors.
     #[arg(long, default_value = DEFAULT_DIT_DIR)] transformer: PathBuf,
     #[arg(long, default_value = DEFAULT_VAE)] vae_path: PathBuf,
@@ -101,12 +112,46 @@ fn main() -> anyhow::Result<()> {
     let mut t5 = T5Encoder::load(t5_path_str, &device)
         .map_err(|e| anyhow::anyhow!("T5 load: {e}"))?;
 
-    log::info!("[1/4] Encoding prompts (seq_len={})...", T5_SEQ_LEN);
-    let cond_tokens = tokenize_t5(&args.tokenizer_path, &args.prompt, T5_SEQ_LEN)?;
-    let cond = t5
-        .encode(&cond_tokens)
-        .map_err(|e| anyhow::anyhow!("T5 cond encode: {e}"))?;
-    let cond = cond.to_dtype(DType::BF16).map_err(|e| anyhow::anyhow!("cond dtype: {e}"))?;
+    // Resolve prompt list. Single-prompt mode keeps the legacy
+    // `--prompt` / `--output` contract; multi-prompt mode reads
+    // `--prompts-file` and writes to `--output-dir/sample_NNN.png`.
+    let prompts: Vec<String> = match (&args.prompt, &args.prompts_file) {
+        (Some(p), None) => vec![p.clone()],
+        (None, Some(path)) => {
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("read --prompts-file {}: {e}", path.display()))?;
+            content.lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| l.to_string())
+                .collect()
+        }
+        (Some(_), Some(_)) => anyhow::bail!("--prompt and --prompts-file are mutually exclusive"),
+        (None, None) => anyhow::bail!("provide --prompt or --prompts-file"),
+    };
+    if prompts.is_empty() {
+        anyhow::bail!("no prompts found in --prompts-file");
+    }
+    let multi_mode = args.prompts_file.is_some();
+    if multi_mode && args.output_dir.is_none() {
+        anyhow::bail!("--prompts-file requires --output-dir");
+    }
+    if let Some(dir) = &args.output_dir {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| anyhow::anyhow!("create --output-dir {}: {e}", dir.display()))?;
+    }
+
+    log::info!("[1/4] Encoding {} prompt(s) + uncond (seq_len={})...", prompts.len(), T5_SEQ_LEN);
+    let conds: Vec<Tensor> = prompts.iter().enumerate()
+        .map(|(i, p)| {
+            let tokens = tokenize_t5(&args.tokenizer_path, p, T5_SEQ_LEN)?;
+            let c = t5.encode(&tokens)
+                .map_err(|e| anyhow::anyhow!("T5 cond encode {}: {e}", i + 1))?;
+            let c = c.to_dtype(DType::BF16).map_err(|e| anyhow::anyhow!("cond dtype: {e}"))?;
+            log::info!("  prompt {}/{}: cond shape={:?}", i + 1, prompts.len(), c.shape().dims());
+            Ok(c)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     let uncond_tokens = tokenize_t5(&args.tokenizer_path, &args.negative, T5_SEQ_LEN)?;
     let uncond = t5
@@ -114,11 +159,7 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("T5 uncond encode: {e}"))?;
     let uncond = uncond.to_dtype(DType::BF16).map_err(|e| anyhow::anyhow!("uncond dtype: {e}"))?;
 
-    log::info!(
-        "[1/4] cond={:?} uncond={:?}",
-        cond.shape().dims(),
-        uncond.shape().dims()
-    );
+    log::info!("[1/4] uncond={:?}", uncond.shape().dims());
     drop(t5); // free ~10 GB before loading DiT
 
     // ------------------------------------------------------------------
@@ -159,35 +200,9 @@ fn main() -> anyhow::Result<()> {
     let latent_w = args.width / 8;
 
     log::info!(
-        "[3/4] Denoising {}x{} → latent {}x{}, {} steps, cfg={}...",
-        args.width, args.height, latent_w, latent_h, args.steps, args.cfg
+        "[3/4] Denoising {} prompt(s) at {}x{} → latent {}x{}, {} steps, cfg={}...",
+        conds.len(), args.width, args.height, latent_w, latent_h, args.steps, args.cfg
     );
-
-    // Box-Muller noise, matches chroma_sampler::sample_image seeding.
-    let numel = AE_IN_CHANNELS * latent_h * latent_w;
-    let noise_data: Vec<f32> = {
-        use rand::{rngs::StdRng, Rng, SeedableRng};
-        let mut rng = StdRng::seed_from_u64(args.seed);
-        let mut v = Vec::with_capacity(numel);
-        while v.len() < numel {
-            let u1: f32 = rng.gen::<f32>().max(1e-10);
-            let u2: f32 = rng.gen::<f32>();
-            let mag = (-2.0 * u1.ln()).sqrt();
-            let theta = 2.0 * std::f32::consts::PI * u2;
-            v.push(mag * theta.cos());
-            if v.len() < numel {
-                v.push(mag * theta.sin());
-            }
-        }
-        v
-    };
-
-    let mut x = Tensor::from_f32_to_bf16(
-        noise_data,
-        Shape::from_dims(&[1, AE_IN_CHANNELS, latent_h, latent_w]),
-        device.clone(),
-    )
-    .map_err(|e| anyhow::anyhow!("noise tensor: {e}"))?;
 
     let timesteps = flux_sampler::schedule(args.steps, args.width, args.height);
     log::info!(
@@ -197,61 +212,102 @@ fn main() -> anyhow::Result<()> {
         timesteps[args.steps]
     );
 
-    let t_denoise = std::time::Instant::now();
-    for step in 0..args.steps {
-        let t_curr = timesteps[step];
-        let t_next = timesteps[step + 1];
-        let dt = t_next - t_curr;
+    let pad_width = std::cmp::max(3, conds.len().to_string().len());
+    let t_denoise_total = std::time::Instant::now();
+    // Collect each prompt's final latent so we can drop the DiT once and
+    // decode every latent through a single VAE-load pass.
+    let mut latents: Vec<Tensor> = Vec::with_capacity(conds.len());
 
-        let t_vec = Tensor::from_f32_to_bf16(
-            vec![t_curr],
-            Shape::from_dims(&[1]),
+    for (idx, cond) in conds.iter().enumerate() {
+        log::info!("  [{}/{}] denoising...", idx + 1, conds.len());
+
+        // Box-Muller noise, matches chroma_sampler::sample_image seeding.
+        // Same seed across prompts keeps noise pattern fixed; if you want
+        // variety, vary the seed or add a per-prompt offset.
+        let numel = AE_IN_CHANNELS * latent_h * latent_w;
+        let noise_data: Vec<f32> = {
+            use rand::{rngs::StdRng, Rng, SeedableRng};
+            let mut rng = StdRng::seed_from_u64(args.seed);
+            let mut v = Vec::with_capacity(numel);
+            while v.len() < numel {
+                let u1: f32 = rng.gen::<f32>().max(1e-10);
+                let u2: f32 = rng.gen::<f32>();
+                let mag = (-2.0 * u1.ln()).sqrt();
+                let theta = 2.0 * std::f32::consts::PI * u2;
+                v.push(mag * theta.cos());
+                if v.len() < numel {
+                    v.push(mag * theta.sin());
+                }
+            }
+            v
+        };
+
+        let mut x = Tensor::from_f32_to_bf16(
+            noise_data,
+            Shape::from_dims(&[1, AE_IN_CHANNELS, latent_h, latent_w]),
             device.clone(),
         )
-        .map_err(|e| anyhow::anyhow!("t_vec: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("noise tensor: {e}"))?;
 
-        // Cond forward
-        let pred_cond = model
-            .forward(&x, &cond, &t_vec)
-            .map_err(|e| anyhow::anyhow!("forward cond step {step}: {e}"))?;
-        // Uncond forward
-        let pred_uncond = model
-            .forward(&x, &uncond, &t_vec)
-            .map_err(|e| anyhow::anyhow!("forward uncond step {step}: {e}"))?;
+        let t_step = std::time::Instant::now();
+        for step in 0..args.steps {
+            let t_curr = timesteps[step];
+            let t_next = timesteps[step + 1];
+            let dt = t_next - t_curr;
 
-        // CFG: pred = uncond + cfg_scale * (cond - uncond)
-        let diff = pred_cond
-            .sub(&pred_uncond)
-            .map_err(|e| anyhow::anyhow!("cfg diff: {e}"))?;
-        let scaled = diff
-            .mul_scalar(args.cfg)
-            .map_err(|e| anyhow::anyhow!("cfg scale: {e}"))?;
-        let pred = pred_uncond
-            .add(&scaled)
-            .map_err(|e| anyhow::anyhow!("cfg add: {e}"))?;
+            let t_vec = Tensor::from_f32_to_bf16(
+                vec![t_curr],
+                Shape::from_dims(&[1]),
+                device.clone(),
+            )
+            .map_err(|e| anyhow::anyhow!("t_vec: {e}"))?;
 
-        // Euler step: x_next = x + dt * pred
-        x = x
-            .add(&pred.mul_scalar(dt).map_err(|e| anyhow::anyhow!("dt mul: {e}"))?)
-            .map_err(|e| anyhow::anyhow!("euler step: {e}"))?;
+            // Cond forward
+            let pred_cond = model
+                .forward(&x, cond, &t_vec)
+                .map_err(|e| anyhow::anyhow!("forward cond prompt {} step {step}: {e}", idx + 1))?;
+            // Uncond forward
+            let pred_uncond = model
+                .forward(&x, &uncond, &t_vec)
+                .map_err(|e| anyhow::anyhow!("forward uncond prompt {} step {step}: {e}", idx + 1))?;
 
-        if (step + 1) % 5 == 0 || step == 0 || step + 1 == args.steps {
-            log::info!(
-                "  step {}/{}, t={:.4} ({:.1}s elapsed)",
-                step + 1,
-                args.steps,
-                t_curr,
-                t_denoise.elapsed().as_secs_f32()
-            );
+            // CFG: pred = uncond + cfg_scale * (cond - uncond)
+            let diff = pred_cond
+                .sub(&pred_uncond)
+                .map_err(|e| anyhow::anyhow!("cfg diff: {e}"))?;
+            let scaled = diff
+                .mul_scalar(args.cfg)
+                .map_err(|e| anyhow::anyhow!("cfg scale: {e}"))?;
+            let pred = pred_uncond
+                .add(&scaled)
+                .map_err(|e| anyhow::anyhow!("cfg add: {e}"))?;
+
+            // Euler step: x_next = x + dt * pred
+            x = x
+                .add(&pred.mul_scalar(dt).map_err(|e| anyhow::anyhow!("dt mul: {e}"))?)
+                .map_err(|e| anyhow::anyhow!("euler step: {e}"))?;
+
+            if (step + 1) % 5 == 0 || step == 0 || step + 1 == args.steps {
+                log::info!(
+                    "  prompt {}/{} step {}/{}, t={:.4} ({:.1}s elapsed)",
+                    idx + 1,
+                    conds.len(),
+                    step + 1,
+                    args.steps,
+                    t_curr,
+                    t_step.elapsed().as_secs_f32()
+                );
+            }
         }
+        latents.push(x);
     }
-    let denoise_secs = t_denoise.elapsed().as_secs_f32();
-    log::info!("[3/4] Denoising done in {:.1}s", denoise_secs);
+    let denoise_secs = t_denoise_total.elapsed().as_secs_f32();
+    log::info!("[3/4] Denoising {} prompt(s) done in {:.1}s", latents.len(), denoise_secs);
 
     // ------------------------------------------------------------------
-    // Stage 4: VAE decode + save PNG
+    // Stage 4: VAE decode + save PNG (single VAE load for all prompts)
     // ------------------------------------------------------------------
-    log::info!("[4/4] VAE decode...");
+    log::info!("[4/4] VAE decode for {} prompt(s)...", latents.len());
     drop(model); // free DiT before loading VAE
     let vae_path_str = args
         .vae_path
@@ -267,21 +323,33 @@ fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("VAE load: {e}"))?;
 
-    let rgb = vae
-        .decode(&x)
-        .map_err(|e| anyhow::anyhow!("VAE decode: {e}"))?;
+    let mut saved_paths: Vec<PathBuf> = Vec::with_capacity(latents.len());
+    for (idx, latent) in latents.iter().enumerate() {
+        let rgb = vae
+            .decode(latent)
+            .map_err(|e| anyhow::anyhow!("VAE decode prompt {}: {e}", idx + 1))?;
+        let out_path = if multi_mode {
+            let dir = args.output_dir.as_ref().unwrap();
+            dir.join(format!("sample_{:0>width$}.png", idx + 1, width = pad_width))
+        } else {
+            args.output.clone()
+        };
+        save_rgb_png(&rgb, &out_path).map_err(|e| anyhow::anyhow!("save PNG: {e}"))?;
+        log::info!("  [{}/{}] saved {}", idx + 1, latents.len(), out_path.display());
+        saved_paths.push(out_path);
+    }
     drop(vae);
-
-    save_rgb_png(&rgb, &args.output).map_err(|e| anyhow::anyhow!("save PNG: {e}"))?;
 
     let total_secs = t_total.elapsed().as_secs_f32();
     log::info!(
-        "Done. Output: {} | denoise={:.1}s | total={:.1}s",
-        args.output.display(),
+        "Done. {} sample(s) saved | denoise={:.1}s | total={:.1}s",
+        saved_paths.len(),
         denoise_secs,
         total_secs
     );
-    println!("Saved: {}", args.output.display());
+    for p in &saved_paths {
+        println!("Saved: {}", p.display());
+    }
     println!(
         "Timing: denoise={:.1}s  total={:.1}s",
         denoise_secs, total_secs

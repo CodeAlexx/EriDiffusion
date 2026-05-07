@@ -19,8 +19,16 @@ const TXT_PAD_LEN: usize = 512;
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long)] prompt: String,
+    /// Single prompt. Mutually exclusive with `--prompts-file`.
+    #[arg(long)] prompt: Option<String>,
+    /// Newline-separated prompts file for batch sampling. Blank lines and
+    /// `#`-prefixed comments are skipped. Requires `--output-dir`. Encoder
+    /// loads once for all prompts; DiT loads once and serves all denoises.
+    #[arg(long)] prompts_file: Option<PathBuf>,
     #[arg(long, default_value = "output.png")] output: PathBuf,
+    /// Multi-prompt output directory. Required with `--prompts-file`.
+    /// Files are written as `sample_001.png`, `sample_002.png`, ...
+    #[arg(long)] output_dir: Option<PathBuf>,
     /// Single-file Z-Image transformer safetensors (e.g. z_image_base_bf16.safetensors).
     #[arg(long)] model: PathBuf,
     #[arg(long)] vae_path: PathBuf,
@@ -46,6 +54,35 @@ fn main() -> anyhow::Result<()> {
     flame_core::config::set_default_dtype(DType::BF16);
     let device = flame_core::global_cuda_device();
 
+    // Resolve prompt list. Single-prompt mode keeps the legacy
+    // `--prompt` / `--output` contract; multi-prompt mode reads
+    // `--prompts-file` and writes to `--output-dir/sample_NNN.png`.
+    let prompts: Vec<String> = match (&args.prompt, &args.prompts_file) {
+        (Some(p), None) => vec![p.clone()],
+        (None, Some(path)) => {
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("read --prompts-file {}: {e}", path.display()))?;
+            content.lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| l.to_string())
+                .collect()
+        }
+        (Some(_), Some(_)) => anyhow::bail!("--prompt and --prompts-file are mutually exclusive"),
+        (None, None) => anyhow::bail!("provide --prompt or --prompts-file"),
+    };
+    if prompts.is_empty() {
+        anyhow::bail!("no prompts found in --prompts-file");
+    }
+    let multi_mode = args.prompts_file.is_some();
+    if multi_mode && args.output_dir.is_none() {
+        anyhow::bail!("--prompts-file requires --output-dir");
+    }
+    if let Some(dir) = &args.output_dir {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| anyhow::anyhow!("create --output-dir {}: {e}", dir.display()))?;
+    }
+
     log::info!("[1/4] Loading Qwen3 + tokenizer...");
     let qwen_weights = load_qwen3_weights(&args.qwen3, &device)?;
     let mut qcfg = Qwen3Encoder::config_from_weights(&qwen_weights)?;
@@ -55,11 +92,17 @@ fn main() -> anyhow::Result<()> {
     let tokenizer = tokenizers::Tokenizer::from_file(&args.tokenizer_path)
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
 
-    log::info!("[2/4] Encoding prompt...");
-    let (cap_feats, cap_mask) = encode_prompt(&qwen3, &tokenizer, &args.prompt, &device)?;
+    log::info!("[2/4] Encoding {} prompt(s) + uncond...", prompts.len());
+    let cond_pairs: Vec<(flame_core::Tensor, flame_core::Tensor)> = prompts.iter().enumerate()
+        .map(|(i, p)| {
+            let pair = encode_prompt(&qwen3, &tokenizer, p, &device)?;
+            log::info!("  prompt {}/{}: cond shape={:?}", i + 1, prompts.len(), pair.0.shape().dims());
+            Ok(pair)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let (cap_uncond, cap_mask_uncond) = encode_prompt(&qwen3, &tokenizer, "", &device)?;
     drop(qwen3);
-    log::info!("  cond={:?} uncond={:?}", cap_feats.shape().dims(), cap_uncond.shape().dims());
+    log::info!("  uncond={:?}", cap_uncond.shape().dims());
 
     log::info!("[3/4] Loading Z-Image transformer + LoRA...");
     let mut model = ZImageModel::load(
@@ -75,33 +118,51 @@ fn main() -> anyhow::Result<()> {
             lp, args.lora_rank, args.lora_alpha);
     }
 
-    log::info!("[4/4] Sampling at {}² ({} steps, cfg={}, shift={})...",
-        args.size, args.steps, args.cfg, args.shift);
+    log::info!("[4/4] Sampling {} prompt(s) at {}² ({} steps, cfg={}, shift={})...",
+        cond_pairs.len(), args.size, args.steps, args.cfg, args.shift);
 
-    // Split path: denoise, unload transformer, then VAE-decode.
-    // At 1024² the Z-Image transformer (~11.5 GB) and the VAE conv workspace
-    // cannot both fit in 24 GB simultaneously.  Dropping the model before
-    // decode frees the VRAM the VAE's cuDNN workspace needs.
+    // Split path: denoise every prompt while the transformer is resident,
+    // then unload it and VAE-decode each collected latent. At 1024² the
+    // Z-Image transformer (~11.5 GB) and the VAE conv workspace cannot
+    // both fit in 24 GB simultaneously, so dropping the model before
+    // decode is required.
     let _no_grad = flame_core::autograd::AutogradContext::no_grad();
     let _ckpt = eridiffusion_core::sampler::zimage_sampler::CheckpointGuard::disable();
-    let latent = zimage_sampler::denoise_latent(
-        &mut model,
-        &cap_feats, Some(&cap_mask),
-        Some(&cap_uncond), Some(&cap_mask_uncond),
-        args.size, args.size,
-        args.steps,
-        args.cfg,
-        args.shift,
-        args.seed,
-        &device,
-    )?;
+    let pad_width = std::cmp::max(3, cond_pairs.len().to_string().len());
+    let mut latents: Vec<flame_core::Tensor> = Vec::with_capacity(cond_pairs.len());
+
+    for (idx, (cap_feats, cap_mask)) in cond_pairs.iter().enumerate() {
+        log::info!("  [{}/{}] denoising prompt...", idx + 1, cond_pairs.len());
+        let latent = zimage_sampler::denoise_latent(
+            &mut model,
+            cap_feats, Some(cap_mask),
+            Some(&cap_uncond), Some(&cap_mask_uncond),
+            args.size, args.size,
+            args.steps,
+            args.cfg,
+            args.shift,
+            args.seed,
+            &device,
+        )?;
+        latents.push(latent);
+    }
+
     // Drop transformer weights before VAE decode to free VRAM.
     drop(model);
     flame_core::cuda_alloc_pool::clear_pool_cache();
     flame_core::trim_cuda_mempool(0);
-    zimage_sampler::decode_latent_to_png(&latent, &args.vae_path, &args.output, &device)?;
 
-    log::info!("Saved {:?}", args.output);
+    for (idx, latent) in latents.iter().enumerate() {
+        let out_path = if multi_mode {
+            let dir = args.output_dir.as_ref().unwrap();
+            dir.join(format!("sample_{:0>width$}.png", idx + 1, width = pad_width))
+        } else {
+            args.output.clone()
+        };
+        zimage_sampler::decode_latent_to_png(latent, &args.vae_path, &out_path, &device)?;
+        log::info!("  [{}/{}] saved {:?}", idx + 1, latents.len(), out_path);
+    }
+    log::info!("Done — {} sample(s) saved", latents.len());
     Ok(())
 }
 

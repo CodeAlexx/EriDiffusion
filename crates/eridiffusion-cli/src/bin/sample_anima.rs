@@ -37,9 +37,17 @@ const T5_MAX_LEN: usize = 512;
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long)] prompt: String,
+    /// Single prompt. Mutually exclusive with `--prompts-file`.
+    #[arg(long)] prompt: Option<String>,
+    /// Newline-separated prompts file for batch sampling. Blank lines and
+    /// `#`-prefixed comments are skipped. Requires `--output-dir`. Encoders
+    /// load once for all prompts; DiT and VAE each load once total.
+    #[arg(long)] prompts_file: Option<PathBuf>,
     #[arg(long, default_value = "")] negative_prompt: String,
     #[arg(long, default_value = "output.png")] output: PathBuf,
+    /// Multi-prompt output directory. Required with `--prompts-file`.
+    /// Files are written as `sample_001.png`, `sample_002.png`, ...
+    #[arg(long)] output_dir: Option<PathBuf>,
     /// Single safetensors (e.g. `anima-preview.safetensors`).
     #[arg(long)] dit_path: PathBuf,
     #[arg(long)] vae_path: PathBuf,
@@ -106,8 +114,43 @@ fn main() -> anyhow::Result<()> {
         Ok((q_hidden.to_dtype(DType::BF16)?, qmask_t, t5_t, t5mask_t))
     };
 
-    log::info!("[2/4] Encoding cond + uncond prompts...");
-    let (cap_cond, mask_cond, t5_cond, t5mask_cond) = encode_pair(&args.prompt)?;
+    // Resolve prompt list. Single-prompt mode keeps the legacy
+    // `--prompt` / `--output` contract; multi-prompt mode reads
+    // `--prompts-file` and writes to `--output-dir/sample_NNN.png`.
+    let prompts: Vec<String> = match (&args.prompt, &args.prompts_file) {
+        (Some(p), None) => vec![p.clone()],
+        (None, Some(path)) => {
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("read --prompts-file {}: {e}", path.display()))?;
+            content.lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| l.to_string())
+                .collect()
+        }
+        (Some(_), Some(_)) => anyhow::bail!("--prompt and --prompts-file are mutually exclusive"),
+        (None, None) => anyhow::bail!("provide --prompt or --prompts-file"),
+    };
+    if prompts.is_empty() {
+        anyhow::bail!("no prompts found in --prompts-file");
+    }
+    let multi_mode = args.prompts_file.is_some();
+    if multi_mode && args.output_dir.is_none() {
+        anyhow::bail!("--prompts-file requires --output-dir");
+    }
+    if let Some(dir) = &args.output_dir {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| anyhow::anyhow!("create --output-dir {}: {e}", dir.display()))?;
+    }
+
+    log::info!("[2/4] Encoding {} prompt(s) + uncond...", prompts.len());
+    let cond_quads: Vec<(Tensor, Tensor, Tensor, Tensor)> = prompts.iter().enumerate()
+        .map(|(i, p)| {
+            let q = encode_pair(p)?;
+            log::info!("  prompt {}/{}: cap={:?}", i + 1, prompts.len(), q.0.shape().dims());
+            Ok(q)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let (cap_uncond, mask_uncond, t5_uncond, t5mask_uncond) = encode_pair(&args.negative_prompt)?;
     drop(qwen3);
     flame_core::cuda_alloc_pool::clear_pool_cache();
@@ -126,69 +169,86 @@ fn main() -> anyhow::Result<()> {
             lp.display(), args.lora_rank, args.lora_alpha);
     }
 
-    // ── 3. Denoise ────────────────────────────────────────────────────────
-    log::info!("[4/4] Denoising {} steps (flow_shift={:.2}, cfg={:.2})...",
-        args.steps, args.flow_shift, args.guidance);
+    // ── 3. Denoise ─ once per prompt, all latents collected ─
+    log::info!("[4/4] Denoising {} prompt(s) × {} steps (flow_shift={:.2}, cfg={:.2})...",
+        cond_quads.len(), args.steps, args.flow_shift, args.guidance);
     let sigmas = anima_sampler::schedule(args.steps, args.flow_shift);
-    let mut latent = {
-        use rand::SeedableRng;
-        let _rng = rand::rngs::StdRng::seed_from_u64(args.seed);
-        Tensor::randn(
-            Shape::from_dims(&[1, anima_mod::IN_CHANNELS, h_lat, w_lat]),
-            0.0, 1.0, device.clone(),
-        )?.to_dtype(DType::BF16)?
-    };
+    let pad_width = std::cmp::max(3, cond_quads.len().to_string().len());
+    let mut latents: Vec<Tensor> = Vec::with_capacity(cond_quads.len());
 
-    for step in 0..args.steps {
-        let sigma = sigmas[step];
-        let sigma_next = sigmas[step + 1];
-        let t = anima_sampler::sigma_to_timestep(sigma);
-        let t_tensor = Tensor::from_vec(vec![t], Shape::from_dims(&[1]), device.clone())?;
-
-        let cond_ctx = vec![
-            cap_cond.clone(), mask_cond.clone(), t5_cond.clone(), t5mask_cond.clone(),
-        ];
-        let unc_ctx = vec![
-            cap_uncond.clone(), mask_uncond.clone(), t5_uncond.clone(), t5mask_uncond.clone(),
-        ];
-        let pred_cond = <AnimaModel as TrainableModel>::forward(&mut model, &latent, &t_tensor, &cond_ctx, None)?;
-        let pred = if args.guidance > 1.0 {
-            let pred_uncond = <AnimaModel as TrainableModel>::forward(&mut model, &latent, &t_tensor, &unc_ctx, None)?;
-            pred_uncond.add(&pred_cond.sub(&pred_uncond)?.mul_scalar(args.guidance)?)?
-        } else {
-            pred_cond
+    for (idx, (cap_cond, mask_cond, t5_cond, t5mask_cond)) in cond_quads.iter().enumerate() {
+        log::info!("  [{}/{}] denoising prompt...", idx + 1, cond_quads.len());
+        let mut latent = {
+            use rand::SeedableRng;
+            let _rng = rand::rngs::StdRng::seed_from_u64(args.seed);
+            Tensor::randn(
+                Shape::from_dims(&[1, anima_mod::IN_CHANNELS, h_lat, w_lat]),
+                0.0, 1.0, device.clone(),
+            )?.to_dtype(DType::BF16)?
         };
 
-        latent = anima_sampler::euler_step(&latent, &pred, sigma, sigma_next)?;
-        if step % 5 == 0 || step == args.steps - 1 {
-            log::info!("  step {}/{} sigma={:.4}", step + 1, args.steps, sigma);
+        for step in 0..args.steps {
+            let sigma = sigmas[step];
+            let sigma_next = sigmas[step + 1];
+            let t = anima_sampler::sigma_to_timestep(sigma);
+            let t_tensor = Tensor::from_vec(vec![t], Shape::from_dims(&[1]), device.clone())?;
+
+            let cond_ctx = vec![
+                cap_cond.clone(), mask_cond.clone(), t5_cond.clone(), t5mask_cond.clone(),
+            ];
+            let unc_ctx = vec![
+                cap_uncond.clone(), mask_uncond.clone(), t5_uncond.clone(), t5mask_uncond.clone(),
+            ];
+            let pred_cond = <AnimaModel as TrainableModel>::forward(&mut model, &latent, &t_tensor, &cond_ctx, None)?;
+            let pred = if args.guidance > 1.0 {
+                let pred_uncond = <AnimaModel as TrainableModel>::forward(&mut model, &latent, &t_tensor, &unc_ctx, None)?;
+                pred_uncond.add(&pred_cond.sub(&pred_uncond)?.mul_scalar(args.guidance)?)?
+            } else {
+                pred_cond
+            };
+
+            latent = anima_sampler::euler_step(&latent, &pred, sigma, sigma_next)?;
+            if step % 5 == 0 || step == args.steps - 1 {
+                log::info!("    prompt {}/{} step {}/{} sigma={:.4}",
+                    idx + 1, cond_quads.len(), step + 1, args.steps, sigma);
+            }
         }
+        latents.push(latent);
     }
 
-    // ── 4. VAE decode ────────────────────────────────────────────────────
+    // ── 4. VAE decode (single VAE load for all latents) ─
     // Latent is per-channel normalized (Anima trainer side). Wan21VaeDecoder
     // unnormalizes (z * STD + MEAN) internally then runs the decoder, output
     // clamped to [-1, 1].
-    log::info!("[VAE] decoding latent...");
+    log::info!("[VAE] decoding {} latent(s)...", latents.len());
     let vae = Wan21VaeDecoder::from_safetensors(&args.vae_path.to_string_lossy(), &device)?;
-    let img = vae.decode_image_normalized(&latent)?;
 
-    // CHW → HWC PNG.
-    let pixels: Vec<f32> = img.to_dtype(DType::F32)?.to_vec()?;
-    let dims = img.shape().dims();
-    let (c, h, w) = if dims.len() == 4 { (dims[1], dims[2], dims[3]) } else { (3, dims[0], dims[1]) };
-    let mut buf = vec![0u8; h * w * 3];
-    for y in 0..h {
-        for x in 0..w {
-            for ch in 0..c.min(3) {
-                let idx = ch * h * w + y * w + x;
-                let v = pixels.get(idx).copied().unwrap_or(0.0);
-                buf[(y * w + x) * 3 + ch] = ((v.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8;
+    for (idx, latent) in latents.iter().enumerate() {
+        let img = vae.decode_image_normalized(latent)?;
+        // CHW → HWC PNG.
+        let pixels: Vec<f32> = img.to_dtype(DType::F32)?.to_vec()?;
+        let dims = img.shape().dims();
+        let (c, h, w) = if dims.len() == 4 { (dims[1], dims[2], dims[3]) } else { (3, dims[0], dims[1]) };
+        let mut buf = vec![0u8; h * w * 3];
+        for y in 0..h {
+            for x in 0..w {
+                for ch in 0..c.min(3) {
+                    let id = ch * h * w + y * w + x;
+                    let v = pixels.get(id).copied().unwrap_or(0.0);
+                    buf[(y * w + x) * 3 + ch] = ((v.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8;
+                }
             }
         }
+        let out_path = if multi_mode {
+            let dir = args.output_dir.as_ref().unwrap();
+            dir.join(format!("sample_{:0>width$}.png", idx + 1, width = pad_width))
+        } else {
+            args.output.clone()
+        };
+        image::save_buffer(&out_path, &buf, w as u32, h as u32, image::ColorType::Rgb8)?;
+        log::info!("  [{}/{}] saved {}", idx + 1, latents.len(), out_path.display());
     }
-    image::save_buffer(&args.output, &buf, w as u32, h as u32, image::ColorType::Rgb8)?;
-    log::info!("Saved to {}", args.output.display());
+    log::info!("Done — {} sample(s) saved", latents.len());
     Ok(())
 }
 

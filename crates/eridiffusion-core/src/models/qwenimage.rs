@@ -467,9 +467,21 @@ impl QwenImageTrainingModel {
     }
 
     /// Inference-path linear (non-autograd, fast).
+    ///
+    /// Bypasses the cuBLASLt BIAS epilogue and adds bias as a separate
+    /// elementwise op. The fused-bias path drifts ~0.003 mean abs (cos
+    /// ≈ 0.999996) per call vs the unfused `matmul + add(bias)` reference
+    /// — see `docs/FUSED_LINEAR3D_BUG_DIG.md`. Compounded across the
+    /// shared-weight forwards (img_in, txt_in, time_text_embed,
+    /// norm_out, proj_out) over 50 sample steps the drift accumulates.
+    /// Separate add is bit-identical to the legacy `matmul + add(bias)`
+    /// path that all the other ported models use.
     fn fused_linear(&self, x: &Tensor, w: &Tensor, b: Option<&Tensor>) -> Result<Tensor> {
         let x3d = if x.shape().dims().len() == 2 { x.unsqueeze(0)? } else { x.clone() };
-        let out = flame_core::ops::fused_inference::fused_linear3d_native(&x3d, w, b)?;
+        let mut out = flame_core::ops::fused_inference::fused_linear3d_native(&x3d, w, None)?;
+        if let Some(bias) = b {
+            out = out.add(bias)?;
+        }
         if x.shape().dims().len() == 2 { out.squeeze(Some(0)) } else { Ok(out) }
     }
 

@@ -79,10 +79,13 @@ pub struct FluxModel {
 
     pub has_guidance: bool,
 
-    /// When Some, double/single block weights are streamed from these shards
-    /// per layer instead of being resident. LoRA-only.
-    /// Mirrors `ErnieModel::enable_offload`.
-    pub offload_shards: Option<Vec<std::path::PathBuf>>,
+    /// When Some, double/single block weights live in pinned host RAM
+    /// (or mmap-backed streaming staging buffers) and are H2D-streamed into
+    /// reusable GPU slots per block, per step. LoRA-only.
+    ///
+    /// Unified block index space: `0..NUM_DOUBLE` → double_blocks.{i},
+    /// `NUM_DOUBLE..NUM_DOUBLE + NUM_SINGLE` → single_blocks.{i}.
+    pub offloader: Option<std::sync::Arc<std::sync::Mutex<crate::training::block_offload::BlockOffloader>>>,
 
     /// Default guidance value passed to the model at training time.
     /// 1.0 for Schnell, 3.5 for Dev (matches sd-scripts and EriDiffusion defaults).
@@ -176,8 +179,35 @@ impl FluxModel {
     pub fn load(
         model_path: &std::path::Path, config: &TrainConfig, device: Arc<CudaDevice>,
     ) -> Result<Self> {
-        log::info!("[Flux] loading from {}", model_path.display());
-        let all = flame_core::serialization::load_file(model_path, &device)?;
+        Self::load_inner(model_path, config, device, /*skip_blocks=*/ false)
+    }
+
+    /// Like `load`, but skips per-block weights (`double_blocks.*` /
+    /// `single_blocks.*`) at GPU-load time. Use this when the caller will
+    /// immediately call `enable_offload` — avoids the transient ~24 GB GPU
+    /// spike from the full-load + drop pattern. Per-block weights are
+    /// streamed in via `stage_*_block` during forward instead.
+    pub fn load_offload(
+        model_path: &std::path::Path, config: &TrainConfig, device: Arc<CudaDevice>,
+    ) -> Result<Self> {
+        Self::load_inner(model_path, config, device, /*skip_blocks=*/ true)
+    }
+
+    fn load_inner(
+        model_path: &std::path::Path, config: &TrainConfig, device: Arc<CudaDevice>,
+        skip_blocks: bool,
+    ) -> Result<Self> {
+        log::info!(
+            "[Flux] loading from {} (skip_blocks={})",
+            model_path.display(), skip_blocks,
+        );
+        let all = if skip_blocks {
+            flame_core::serialization::load_file_filtered(model_path, &device, |k| {
+                !k.starts_with("double_blocks.") && !k.starts_with("single_blocks.")
+            })?
+        } else {
+            flame_core::serialization::load_file(model_path, &device)?
+        };
         log::info!("[Flux] {} weight tensors", all.len());
 
         let has_guidance = all.contains_key("guidance_in.in_layer.weight");
@@ -221,16 +251,16 @@ impl FluxModel {
         // time shifted the guidance MLP's input distribution away from where
         // BFL distillation expects it.
         let guidance_value = 1.0;
-        Ok(Self { config: config.clone(), device, shared_weights: shared, double_block_weights: db, single_block_weights: sb, bundle, fft_params, is_full_finetune: is_fft, has_guidance, offload_shards: None, guidance_value })
+        Ok(Self { config: config.clone(), device, shared_weights: shared, double_block_weights: db, single_block_weights: sb, bundle, fft_params, is_full_finetune: is_fft, has_guidance, offloader: None, guidance_value })
     }
 
-    /// Drop double/single block weights from VRAM and remember source shards
-    /// so each block's forward re-loads just that block's tensors. LoRA-only.
-    /// Mirrors `ErnieModel::enable_offload`.
+    /// Drop double/single block weights from VRAM and build a `BlockOffloader`
+    /// that streams them from pinned host RAM into reusable GPU slots per block,
+    /// per step. Unified index space: `0..NUM_DOUBLE` → double_blocks.{i},
+    /// `NUM_DOUBLE..NUM_DOUBLE+NUM_SINGLE` → single_blocks.{i}.
+    /// LoRA or base inference — both supported.
     pub fn enable_offload(&mut self, shards: Vec<std::path::PathBuf>) -> Result<()> {
-        if self.is_full_finetune {
-            return Err(crate::EriDiffusionError::Model("Flux offload requires LoRA mode".into()));
-        }
+        // Drop per-block GPU tensors so the offloader controls staging.
         let mut dropped = 0usize;
         for block in &mut self.double_block_weights {
             dropped += block.len();
@@ -243,47 +273,53 @@ impl FluxModel {
         log::info!("[Flux] offload: dropped {} per-block weight tensors", dropped);
         flame_core::cuda_alloc_pool::clear_pool_cache();
         flame_core::trim_cuda_mempool(0);
-        self.offload_shards = Some(shards);
-        Ok(())
-    }
 
-    fn stage_double_block(&mut self, idx: usize) -> Result<()> {
-        let shards = match &self.offload_shards { None => return Ok(()), Some(s) => s.clone() };
-        let prefix = format!("double_blocks.{}.", idx);
-        let mut block = HashMap::new();
-        for shard in &shards {
-            let part = flame_core::serialization::load_file_filtered(
-                shard, &self.device, |k| k.starts_with(&prefix),
-            )?;
-            for (k, v) in part {
-                block.insert(k, v.to_dtype(DType::BF16)?);
+        struct FluxFacilitator;
+        impl crate::training::block_offload::BlockFacilitator for FluxFacilitator {
+            fn block_count(&self) -> usize { NUM_DOUBLE + NUM_SINGLE }
+            fn classify_key(&self, key: &str) -> Option<usize> {
+                if let Some(rest) = key.strip_prefix("double_blocks.") {
+                    let idx: usize = rest.split('.').next()?.parse().ok()?;
+                    if idx < NUM_DOUBLE { return Some(idx); }
+                }
+                if let Some(rest) = key.strip_prefix("single_blocks.") {
+                    let idx: usize = rest.split('.').next()?.parse().ok()?;
+                    if idx < NUM_SINGLE { return Some(NUM_DOUBLE + idx); }
+                }
+                None
             }
         }
-        self.double_block_weights[idx] = block;
-        Ok(())
-    }
-    fn evict_double_block(&mut self, idx: usize) {
-        if self.offload_shards.is_none() { return; }
-        self.double_block_weights[idx].clear();
-    }
-    fn stage_single_block(&mut self, idx: usize) -> Result<()> {
-        let shards = match &self.offload_shards { None => return Ok(()), Some(s) => s.clone() };
-        let prefix = format!("single_blocks.{}.", idx);
-        let mut block = HashMap::new();
-        for shard in &shards {
-            let part = flame_core::serialization::load_file_filtered(
-                shard, &self.device, |k| k.starts_with(&prefix),
-            )?;
-            for (k, v) in part {
-                block.insert(k, v.to_dtype(DType::BF16)?);
-            }
+
+        let shard_strs: Vec<String> = shards.iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let path_refs: Vec<&str> = shard_strs.iter().map(|s| s.as_str()).collect();
+
+        let use_streaming = std::env::var("FLUX_BLOCK_STREAMING")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "" | "false" | "False"))
+            .unwrap_or(true); // default: streaming (low pinned-RAM footprint)
+
+        let offloader = if use_streaming {
+            log::info!("[Flux] BlockOffloader: streaming mode");
+            crate::training::block_offload::BlockOffloader::load_streaming(
+                &path_refs, &FluxFacilitator, self.device.clone(),
+            )
+        } else {
+            log::info!("[Flux] BlockOffloader: pinned-RAM mode");
+            crate::training::block_offload::BlockOffloader::load(
+                &path_refs, &FluxFacilitator, self.device.clone(),
+            )
         }
-        self.single_block_weights[idx] = block;
+        // native_layout=true: leave 2D .weight tensors in on-disk [Cout, Cin] layout.
+        // Flux model code calls `.transpose()` itself before matmul — pre-transposing
+        // here would invert the shape and cause a matmul dimension mismatch.
+        .map(|o| o.with_native_layout(true))
+        .map_err(|e| crate::EriDiffusionError::Model(format!("BlockOffloader: {e}")))?;
+
+        self.offloader = Some(std::sync::Arc::new(std::sync::Mutex::new(offloader)));
+        log::info!("[Flux] BlockOffloader ready ({} unified blocks)", NUM_DOUBLE + NUM_SINGLE);
         Ok(())
-    }
-    fn evict_single_block(&mut self, idx: usize) {
-        if self.offload_shards.is_none() { return; }
-        self.single_block_weights[idx].clear();
     }
 
     // ── Primitives ──────────────────────────────────────────────────
@@ -380,13 +416,19 @@ impl FluxModel {
             }
             offset += half_ax;
         }
+        // Keep cos/sin in F32. Per inference-flame's `build_rope_2d`
+        // (flux1_dit.rs:458-461): the ~4e-3 BF16 floor on cos/sin
+        // accumulates across `blocks × steps × (Q+K) ≈ 2280` RoPE
+        // applications per inference and shows up as dense per-pixel
+        // speckle noise on the output. Use the `_f32pe` variant of the
+        // fused RoPE kernel which accepts F32 cos/sin against BF16 q/k.
         let cos = Tensor::from_slice(&cos_data, Shape::from_dims(&[1, 1, n, half_dim]), flame_core::global_cuda_device())?;
         let sin = Tensor::from_slice(&sin_data, Shape::from_dims(&[1, 1, n, half_dim]), flame_core::global_cuda_device())?;
-        Ok((cos.to_dtype(DType::BF16)?, sin.to_dtype(DType::BF16)?))
+        Ok((cos, sin))
     }
 
     fn apply_rope(q: &Tensor, k: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<(Tensor, Tensor)> {
-        Ok((flame_core::bf16_ops::rope_fused_bf16(q, cos, sin)?, flame_core::bf16_ops::rope_fused_bf16(k, cos, sin)?))
+        Ok((flame_core::bf16_ops::rope_fused_bf16_f32pe(q, cos, sin)?, flame_core::bf16_ops::rope_fused_bf16_f32pe(k, cos, sin)?))
     }
 
     // ── Double block forward ────────────────────────────────────────
@@ -424,14 +466,6 @@ impl FluxModel {
         let (b, n_img) = (dims[0], dims[1]);
         let n_txt = txt.shape().dims()[1];
 
-        // Inference dispatch: use fused BF16 kernels (qkv_split_permute_bf16,
-        // attn_split_txt_img_bf16, gate_residual_fused_bf16) when no grad tape
-        // is being recorded. These kernels auto-dispatch to autograd-recording
-        // primitives during training; the explicit is_inference branch is only
-        // needed for gate_residual_fused_bf16 which requires a [B, DIM] gate.
-        // Training path below is bit-identical to pre-iflame code.
-        let is_inference = !AutogradContext::is_recording();
-
         // Modulation
         let img_mod = Self::linear(&vec.silu()?, self.dw(idx, "img_mod.lin.weight")?, self.dw(idx, "img_mod.lin.bias")?)?;
         let img_mods = img_mod.unsqueeze(1)?.chunk(6, 2)?;
@@ -455,6 +489,8 @@ impl FluxModel {
             bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::ImgK))),
             bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::ImgV))),
         )?;
+        let c = img_qkv.chunk(3, 2)?;
+        let (img_q, img_k, img_v) = (c[0].clone(), c[1].clone(), c[2].clone());
 
         // --- Txt attention --- (split Q/K/V LoRA)
         let txt_norm = flame_core::layer_norm::layer_norm(txt, &[DIM], None, None, NORM_EPS)?;
@@ -466,18 +502,18 @@ impl FluxModel {
             bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::TxtK))),
             bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::TxtV))),
         )?;
+        let c = txt_qkv.chunk(3, 2)?;
+        let (txt_q, txt_k, txt_v) = (c[0].clone(), c[1].clone(), c[2].clone());
 
-        // QKV split → [B, H, N, D]. `qkv_split_permute_bf16` auto-dispatches:
-        // fused CUDA kernel in inference, primitives (narrow+reshape+permute)
-        // during training so autograd records each op. Both paths are safe.
-        let (img_q, img_k, img_v) = flame_core::bf16_ops::qkv_split_permute_bf16(&img_qkv, NUM_HEADS, HEAD_DIM)?;
-        let (txt_q, txt_k, txt_v) = flame_core::bf16_ops::qkv_split_permute_bf16(&txt_qkv, NUM_HEADS, HEAD_DIM)?;
-
-        // QK norm (operates on [B, H, N, D] from qkv_split_permute_bf16)
+        // QK norm
         let img_q = Self::rms_norm_per_head(&img_q, self.dw(idx, "img_attn.norm.query_norm.scale")?)?;
         let img_k = Self::rms_norm_per_head(&img_k, self.dw(idx, "img_attn.norm.key_norm.scale")?)?;
         let txt_q = Self::rms_norm_per_head(&txt_q, self.dw(idx, "txt_attn.norm.query_norm.scale")?)?;
         let txt_k = Self::rms_norm_per_head(&txt_k, self.dw(idx, "txt_attn.norm.key_norm.scale")?)?;
+
+        // Reshape → [B, H, N, D]
+        let (img_q, img_k, img_v) = (reshape_qkv(&img_q, b, n_img)?, reshape_qkv(&img_k, b, n_img)?, reshape_qkv(&img_v, b, n_img)?);
+        let (txt_q, txt_k, txt_v) = (reshape_qkv(&txt_q, b, n_txt)?, reshape_qkv(&txt_k, b, n_txt)?, reshape_qkv(&txt_v, b, n_txt)?);
 
         // Joint attention. `.contiguous()` after each cat — H9 / GOTCHAS §2.4:
         // Tensor::cat may return non-contiguous views; downstream BF16 SDPA /
@@ -488,12 +524,13 @@ impl FluxModel {
         let v = Tensor::cat(&[&txt_v, &img_v], 2)?.contiguous()?;
         let (q, k) = Self::apply_rope(&q, &k, cos, sin)?;
 
-        // SDPA → [B, H, N_total, D]
         let attn = flame_core::attention::sdpa(&q, &k, &v, None)?;
-
-        // Split attn back into txt/img streams. `attn_split_txt_img_bf16`
-        // auto-dispatches: fused kernel in inference, narrow+permute+reshape
-        // during training. Returns ([B, n_txt, DIM], [B, n_img, DIM]).
+        // FLUX speckle bug bisect (2026-05-07): the prior BlockOffloader
+        // port replaced the fused `attn_split_txt_img_bf16` with manual
+        // permute+reshape+narrow. The fused kernel handles the
+        // [B,H,N,D] → ([B,n_txt,DIM], [B,n_img,DIM]) transform correctly;
+        // the manual replacement (with .contiguous()) produced byte-
+        // identical speckle output. Restoring the fused kernel.
         let (txt_attn, img_attn) = flame_core::bf16_ops::attn_split_txt_img_bf16(&attn, n_txt, n_img)?;
 
         // Output proj + gate + residual
@@ -501,24 +538,17 @@ impl FluxModel {
         let img_proj = if let Some(lora) = bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::ImgProj))) {
             img_proj.add(&lora.forward_delta(&img_attn)?)?
         } else { img_proj };
-
-        // gate_residual_fused_bf16 (inference): squeeze [B,1,DIM] gate → [B,DIM].
-        // Training path uses mul+add directly (bit-identical to pre-iflame code).
-        let img = if is_inference {
-            flame_core::bf16_ops::gate_residual_fused_bf16(img, &img_g1.squeeze(Some(1))?, &img_proj)?
-        } else {
-            img.add(&img_g1.mul(&img_proj)?)?
-        };
+        // FLUX speckle bisect (2026-05-07): replace manual mul+add with the
+        // fused gate_residual_fused_bf16 kernel (the OLD inference path the
+        // BlockOffloader port removed). Eliminates any potential broadcast
+        // bug between [B,1,DIM] gate and [B,N,DIM] proj.
+        let img = flame_core::bf16_ops::gate_residual_fused_bf16(&img, &img_g1.squeeze(Some(1))?, &img_proj)?;
 
         let txt_proj = Self::linear(&txt_attn, self.dw(idx, "txt_attn.proj.weight")?, self.dw(idx, "txt_attn.proj.bias")?)?;
         let txt_proj = if let Some(lora) = bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::TxtProj))) {
             txt_proj.add(&lora.forward_delta(&txt_attn)?)?
         } else { txt_proj };
-        let txt = if is_inference {
-            flame_core::bf16_ops::gate_residual_fused_bf16(txt, &txt_g1.squeeze(Some(1))?, &txt_proj)?
-        } else {
-            txt.add(&txt_g1.mul(&txt_proj)?)?
-        };
+        let txt = flame_core::bf16_ops::gate_residual_fused_bf16(&txt, &txt_g1.squeeze(Some(1))?, &txt_proj)?;
 
         // --- GELU MLP --- (img + txt MLP up/down LoRAs added per H5)
         let img_norm2 = flame_core::layer_norm::layer_norm(&img, &[DIM], None, None, NORM_EPS)?;
@@ -532,11 +562,7 @@ impl FluxModel {
         let img_mlp_out = if let Some(lora) = bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::ImgMlp2))) {
             img_mlp_out_base.add(&lora.forward_delta(&img_mlp_h)?)?
         } else { img_mlp_out_base };
-        let img = if is_inference {
-            flame_core::bf16_ops::gate_residual_fused_bf16(&img, &img_g2.squeeze(Some(1))?, &img_mlp_out)?
-        } else {
-            img.add(&img_g2.mul(&img_mlp_out)?)?
-        };
+        let img = flame_core::bf16_ops::gate_residual_fused_bf16(&img, &img_g2.squeeze(Some(1))?, &img_mlp_out)?;
 
         let txt_norm2 = flame_core::layer_norm::layer_norm(&txt, &[DIM], None, None, NORM_EPS)?;
         let txt_mlp_in = txt_norm2.mul(&txt_scale2.add_scalar(1.0)?)?.add(txt_s2)?;
@@ -549,11 +575,7 @@ impl FluxModel {
         let txt_mlp_out = if let Some(lora) = bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::TxtMlp2))) {
             txt_mlp_out_base.add(&lora.forward_delta(&txt_mlp_h)?)?
         } else { txt_mlp_out_base };
-        let txt = if is_inference {
-            flame_core::bf16_ops::gate_residual_fused_bf16(&txt, &txt_g2.squeeze(Some(1))?, &txt_mlp_out)?
-        } else {
-            txt.add(&txt_g2.mul(&txt_mlp_out)?)?
-        };
+        let txt = flame_core::bf16_ops::gate_residual_fused_bf16(&txt, &txt_g2.squeeze(Some(1))?, &txt_mlp_out)?;
 
         Ok((img, txt))
     }
@@ -564,9 +586,6 @@ impl FluxModel {
         let dims = x.shape().dims().to_vec();
         let (b, n) = (dims[0], dims[1]);
         let bundle = self.bundle.as_ref();
-
-        // Inference dispatch (see double_block_forward comment).
-        let is_inference = !AutogradContext::is_recording();
 
         // Modulation: Linear(vec.silu()) → 3*DIM
         let m = Self::linear(&vec.silu()?, self.singw(idx, "modulation.lin.weight")?, self.singw(idx, "modulation.lin.bias")?)?;
@@ -596,12 +615,13 @@ impl FluxModel {
             mlp_in_base.add(&lora.forward_delta(&x_mod)?)?
         } else { mlp_in_base };
 
-        // QKV split → [B, H, N, D]. Auto-dispatches to primitives during training.
-        let (q, k, v) = flame_core::bf16_ops::qkv_split_permute_bf16(&qkv, NUM_HEADS, HEAD_DIM)?;
+        let c = qkv.chunk(3, 2)?;
+        let (q, k, v) = (c[0].clone(), c[1].clone(), c[2].clone());
 
         let q = Self::rms_norm_per_head(&q, self.singw(idx, "norm.query_norm.scale")?)?;
         let k = Self::rms_norm_per_head(&k, self.singw(idx, "norm.key_norm.scale")?)?;
 
+        let (q, k, v) = (reshape_qkv(&q, b, n)?, reshape_qkv(&k, b, n)?, reshape_qkv(&v, b, n)?);
         let (q, k) = Self::apply_rope(&q, &k, cos, sin)?;
         let attn = flame_core::attention::sdpa(&q, &k, &v, None)?;
         let attn = attn.permute(&[0, 2, 1, 3])?.reshape(&[b, n, DIM])?;
@@ -620,14 +640,8 @@ impl FluxModel {
             l2.add(&lora.forward_delta(&fused)?)?
         } else { l2 };
 
-        // Gated residual. Inference: gate_residual_fused_bf16 with squeezed
-        // [B,DIM] gate. Training: mul+add (bit-identical to pre-iflame code).
-        if is_inference {
-            flame_core::bf16_ops::gate_residual_fused_bf16(x, &gate.squeeze(Some(1))?, &l2)
-                .map_err(Into::into)
-        } else {
-            x.add(&gate.mul(&l2)?).map_err(Into::into)
-        }
+        flame_core::bf16_ops::gate_residual_fused_bf16(x, &gate.squeeze(Some(1))?, &l2)
+            .map_err(Into::into)
     }
 
     // ── Full forward ─────────────────────────────────────────────────
@@ -667,20 +681,37 @@ impl FluxModel {
         // RoPE — `build_rope` reads `all_ids` via `to_vec()` so non-contiguous
         // input is harmless here (CPU-side gather). Kept idiomatic for clarity.
         let all_ids = Tensor::cat(&[txt_ids, img_ids], 0)?;
+        // Keep cos/sin F32. The fused `rope_fused_bf16_f32pe` kernel accepts
+        // F32 PE against BF16 q/k. Pre-fix this dtype-cast to BF16 was the
+        // load-bearing FLUX speckle bug — the BF16 floor on cos/sin
+        // accumulated across 57×20×2 RoPE applications and produced dense
+        // per-pixel speckle on the output (per inference-flame's comment in
+        // `flux1_dit.rs::build_rope_2d`).
         let (cos, sin) = Self::build_rope(&all_ids)?;
-        let (cos, sin) = (cos.to_dtype(DType::BF16)?, sin.to_dtype(DType::BF16)?);
 
         // Double blocks
         // Note: Flux double blocks return (img, txt) — gradient checkpointing
         // via flame_core::AutogradContext::checkpoint() returns a single Tensor,
         // so we'd need to fuse along a fresh axis to checkpoint. Left as a
-        // future optimization — VRAM headroom is gained via `enable_offload`
+        // future optimization — VRAM headroom is gained via the BlockOffloader
         // (per-block weight streaming) instead.
         let (mut img, mut txt) = (img, txt);
         for i in 0..NUM_DOUBLE {
-            self.stage_double_block(i)?;
+            // BlockOffloader: stream block i from pinned host RAM into GPU slot.
+            if let Some(ref off) = self.offloader {
+                let arc = off.lock()
+                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
+                    .ensure_block(i)
+                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader ensure_block({i}): {e}")))?;
+                self.double_block_weights[i] = (*arc).clone();
+            }
             let (ni, nt) = self.double_block_forward(&img, &txt, &vec, &cos, &sin, i)?;
-            self.evict_double_block(i);
+            if let Some(ref off) = self.offloader {
+                self.double_block_weights[i].clear();
+                off.lock()
+                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
+                    .evict_block();
+            }
             img = ni; txt = nt;
         }
 
@@ -689,15 +720,52 @@ impl FluxModel {
         // BF16 layer_norm + linear matmul.
         let mut merged = Tensor::cat(&[&txt, &img], 1)?.contiguous()?;
         for i in 0..NUM_SINGLE {
-            self.stage_single_block(i)?;
+            let unified_idx = NUM_DOUBLE + i;
+            if let Some(ref off) = self.offloader {
+                let arc = off.lock()
+                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
+                    .ensure_block(unified_idx)
+                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader ensure_block({unified_idx}): {e}")))?;
+                self.single_block_weights[i] = (*arc).clone();
+            }
             merged = self.single_block_forward(&merged, &vec, &cos, &sin, n_txt, i)?;
-            self.evict_single_block(i);
+            if let Some(ref off) = self.offloader {
+                self.single_block_weights[i].clear();
+                off.lock()
+                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
+                    .evict_block();
+            }
         }
 
-        // Extract img + final layer
+        // Extract img + final layer.
+        //
+        // FLUX speckle bug FIX (2026-05-07): the final layer in BFL FLUX is
+        //     out = linear(modulate(layer_norm(x), shift, scale))
+        // where (shift, scale) come from `Linear(silu(vec))` against the
+        // `final_layer.adaLN_modulation.1.{weight,bias}` weights. Pre-fix
+        // EDv2 only did `layer_norm → linear`, skipping the modulate. The
+        // missing modulation produced dense per-pixel speckle output (the
+        // post-norm activations were never centred/scaled by the
+        // timestep-conditioned (shift, scale) so the final linear emitted
+        // a noisy magnitude-band that VAE-decoded into per-pixel noise).
+        // Mirrors `inference-flame::flux1_dit::final_layer_forward`
+        // (flux1_dit.rs:1010-1033).
         let img_out = merged.narrow(1, n_txt, n_img)?;
+        let vec_act = vec.silu()?;
+        let mods = Self::linear(
+            &vec_act.unsqueeze(1)?,
+            self.sw("final_layer.adaLN_modulation.1.weight")?,
+            self.sw("final_layer.adaLN_modulation.1.bias")?,
+        )?.squeeze(Some(1))?;
+        let final_shift = mods.narrow(1, 0, DIM)?;
+        let final_scale = mods.narrow(1, DIM, DIM)?;
+
         let i_norm = flame_core::layer_norm::layer_norm(&img_out, &[DIM], None, None, NORM_EPS)?;
-        let i_linear = Self::linear(&i_norm, self.sw("final_layer.linear.weight")?, self.sw("final_layer.linear.bias")?)?;
+        // modulate: x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        let i_mod = i_norm
+            .mul(&final_scale.add_scalar(1.0)?.unsqueeze(1)?)?
+            .add(&final_shift.unsqueeze(1)?)?;
+        let i_linear = Self::linear(&i_mod, self.sw("final_layer.linear.weight")?, self.sw("final_layer.linear.bias")?)?;
 
         Ok(i_linear)
     }
@@ -719,6 +787,10 @@ impl FluxModel {
 
 fn parse_block_idx(rest: &str, max: usize) -> Option<usize> {
     rest.find('.').and_then(|d| rest[..d].parse::<usize>().ok()).filter(|&i| i < max)
+}
+
+fn reshape_qkv(x: &Tensor, b: usize, n: usize) -> Result<Tensor> {
+    x.reshape(&[b, n, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3]).map_err(Into::into)
 }
 
 // ── TrainableModel trait ────────────────────────────────────────────

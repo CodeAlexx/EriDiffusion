@@ -24,9 +24,20 @@ const DROP_IDX: usize = 34;
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long)] prompt: String,
+    /// Single prompt. Mutually exclusive with `--prompts-file`.
+    #[arg(long)] prompt: Option<String>,
+    /// Newline-separated prompts file for batch sampling. Blank lines and
+    /// `#`-prefixed comments are skipped. Requires `--output-dir`. The
+    /// text encoder is loaded once, every prompt is encoded, the TE is
+    /// dropped, then the DiT loads once and serves all prompts — instead
+    /// of paying TE+DiT load on every standalone invocation.
+    #[arg(long)] prompts_file: Option<PathBuf>,
     #[arg(long, default_value = "")] negative_prompt: String,
+    /// Single-prompt output path. Used when `--prompt` is given.
     #[arg(long, default_value = "output.png")] output: PathBuf,
+    /// Multi-prompt output directory. Required with `--prompts-file`.
+    /// Files are written as `sample_001.png`, `sample_002.png`, ...
+    #[arg(long)] output_dir: Option<PathBuf>,
     /// Qwen-Image-2512 transformer dir (the `transformer/` subdir of the HF
     /// release, with 9 sharded `diffusion_pytorch_model-...safetensors`).
     #[arg(long)] model: PathBuf,
@@ -105,9 +116,43 @@ fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("narrow: {e}"))
     };
 
-    log::info!("[2/4] Encoding prompt + negative prompt...");
-    let cond = encode(&args.prompt)?;
-    log::info!("  cond shape={:?}", cond.shape().dims());
+    // Resolve prompt list. Single-prompt mode keeps the legacy
+    // `--prompt` / `--output` contract; multi-prompt mode reads
+    // `--prompts-file` and writes to `--output-dir`.
+    let prompts: Vec<String> = match (&args.prompt, &args.prompts_file) {
+        (Some(p), None) => vec![p.clone()],
+        (None, Some(path)) => {
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("read --prompts-file {}: {e}", path.display()))?;
+            content.lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| l.to_string())
+                .collect()
+        }
+        (Some(_), Some(_)) => anyhow::bail!("--prompt and --prompts-file are mutually exclusive"),
+        (None, None) => anyhow::bail!("provide --prompt or --prompts-file"),
+    };
+    if prompts.is_empty() {
+        anyhow::bail!("no prompts found in --prompts-file");
+    }
+    let multi_mode = args.prompts_file.is_some();
+    if multi_mode && args.output_dir.is_none() {
+        anyhow::bail!("--prompts-file requires --output-dir");
+    }
+    if let Some(dir) = &args.output_dir {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| anyhow::anyhow!("create --output-dir {}: {e}", dir.display()))?;
+    }
+
+    log::info!("[2/4] Encoding {} prompt(s) + uncond...", prompts.len());
+    let conds: Vec<Tensor> = prompts.iter().enumerate()
+        .map(|(i, p)| {
+            let c = encode(p)?;
+            log::info!("  prompt {}/{}: cond shape={:?}", i + 1, prompts.len(), c.shape().dims());
+            Ok(c)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let uncond = if args.cfg > 1.0 {
         Some(encode(&args.negative_prompt)?)
     } else {
@@ -131,22 +176,35 @@ fn main() -> anyhow::Result<()> {
     }
 
     log::info!(
-        "[4/4] Sampling at {}² ({} steps, cfg={}) → {}",
-        args.size, args.steps, args.cfg, args.output.display(),
+        "[4/4] Sampling {} prompt(s) at {}² ({} steps, cfg={})",
+        conds.len(), args.size, args.steps, args.cfg,
     );
-    qwenimage_sampler::sample_image(
-        &mut model,
-        &cond,
-        uncond.as_ref(),
-        args.size, args.size,
-        args.steps,
-        args.cfg,
-        args.seed,
-        &args.vae_path,
-        &args.output,
-        &device,
-    )?;
-    log::info!("Saved {}", args.output.display());
+    // Width of the zero-padded sample index. Three digits is enough for
+    // any practical batch; widen automatically if a future caller passes
+    // 1000+ prompts.
+    let pad_width = std::cmp::max(3, conds.len().to_string().len());
+    for (i, cond) in conds.iter().enumerate() {
+        let out_path = if multi_mode {
+            let dir = args.output_dir.as_ref().unwrap();
+            dir.join(format!("sample_{:0>width$}.png", i + 1, width = pad_width))
+        } else {
+            args.output.clone()
+        };
+        log::info!("  [{}/{}] → {}", i + 1, conds.len(), out_path.display());
+        qwenimage_sampler::sample_image(
+            &mut model,
+            cond,
+            uncond.as_ref(),
+            args.size, args.size,
+            args.steps,
+            args.cfg,
+            args.seed,
+            &args.vae_path,
+            &out_path,
+            &device,
+        )?;
+    }
+    log::info!("Saved {} sample(s)", conds.len());
     Ok(())
 }
 

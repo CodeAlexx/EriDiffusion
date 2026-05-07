@@ -10,8 +10,16 @@ use eridiffusion_core::sampler::ernie_sampler;
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long)] prompt: String,
+    /// Single prompt. Mutually exclusive with `--prompts-file`.
+    #[arg(long)] prompt: Option<String>,
+    /// Newline-separated prompts file for batch sampling. Blank lines and
+    /// `#`-prefixed comments are skipped. Requires `--output-dir`. Encoder
+    /// loads once for all prompts; DiT and VAE each load once total.
+    #[arg(long)] prompts_file: Option<PathBuf>,
     #[arg(long, default_value = "output.png")] output: PathBuf,
+    /// Multi-prompt output directory. Required with `--prompts-file`.
+    /// Files are written as `sample_001.png`, `sample_002.png`, ...
+    #[arg(long)] output_dir: Option<PathBuf>,
     #[arg(long)] transformer_dir: PathBuf,
     #[arg(long)] vae_path: PathBuf,
     #[arg(long)] text_ckpt: PathBuf,
@@ -47,7 +55,36 @@ fn main() -> anyhow::Result<()> {
     // pad_token_id=11 per text_encoder/config.json. **Same params at train time.**
     const ERNIE_MAX_LEN: usize = 512;
     const ERNIE_PAD_ID: i32 = 11;
-    log::info!("[1/3] Text encoding (max_len={ERNIE_MAX_LEN}, pad_id={ERNIE_PAD_ID})...");
+    // Resolve prompt list. Single-prompt mode keeps the legacy
+    // `--prompt` / `--output` contract; multi-prompt mode reads
+    // `--prompts-file` and writes to `--output-dir/sample_NNN.png`.
+    let prompts: Vec<String> = match (&args.prompt, &args.prompts_file) {
+        (Some(p), None) => vec![p.clone()],
+        (None, Some(path)) => {
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("read --prompts-file {}: {e}", path.display()))?;
+            content.lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| l.to_string())
+                .collect()
+        }
+        (Some(_), Some(_)) => anyhow::bail!("--prompt and --prompts-file are mutually exclusive"),
+        (None, None) => anyhow::bail!("provide --prompt or --prompts-file"),
+    };
+    if prompts.is_empty() {
+        anyhow::bail!("no prompts found in --prompts-file");
+    }
+    let multi_mode = args.prompts_file.is_some();
+    if multi_mode && args.output_dir.is_none() {
+        anyhow::bail!("--prompts-file requires --output-dir");
+    }
+    if let Some(dir) = &args.output_dir {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| anyhow::anyhow!("create --output-dir {}: {e}", dir.display()))?;
+    }
+
+    log::info!("[1/3] Text encoding {} prompt(s) (max_len={ERNIE_MAX_LEN}, pad_id={ERNIE_PAD_ID})...", prompts.len());
     let tokenizer = tokenizers::Tokenizer::from_file(&args.tokenizer_path)
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
     let encode = |text: &str| -> anyhow::Result<(Vec<i32>, usize)> {
@@ -57,14 +94,23 @@ fn main() -> anyhow::Result<()> {
         let real_len = ids.len();
         Ok((ids, real_len))
     };
-    let (ids, len) = encode(&args.prompt)?;
+    let prompt_ids: Vec<(Vec<i32>, usize)> = prompts.iter()
+        .map(|p| encode(p))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let (uncond_ids, uncond_len) = encode("")?;
     let te = Mistral3bEncoder::load(args.text_ckpt.to_str().unwrap(), &device)?;
-    let embeds = te.encode_with_pad(&ids, ERNIE_MAX_LEN, ERNIE_PAD_ID)?;
+    // Encode every prompt with the live TE before dropping.
+    let cond_pairs: Vec<(Tensor, usize)> = prompt_ids.iter().enumerate()
+        .map(|(i, (ids, len))| {
+            let emb = te.encode_with_pad(ids, ERNIE_MAX_LEN, ERNIE_PAD_ID)?;
+            log::info!("  prompt {}/{}: cond shape={:?} (real_len={})",
+                i + 1, prompts.len(), emb.shape().dims(), len);
+            Ok((emb, *len))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let uncond = te.encode_with_pad(&uncond_ids, ERNIE_MAX_LEN, ERNIE_PAD_ID)?;
     drop(te);
-    log::info!("  Text encoded: cond={:?} (real_len={len}) uncond={:?} (real_len={uncond_len})",
-        embeds.shape().dims(), uncond.shape().dims());
+    log::info!("  uncond={:?} (real_len={uncond_len})", uncond.shape().dims());
 
     // 2. Load model. Base-only takes the manual no-parameters path (avoids the F32
     // full-weight parameter copy that ErnieModel::load does for FineTune mode and that
@@ -134,7 +180,7 @@ fn main() -> anyhow::Result<()> {
             lora_adapters: Vec::new(),
             parameters: Vec::new(),
             is_lora: false,
-            offload_shards: None,
+            offloader: None,
         };
         if args.offload {
             m.enable_offload(shard_paths.clone())?;
@@ -144,65 +190,80 @@ fn main() -> anyhow::Result<()> {
     };
     let mut config = model;
 
-    // 3. Denoise
-    log::info!("[3/3] Denoising {} steps...", args.steps);
+    // 3. Denoise — collect a final latent per prompt while DiT is resident.
+    log::info!("[3/4] Denoising {} prompt(s) × {} steps...", prompts.len(), args.steps);
     let sigmas = ernie_sampler::schedule(args.steps);
-    let mut latent = {
-        use rand::SeedableRng;
-        let rng = rand::rngs::StdRng::seed_from_u64(args.seed);
-        Tensor::randn(Shape::from_dims(&[1, 128, hp, wp]), 0.0, 1.0, device.clone())?
-            .to_dtype(DType::BF16)?
-    };
+    let pad_width = std::cmp::max(3, prompts.len().to_string().len());
 
-    // Trim padded text positions to real-token-count, matching upstream Python
-    // ErnieModel.py:153-154 and the trainer side. After this, the DiT only
-    // ever attends to real text tokens — n_txt for image-token RoPE matches
-    // training (which uses the same trim).
-    let cond_l = vec![len.min(ERNIE_MAX_LEN).max(1)];
-    let uncond_l = vec![uncond_len.min(ERNIE_MAX_LEN).max(1)];
-    let trim_cond = embeds.narrow(1, 0, cond_l[0])?.contiguous()?;
-    let trim_uncond = uncond.narrow(1, 0, uncond_l[0])?.contiguous()?;
+    // Trim uncond once (same across all prompts).
+    let trim_uncond = uncond.narrow(1, 0, uncond_len.min(ERNIE_MAX_LEN).max(1))?.contiguous()?;
 
-    for step in 0..args.steps {
-        let sigma = sigmas[step];
-        let sigma_next = sigmas[step + 1];
-        let t = ernie_sampler::sigma_to_timestep(sigma);
-        let t_tensor = Tensor::from_vec(vec![t], Shape::from_dims(&[1]), device.clone())?;
+    let mut latents: Vec<Tensor> = Vec::with_capacity(cond_pairs.len());
+    for (idx, (embeds, len)) in cond_pairs.iter().enumerate() {
+        log::info!("  [{}/{}] denoising prompt...", idx + 1, cond_pairs.len());
+        let trim_cond = embeds.narrow(1, 0, len.min(&ERNIE_MAX_LEN).max(&1).clone())?.contiguous()?;
 
-        // Sequential CFG: pred = uncond + guidance * (cond - uncond)
-        let pred_cond = config.forward(&latent, &trim_cond, &t_tensor)?;
-        let pred_uncond = config.forward(&latent, &trim_uncond, &t_tensor)?;
-        let pred = pred_uncond.add(&pred_cond.sub(&pred_uncond)?.mul_scalar(args.guidance)?)?;
+        // Same noise for every prompt (fixed seed). If varied noise is
+        // wanted, advance seed by `idx`.
+        let mut latent = {
+            use rand::SeedableRng;
+            let _rng = rand::rngs::StdRng::seed_from_u64(args.seed);
+            Tensor::randn(Shape::from_dims(&[1, 128, hp, wp]), 0.0, 1.0, device.clone())?
+                .to_dtype(DType::BF16)?
+        };
 
-        latent = ernie_sampler::euler_step(&latent, &pred, sigma, sigma_next)?;
+        for step in 0..args.steps {
+            let sigma = sigmas[step];
+            let sigma_next = sigmas[step + 1];
+            let t = ernie_sampler::sigma_to_timestep(sigma);
+            let t_tensor = Tensor::from_vec(vec![t], Shape::from_dims(&[1]), device.clone())?;
 
-        if step % 10 == 0 || step == args.steps - 1 {
-            log::info!("  step {}/{}, sigma={:.4}", step + 1, args.steps, sigma);
+            // Sequential CFG: pred = uncond + guidance * (cond - uncond)
+            let pred_cond = config.forward(&latent, &trim_cond, &t_tensor)?;
+            let pred_uncond = config.forward(&latent, &trim_uncond, &t_tensor)?;
+            let pred = pred_uncond.add(&pred_cond.sub(&pred_uncond)?.mul_scalar(args.guidance)?)?;
+
+            latent = ernie_sampler::euler_step(&latent, &pred, sigma, sigma_next)?;
+
+            if step % 10 == 0 || step == args.steps - 1 {
+                log::info!("    prompt {}/{} step {}/{}, sigma={:.4}",
+                    idx + 1, cond_pairs.len(), step + 1, args.steps, sigma);
+            }
         }
+        latents.push(latent);
     }
 
-    // 4. VAE decode
-    log::info!("[4/4] VAE decoding...");
+    // 4. VAE decode + save (single VAE load for all latents).
+    log::info!("[4/4] VAE decoding {} latent(s)...", latents.len());
+    drop(config); // free DiT memory before VAE
     let vae_weights = flame_core::serialization::load_file(&args.vae_path, &device)?;
     let dev = flame_core::Device::from(device.clone());
     let decoder = KleinVaeDecoder::load(&vae_weights, &dev)?;
-    let img = decoder.decode(&latent)?;
 
-    // 5. Save image
-    let pixels: Vec<f32> = img.to_dtype(DType::F32)?.to_vec()?;
-    let dims = img.shape().dims();
-    let (c, h, w) = if dims.len() == 4 { (dims[1], dims[2], dims[3]) } else { (3, dims[0], dims[1]) };
-    let mut buf = vec![0u8; c * h * w];
-    for y in 0..h {
-        for x in 0..w {
-            for ch in 0..c {
-                let idx = if dims.len() == 4 { ch * h * w + y * w + x } else { y * w * c + x * c + ch };
-                let v = pixels.get(idx).copied().unwrap_or(0.0);
-                buf[y * w * c + x * c + ch] = ((v.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8;
+    for (idx, latent) in latents.iter().enumerate() {
+        let img = decoder.decode(latent)?;
+        let pixels: Vec<f32> = img.to_dtype(DType::F32)?.to_vec()?;
+        let dims = img.shape().dims();
+        let (c, h, w) = if dims.len() == 4 { (dims[1], dims[2], dims[3]) } else { (3, dims[0], dims[1]) };
+        let mut buf = vec![0u8; c * h * w];
+        for y in 0..h {
+            for x in 0..w {
+                for ch in 0..c {
+                    let id = if dims.len() == 4 { ch * h * w + y * w + x } else { y * w * c + x * c + ch };
+                    let v = pixels.get(id).copied().unwrap_or(0.0);
+                    buf[y * w * c + x * c + ch] = ((v.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8;
+                }
             }
         }
+        let out_path = if multi_mode {
+            let dir = args.output_dir.as_ref().unwrap();
+            dir.join(format!("sample_{:0>width$}.png", idx + 1, width = pad_width))
+        } else {
+            args.output.clone()
+        };
+        image::save_buffer(&out_path, &buf, w as u32, h as u32, image::ColorType::Rgb8)?;
+        log::info!("  [{}/{}] saved {:?}", idx + 1, latents.len(), out_path);
     }
-    image::save_buffer(&args.output, &buf, w as u32, h as u32, image::ColorType::Rgb8)?;
-    log::info!("Saved to {:?}", args.output);
+    log::info!("Done — {} sample(s) saved", latents.len());
     Ok(())
 }

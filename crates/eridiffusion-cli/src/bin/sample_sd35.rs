@@ -30,9 +30,17 @@ const VAE_SHIFT: f32 = 0.0609;
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long)] prompt: String,
+    /// Single prompt. Mutually exclusive with `--prompts-file`.
+    #[arg(long)] prompt: Option<String>,
+    /// Newline-separated prompts file for batch sampling. Blank lines and
+    /// `#`-prefixed comments are skipped. Requires `--output-dir`. CLIPs +
+    /// T5 load once for all prompts; DiT and VAE each load once total.
+    #[arg(long)] prompts_file: Option<PathBuf>,
     #[arg(long, default_value = "")] negative_prompt: String,
     #[arg(long, default_value = "output.png")] output: PathBuf,
+    /// Multi-prompt output directory. Required with `--prompts-file`.
+    /// Files are written as `sample_001.png`, `sample_002.png`, ...
+    #[arg(long)] output_dir: Option<PathBuf>,
 
     /// SD 3.5 transformer (combined ckpt or DiT-only). Same file works for VAE.
     #[arg(long)] transformer: PathBuf,
@@ -197,12 +205,49 @@ fn main() -> anyhow::Result<()> {
     let tok_t5 = tokenizers::Tokenizer::from_file(&args.t5_tokenizer)
         .map_err(|e| anyhow::anyhow!("t5 tokenizer: {e}"))?;
 
-    // 2. Encode prompts (cond + uncond if CFG enabled)
-    log::info!("[2/5] Encoding prompts...");
-    let (ctx_cond, pool_cond) = encode_sd3_prompt(
-        &args.prompt, &clip_l, &clip_g, &mut t5,
-        &tok_l, &tok_g, &tok_t5, args.t5_max_len, &device,
-    )?;
+    // Resolve prompt list. Single-prompt mode keeps the legacy
+    // `--prompt` / `--output` contract; multi-prompt mode reads
+    // `--prompts-file` and writes to `--output-dir/sample_NNN.png`.
+    let prompts: Vec<String> = match (&args.prompt, &args.prompts_file) {
+        (Some(p), None) => vec![p.clone()],
+        (None, Some(path)) => {
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("read --prompts-file {}: {e}", path.display()))?;
+            content.lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| l.to_string())
+                .collect()
+        }
+        (Some(_), Some(_)) => anyhow::bail!("--prompt and --prompts-file are mutually exclusive"),
+        (None, None) => anyhow::bail!("provide --prompt or --prompts-file"),
+    };
+    if prompts.is_empty() {
+        anyhow::bail!("no prompts found in --prompts-file");
+    }
+    let multi_mode = args.prompts_file.is_some();
+    if multi_mode && args.output_dir.is_none() {
+        anyhow::bail!("--prompts-file requires --output-dir");
+    }
+    if let Some(dir) = &args.output_dir {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| anyhow::anyhow!("create --output-dir {}: {e}", dir.display()))?;
+    }
+
+    // 2. Encode prompts (cond × N + uncond if CFG enabled). Encoders all
+    // load once and stay resident until every prompt is encoded.
+    log::info!("[2/5] Encoding {} prompt(s) + uncond...", prompts.len());
+    let conds: Vec<(Tensor, Tensor)> = prompts.iter().enumerate()
+        .map(|(i, p)| {
+            let pair = encode_sd3_prompt(
+                p, &clip_l, &clip_g, &mut t5,
+                &tok_l, &tok_g, &tok_t5, args.t5_max_len, &device,
+            )?;
+            log::info!("  prompt {}/{}: ctx={:?} pool={:?}",
+                i + 1, prompts.len(), pair.0.shape().dims(), pair.1.shape().dims());
+            Ok(pair)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let do_cfg = args.cfg_scale > 1.0;
     let uncond = if do_cfg {
         Some(encode_sd3_prompt(
@@ -240,59 +285,77 @@ fn main() -> anyhow::Result<()> {
             lp, args.lora_rank, args.lora_alpha);
     }
 
-    // 4. Init noise + denoise
-    let numel = VAE_LATENT_CHANNELS * h_lat * w_lat;
-    let mut rng = rand::rngs::StdRng::seed_from_u64(args.seed);
-    let mut data = Vec::with_capacity(numel);
-    while data.len() < numel {
-        let u1 = rng.gen::<f32>().max(1e-10);
-        let u2 = rng.gen::<f32>();
-        let mag = (-2.0 * u1.ln()).sqrt();
-        let theta = 2.0 * std::f32::consts::PI * u2;
-        data.push(mag * theta.cos());
-        if data.len() < numel { data.push(mag * theta.sin()); }
-    }
-    let mut latent = Tensor::from_vec(
-        data, Shape::from_dims(&[1, VAE_LATENT_CHANNELS, h_lat, w_lat]), device.clone(),
-    )?.to_dtype(DType::BF16)?;
-
+    // 4. Init noise + denoise — once per prompt, all latents collected
+    //    while the DiT is resident.
     let timesteps = build_schedule(args.steps, args.shift);
-    log::info!("[4/5] Denoising {} steps...", args.steps);
-    for i in 0..args.steps {
-        let t_curr = timesteps[i];
-        let t_next = timesteps[i + 1];
-        let t_vec = Tensor::from_vec(
-            vec![t_curr * 1000.0], Shape::from_dims(&[1]), device.clone(),
-        )?.to_dtype(DType::BF16)?;
-        let pred_cond = <SD35Model as TrainableModel>::forward(
-            &mut model, &latent, &t_vec,
-            std::slice::from_ref(&ctx_cond), Some(&pool_cond),
-        )?;
-        let pred = if let Some((ref ctx_u, ref pool_u)) = uncond {
-            let pred_uncond = <SD35Model as TrainableModel>::forward(
-                &mut model, &latent, &t_vec,
-                std::slice::from_ref(ctx_u), Some(pool_u),
-            )?;
-            let diff = pred_cond.sub(&pred_uncond)?;
-            pred_uncond.add(&diff.mul_scalar(args.cfg_scale)?)?
-        } else { pred_cond };
-        let dt = t_next - t_curr;
-        latent = latent.add(&pred.mul_scalar(dt)?)?;
-        if i % 5 == 0 || i == args.steps - 1 {
-            log::info!("  step {}/{} t={:.4}", i + 1, args.steps, t_curr);
+    log::info!("[4/5] Denoising {} prompt(s) × {} steps...", conds.len(), args.steps);
+    let pad_width = std::cmp::max(3, conds.len().to_string().len());
+    let mut latents: Vec<Tensor> = Vec::with_capacity(conds.len());
+
+    for (idx, (ctx_cond, pool_cond)) in conds.iter().enumerate() {
+        log::info!("  [{}/{}] denoising prompt...", idx + 1, conds.len());
+        let numel = VAE_LATENT_CHANNELS * h_lat * w_lat;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(args.seed);
+        let mut data = Vec::with_capacity(numel);
+        while data.len() < numel {
+            let u1 = rng.gen::<f32>().max(1e-10);
+            let u2 = rng.gen::<f32>();
+            let mag = (-2.0 * u1.ln()).sqrt();
+            let theta = 2.0 * std::f32::consts::PI * u2;
+            data.push(mag * theta.cos());
+            if data.len() < numel { data.push(mag * theta.sin()); }
         }
+        let mut latent = Tensor::from_vec(
+            data, Shape::from_dims(&[1, VAE_LATENT_CHANNELS, h_lat, w_lat]), device.clone(),
+        )?.to_dtype(DType::BF16)?;
+
+        for i in 0..args.steps {
+            let t_curr = timesteps[i];
+            let t_next = timesteps[i + 1];
+            let t_vec = Tensor::from_vec(
+                vec![t_curr * 1000.0], Shape::from_dims(&[1]), device.clone(),
+            )?.to_dtype(DType::BF16)?;
+            let pred_cond = <SD35Model as TrainableModel>::forward(
+                &mut model, &latent, &t_vec,
+                std::slice::from_ref(ctx_cond), Some(pool_cond),
+            )?;
+            let pred = if let Some((ref ctx_u, ref pool_u)) = uncond {
+                let pred_uncond = <SD35Model as TrainableModel>::forward(
+                    &mut model, &latent, &t_vec,
+                    std::slice::from_ref(ctx_u), Some(pool_u),
+                )?;
+                let diff = pred_cond.sub(&pred_uncond)?;
+                pred_uncond.add(&diff.mul_scalar(args.cfg_scale)?)?
+            } else { pred_cond };
+            let dt = t_next - t_curr;
+            latent = latent.add(&pred.mul_scalar(dt)?)?;
+            if i % 5 == 0 || i == args.steps - 1 {
+                log::info!("    prompt {}/{} step {}/{} t={:.4}",
+                    idx + 1, conds.len(), i + 1, args.steps, t_curr);
+            }
+        }
+        latents.push(latent);
     }
 
-    // 5. VAE decode
-    log::info!("[5/5] VAE decoding...");
+    // 5. VAE decode (single VAE load for all latents)
+    log::info!("[5/5] VAE decoding {} latent(s)...", latents.len());
     drop(model);
     let vae_path = args.vae_ckpt.as_ref().unwrap_or(&args.transformer);
     let vae = LdmVAEDecoder::from_safetensors(
         vae_path.to_str().ok_or_else(|| anyhow::anyhow!("vae path utf8"))?,
         VAE_LATENT_CHANNELS, VAE_SCALE, VAE_SHIFT, &device,
     )?;
-    let rgb = vae.decode(&latent)?;
-    save_png(&rgb, &args.output)?;
-    log::info!("Saved to {:?}", args.output);
+    for (idx, latent) in latents.iter().enumerate() {
+        let rgb = vae.decode(latent)?;
+        let out_path = if multi_mode {
+            let dir = args.output_dir.as_ref().unwrap();
+            dir.join(format!("sample_{:0>width$}.png", idx + 1, width = pad_width))
+        } else {
+            args.output.clone()
+        };
+        save_png(&rgb, &out_path)?;
+        log::info!("  [{}/{}] saved {:?}", idx + 1, latents.len(), out_path);
+    }
+    log::info!("Done — {} sample(s) saved", latents.len());
     Ok(())
 }

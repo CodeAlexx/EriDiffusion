@@ -28,9 +28,17 @@ const TXT_PAD_LEN: usize = 512;
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long)] prompt: String,
+    /// Single prompt. Mutually exclusive with `--prompts-file`.
+    #[arg(long)] prompt: Option<String>,
+    /// Newline-separated prompts file for batch sampling. Blank lines and
+    /// `#`-prefixed comments are skipped. Requires `--output-dir`. Encoder
+    /// loads once for all prompts; DiT and VAE each load once total.
+    #[arg(long)] prompts_file: Option<PathBuf>,
     #[arg(long, default_value = "")] negative: String,
     #[arg(long, default_value = "output.png")] output: PathBuf,
+    /// Multi-prompt output directory. Required with `--prompts-file`.
+    /// Files are written as `sample_001.png`, `sample_002.png`, ...
+    #[arg(long)] output_dir: Option<PathBuf>,
     /// Klein transformer: single safetensors file OR directory of shards.
     #[arg(long)] transformer: PathBuf,
     #[arg(long)] vae_path: PathBuf,
@@ -105,17 +113,52 @@ fn main() -> anyhow::Result<()> {
     let w_lat = args.size / 16;
     log::info!("Size {}² → latent {}x{}", args.size, h_lat, w_lat);
 
-    log::info!("[1/4] Encoding prompt with Qwen3...");
+    // Resolve prompt list. Single-prompt mode keeps the legacy
+    // `--prompt` / `--output` contract; multi-prompt mode reads
+    // `--prompts-file` and writes to `--output-dir/sample_NNN.png`.
+    let prompts: Vec<String> = match (&args.prompt, &args.prompts_file) {
+        (Some(p), None) => vec![p.clone()],
+        (None, Some(path)) => {
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("read --prompts-file {}: {e}", path.display()))?;
+            content.lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| l.to_string())
+                .collect()
+        }
+        (Some(_), Some(_)) => anyhow::bail!("--prompt and --prompts-file are mutually exclusive"),
+        (None, None) => anyhow::bail!("provide --prompt or --prompts-file"),
+    };
+    if prompts.is_empty() {
+        anyhow::bail!("no prompts found in --prompts-file");
+    }
+    let multi_mode = args.prompts_file.is_some();
+    if multi_mode && args.output_dir.is_none() {
+        anyhow::bail!("--prompts-file requires --output-dir");
+    }
+    if let Some(dir) = &args.output_dir {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| anyhow::anyhow!("create --output-dir {}: {e}", dir.display()))?;
+    }
+
+    log::info!("[1/4] Encoding {} prompt(s) + uncond with Qwen3...", prompts.len());
     let tokenizer = tokenizers::Tokenizer::from_file(&args.tokenizer_path)
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
     let qwen_weights = load_qwen3_weights(&args.qwen3, &device)?;
     let qcfg = Qwen3Encoder::config_from_weights(&qwen_weights)?;
     log::info!("  Qwen3 hidden={} extract={:?}", qcfg.hidden_size, qcfg.extract_layers);
     let qwen = Qwen3Encoder::new(qwen_weights, qcfg, device.clone());
-    let cond = encode_prompt(&qwen, &tokenizer, &args.prompt)?;
+    let conds: Vec<Tensor> = prompts.iter().enumerate()
+        .map(|(i, p)| {
+            let c = encode_prompt(&qwen, &tokenizer, p)?;
+            log::info!("  prompt {}/{}: cond shape={:?}", i + 1, prompts.len(), c.shape().dims());
+            Ok(c)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let uncond = encode_prompt(&qwen, &tokenizer, &args.negative)?;
     drop(qwen);
-    log::info!("  cond={:?} uncond={:?}", cond.shape().dims(), uncond.shape().dims());
+    log::info!("  uncond={:?}", uncond.shape().dims());
 
     log::info!("[2/4] Loading Klein transformer...");
     let shards = collect_shards(&args.transformer)?;
@@ -154,65 +197,81 @@ fn main() -> anyhow::Result<()> {
             lora_adapters: Vec::new(),
             parameters: Vec::new(),
             is_lora: false,
-            offload_shards: None,
+            offloader: None,
         }
     };
 
-    log::info!("[3/4] Denoising {} steps (cfg={})...", args.steps, args.cfg);
+    log::info!("[3/4] Denoising {} prompt(s) × {} steps (cfg={})...", conds.len(), args.steps, args.cfg);
     let n_img = h_lat * w_lat;
     let timesteps = klein_sampler::get_schedule(args.steps, n_img);
     log::info!("  schedule: t[0]={:.4} t[-2]={:.4} t[-1]={:.4}",
         timesteps[0], timesteps[args.steps - 1], timesteps[args.steps]);
 
-    // Seeded normal noise via flame's randn (CUDA Box-Muller is internal there).
-    use rand::SeedableRng;
-    let _rng = rand::rngs::StdRng::seed_from_u64(args.seed);
-    let latent_shape = Shape::from_dims(&[1, 128, h_lat, w_lat]);
-    let mut latent = Tensor::randn(latent_shape, 0.0, 1.0, device.clone())?
-        .to_dtype(DType::BF16)?;
+    let pad_width = std::cmp::max(3, conds.len().to_string().len());
+    let mut latents: Vec<Tensor> = Vec::with_capacity(conds.len());
 
-    for step in 0..args.steps {
-        let sigma = timesteps[step];
-        let sigma_next = timesteps[step + 1];
-        let t = klein_sampler::sigma_to_timestep(sigma);
-        let t_tensor = Tensor::from_vec(vec![t], Shape::from_dims(&[1]), device.clone())?;
+    for (idx, cond) in conds.iter().enumerate() {
+        log::info!("  [{}/{}] denoising prompt...", idx + 1, conds.len());
+        // Seeded normal noise via flame's randn (CUDA Box-Muller is internal there).
+        use rand::SeedableRng;
+        let _rng = rand::rngs::StdRng::seed_from_u64(args.seed);
+        let latent_shape = Shape::from_dims(&[1, 128, h_lat, w_lat]);
+        let mut latent = Tensor::randn(latent_shape, 0.0, 1.0, device.clone())?
+            .to_dtype(DType::BF16)?;
 
-        let pred_cond = model.forward(&latent, &cond, &t_tensor)?;
-        let pred_uncond = model.forward(&latent, &uncond, &t_tensor)?;
-        // CFG: uncond + cfg * (cond - uncond)
-        let pred = pred_uncond.add(&pred_cond.sub(&pred_uncond)?.mul_scalar(args.cfg)?)?;
+        for step in 0..args.steps {
+            let sigma = timesteps[step];
+            let sigma_next = timesteps[step + 1];
+            let t = klein_sampler::sigma_to_timestep(sigma);
+            let t_tensor = Tensor::from_vec(vec![t], Shape::from_dims(&[1]), device.clone())?;
 
-        // Klein euler uses dt = sigma_next - sigma (BFL direct velocity).
-        latent = klein_sampler::euler_step(&latent, &pred, sigma, sigma_next)?;
+            let pred_cond = model.forward(&latent, cond, &t_tensor)?;
+            let pred_uncond = model.forward(&latent, &uncond, &t_tensor)?;
+            // CFG: uncond + cfg * (cond - uncond)
+            let pred = pred_uncond.add(&pred_cond.sub(&pred_uncond)?.mul_scalar(args.cfg)?)?;
 
-        if step % 10 == 0 || step == args.steps - 1 {
-            log::info!("  step {}/{}, sigma={:.4}", step + 1, args.steps, sigma);
+            // Klein euler uses dt = sigma_next - sigma (BFL direct velocity).
+            latent = klein_sampler::euler_step(&latent, &pred, sigma, sigma_next)?;
+
+            if step % 10 == 0 || step == args.steps - 1 {
+                log::info!("    prompt {}/{} step {}/{}, sigma={:.4}",
+                    idx + 1, conds.len(), step + 1, args.steps, sigma);
+            }
         }
+        latents.push(latent);
     }
 
-    log::info!("[4/4] VAE decode...");
+    log::info!("[4/4] VAE decode {} latent(s)...", latents.len());
     drop(model);  // free DiT weights before decoder allocates
     let vae_weights = flame_core::serialization::load_file(&args.vae_path, &device)?;
     let dev = flame_core::Device::from(device.clone());
     let decoder = KleinVaeDecoder::load(&vae_weights, &dev)?;
     drop(vae_weights);
-    let img = decoder.decode(&latent)?;
 
-    // Save PNG
-    let pixels: Vec<f32> = img.to_dtype(DType::F32)?.to_vec()?;
-    let dims = img.shape().dims();
-    let (c, h, w) = if dims.len() == 4 { (dims[1], dims[2], dims[3]) } else { (3, dims[0], dims[1]) };
-    let mut buf = vec![0u8; h * w * 3];
-    for y in 0..h {
-        for x in 0..w {
-            for ch in 0..c.min(3) {
-                let idx = ch * h * w + y * w + x;
-                let v = pixels.get(idx).copied().unwrap_or(0.0);
-                buf[(y * w + x) * 3 + ch] = ((v.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8;
+    for (idx, latent) in latents.iter().enumerate() {
+        let img = decoder.decode(latent)?;
+        let pixels: Vec<f32> = img.to_dtype(DType::F32)?.to_vec()?;
+        let dims = img.shape().dims();
+        let (c, h, w) = if dims.len() == 4 { (dims[1], dims[2], dims[3]) } else { (3, dims[0], dims[1]) };
+        let mut buf = vec![0u8; h * w * 3];
+        for y in 0..h {
+            for x in 0..w {
+                for ch in 0..c.min(3) {
+                    let id = ch * h * w + y * w + x;
+                    let v = pixels.get(id).copied().unwrap_or(0.0);
+                    buf[(y * w + x) * 3 + ch] = ((v.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8;
+                }
             }
         }
+        let out_path = if multi_mode {
+            let dir = args.output_dir.as_ref().unwrap();
+            dir.join(format!("sample_{:0>width$}.png", idx + 1, width = pad_width))
+        } else {
+            args.output.clone()
+        };
+        image::save_buffer(&out_path, &buf, w as u32, h as u32, image::ColorType::Rgb8)?;
+        log::info!("  [{}/{}] saved {:?}", idx + 1, latents.len(), out_path);
     }
-    image::save_buffer(&args.output, &buf, w as u32, h as u32, image::ColorType::Rgb8)?;
-    log::info!("Saved to {:?}", args.output);
+    log::info!("Done — {} sample(s) saved", latents.len());
     Ok(())
 }

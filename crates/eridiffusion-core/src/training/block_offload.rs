@@ -537,9 +537,31 @@ impl BlockOffloader {
 
                 let bf16_u16: Vec<u16> = match dtype_str {
                     "BF16" => {
+                        // BF16 bytes on disk are already LE u16 — a single
+                        // memcpy is bandwidth-bound, while the scalar
+                        // chunk-by-chunk reconstruction the original code did
+                        // tops out around 100-150 MB/s on this box. For
+                        // Qwen-Image-2512 (~39 GB), that's ~285s of wall time
+                        // for what should be ~5-10s of memcpy.
+                        //
+                        // NOTE: a "skip the Vec<u16> intermediate" variant
+                        // (writing directly into pinned memory in a single
+                        // memcpy) was tried and measured ~50-65s SLOWER on
+                        // Qwen-Image-2512 (187-195s vs 131s for this Vec-then-
+                        // memcpy pattern). Pinned host memory writes are
+                        // bandwidth-limited (~3 GB/s), so the indirect Vec
+                        // intermediate exploits the CPU cache for the first
+                        // memcpy and the second mmcopy hits a faster optimized
+                        // bulk-memcpy path into the pinned buffer. Counter-
+                        // intuitive but measured. Keep the Vec<u16> intermediate.
                         let mut out = vec![0u16; num_elems];
-                        for (v, chunk) in out.iter_mut().zip(raw.chunks_exact(2)) {
-                            *v = u16::from_le_bytes([chunk[0], chunk[1]]);
+                        let byte_len = num_elems * 2;
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                raw.as_ptr(),
+                                out.as_mut_ptr() as *mut u8,
+                                byte_len,
+                            );
                         }
                         out
                     }

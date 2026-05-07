@@ -143,7 +143,11 @@ pub struct KleinModel {
     pub lora_adapters: Vec<LoRALinear>,
     pub parameters: Vec<Parameter>,
     pub is_lora: bool,
-    pub offload_shards: Option<Vec<std::path::PathBuf>>,
+    /// When Some, per-block weights are streamed from pinned host RAM into
+    /// reusable GPU slots per block, per step via BlockOffloader.
+    /// Unified index space: `0..num_double` → double_blocks.{i},
+    /// `num_double..num_double+num_single` → single_blocks.{i}.
+    pub offloader: Option<std::sync::Arc<std::sync::Mutex<crate::training::block_offload::BlockOffloader>>>,
 }
 
 impl KleinModel {
@@ -230,17 +234,17 @@ impl KleinModel {
         Ok(Self {
             config: config.clone(), kconfig, device,
             weights, lora_adapters, parameters, is_lora,
-            offload_shards: None,
+            offloader: None,
         })
     }
 
-    /// Enable per-block weight streaming. Drops `double_blocks.*`/`single_blocks.*`
-    /// from VRAM and re-loads each block from the supplied shard list inside
-    /// `forward`. Mirrors `ErnieModel::enable_offload`. LoRA-only.
+    /// Enable per-block weight streaming via `BlockOffloader`. Drops
+    /// `double_blocks.*`/`single_blocks.*` from VRAM; blocks are streamed from
+    /// pinned host RAM into reusable GPU slots per block, per step.
+    /// Works for both base and LoRA inference.
     pub fn enable_offload(&mut self, shards: Vec<std::path::PathBuf>) -> Result<()> {
-        if !self.is_lora {
-            return Err(crate::EriDiffusionError::Model("offload requires LoRA mode".into()));
-        }
+        let num_double = self.kconfig.num_double;
+        let num_single = self.kconfig.num_single;
         let to_drop: Vec<String> = self.weights.keys()
             .filter(|k| k.starts_with("double_blocks.") || k.starts_with("single_blocks."))
             .cloned()
@@ -250,27 +254,53 @@ impl KleinModel {
         log::info!("Klein offload: dropped {} per-block weights", n);
         flame_core::cuda_alloc_pool::clear_pool_cache();
         flame_core::trim_cuda_mempool(0);
-        self.offload_shards = Some(shards);
-        Ok(())
-    }
 
-    fn stage_block(&mut self, prefix: &str) -> Result<()> {
-        let shards = match &self.offload_shards { None => return Ok(()), Some(s) => s.clone() };
-        for shard in &shards {
-            let part = flame_core::serialization::load_file_filtered(
-                shard, &self.device, |k| k.starts_with(prefix),
-            )?;
-            for (k, v) in part {
-                self.weights.insert(k, v.to_dtype(DType::BF16)?);
+        struct KleinFacilitator { num_double: usize, num_single: usize }
+        impl crate::training::block_offload::BlockFacilitator for KleinFacilitator {
+            fn block_count(&self) -> usize { self.num_double + self.num_single }
+            fn classify_key(&self, key: &str) -> Option<usize> {
+                if let Some(rest) = key.strip_prefix("double_blocks.") {
+                    let idx: usize = rest.split('.').next()?.parse().ok()?;
+                    if idx < self.num_double { return Some(idx); }
+                }
+                if let Some(rest) = key.strip_prefix("single_blocks.") {
+                    let idx: usize = rest.split('.').next()?.parse().ok()?;
+                    if idx < self.num_single { return Some(self.num_double + idx); }
+                }
+                None
             }
         }
-        Ok(())
-    }
+        let facilitator = KleinFacilitator { num_double, num_single };
 
-    fn evict_block(&mut self, prefix: &str) {
-        if self.offload_shards.is_none() { return; }
-        let owned: String = prefix.to_string();
-        self.weights.retain(|k, _| !k.starts_with(&owned));
+        let shard_strs: Vec<String> = shards.iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let path_refs: Vec<&str> = shard_strs.iter().map(|s| s.as_str()).collect();
+
+        let use_streaming = std::env::var("KLEIN_BLOCK_STREAMING")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "" | "false" | "False"))
+            .unwrap_or(true);
+
+        let offloader = if use_streaming {
+            log::info!("Klein BlockOffloader: streaming mode");
+            crate::training::block_offload::BlockOffloader::load_streaming(
+                &path_refs, &facilitator, self.device.clone(),
+            )
+        } else {
+            log::info!("Klein BlockOffloader: pinned-RAM mode");
+            crate::training::block_offload::BlockOffloader::load(
+                &path_refs, &facilitator, self.device.clone(),
+            )
+        }
+        // native_layout=true: leave 2D .weight tensors in on-disk [Cout, Cin] layout.
+        // Klein model code calls `.transpose()` itself (via linear_3d) before matmul.
+        .map(|o| o.with_native_layout(true))
+        .map_err(|e| crate::EriDiffusionError::Model(format!("BlockOffloader: {e}")))?;
+
+        self.offloader = Some(std::sync::Arc::new(std::sync::Mutex::new(offloader)));
+        log::info!("Klein BlockOffloader ready ({} unified blocks)", num_double + num_single);
+        Ok(())
     }
 
     fn w(&self, key: &str) -> Result<&Tensor> {
@@ -765,7 +795,16 @@ impl KleinModel {
         let mut txt = txt_proj;
         for i in 0..self.kconfig.num_double {
             let prefix = format!("double_blocks.{i}.");
-            self.stage_block(&prefix)?;
+            // BlockOffloader: stream block i from pinned host RAM into GPU slot.
+            if let Some(ref off) = self.offloader {
+                let arc = off.lock()
+                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
+                    .ensure_block(i)
+                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader ensure_block({i}): {e}")))?;
+                for (k, v) in arc.iter() {
+                    self.weights.insert(k.clone(), v.clone());
+                }
+            }
 
             // Snapshot weights into a self-contained map for the closure.
             let mut layer_weights: HashMap<String, Tensor> = HashMap::new();
@@ -804,7 +843,13 @@ impl KleinModel {
             };
             img = new_img;
             txt = new_txt;
-            self.evict_block(&prefix);
+            // Evict double block i from weights and release GPU slot.
+            if let Some(ref off) = self.offloader {
+                self.weights.retain(|k, _| !k.starts_with(&prefix));
+                off.lock()
+                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
+                    .evict_block();
+            }
         }
 
         // ---- Single blocks (txt-then-img) ----
@@ -813,7 +858,17 @@ impl KleinModel {
 
         for i in 0..self.kconfig.num_single {
             let prefix = format!("single_blocks.{i}.");
-            self.stage_block(&prefix)?;
+            let unified_idx = self.kconfig.num_double + i;
+            // BlockOffloader: stream single block (unified_idx) from pinned host RAM.
+            if let Some(ref off) = self.offloader {
+                let arc = off.lock()
+                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
+                    .ensure_block(unified_idx)
+                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader ensure_block({unified_idx}): {e}")))?;
+                for (k, v) in arc.iter() {
+                    self.weights.insert(k.clone(), v.clone());
+                }
+            }
             let mut layer_weights: HashMap<String, Tensor> = HashMap::new();
             for (k, v) in self.weights.iter() {
                 if k.starts_with(&prefix) { layer_weights.insert(k.clone(), v.clone()); }
@@ -846,7 +901,13 @@ impl KleinModel {
                     layer_weights, lora, i, nh, hd, inner, mlp,
                 )?
             };
-            self.evict_block(&prefix);
+            // Evict single block from weights and release GPU slot.
+            if let Some(ref off) = self.offloader {
+                self.weights.retain(|k, _| !k.starts_with(&prefix));
+                off.lock()
+                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
+                    .evict_block();
+            }
         }
 
         // ---- Extract image tokens ----

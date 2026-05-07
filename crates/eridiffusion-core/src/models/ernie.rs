@@ -29,9 +29,10 @@ pub struct ErnieModel {
     pub lora_adapters: Vec<LoRALinear>,
     pub parameters: Vec<Parameter>,
     pub is_lora: bool,
-    /// When Some, per-layer transformer weights are streamed from these shards
-    /// on each layer's forward (not resident in `weights`). Set via `enable_offload`.
-    pub offload_shards: Option<Vec<std::path::PathBuf>>,
+    /// When Some, per-layer transformer weights are streamed from pinned host RAM
+    /// into reusable GPU slots per layer, per step via BlockOffloader.
+    /// Block index space: `0..LAYERS` → `layers.{i}.*`.
+    pub offloader: Option<std::sync::Arc<std::sync::Mutex<crate::training::block_offload::BlockOffloader>>>,
 }
 
 impl ErnieModel {
@@ -70,18 +71,14 @@ impl ErnieModel {
                 parameters.push(Parameter::new(t.to_dtype(DType::F32)?.requires_grad_(true)));
             }
         }
-        Ok(Self { config: config.clone(), device, weights, lora_adapters, parameters, is_lora, offload_shards: None })
+        Ok(Self { config: config.clone(), device, weights, lora_adapters, parameters, is_lora, offloader: None })
     }
 
-    /// Enable per-layer block offloading: drop all `layers.X.*` weights from VRAM
-    /// and remember the source shards so each layer's forward can re-load just
-    /// that layer's weights via `load_file_filtered`. ~30 layers × 280 MB at NVMe
-    /// ~3 GB/s = ~3s per denoise step. Trades wall time for VRAM headroom (frees
-    /// ~10 GB so cuDNN flash SDPA can fit at 1024²). LoRA-only.
+    /// Enable per-layer block offloading via `BlockOffloader`. Drops all
+    /// `layers.{i}.*` weights from VRAM; blocks are streamed from pinned host RAM
+    /// into reusable GPU slots per layer, per step. Works for both base and LoRA
+    /// inference.
     pub fn enable_offload(&mut self, shards: Vec<std::path::PathBuf>) -> Result<()> {
-        // Offload works for both base and LoRA inference — the LoRA-only gate was
-        // artificial. Base inference at 1024² requires offload to fit within 24 GB
-        // (36 layers × 436 MB/layer = 15.7 GB weights alone).
         let to_drop: Vec<String> = self.weights.keys()
             .filter(|k| k.starts_with("layers."))
             .cloned()
@@ -91,30 +88,45 @@ impl ErnieModel {
         log::info!("Ernie offload: dropped {} per-layer weight tensors", n);
         flame_core::cuda_alloc_pool::clear_pool_cache();
         flame_core::trim_cuda_mempool(0);
-        self.offload_shards = Some(shards);
-        Ok(())
-    }
 
-    /// Load layer `i`'s weights from shards into `self.weights`. No-op if not offloading.
-    fn stage_layer(&mut self, i: usize) -> Result<()> {
-        let shards = match &self.offload_shards { None => return Ok(()), Some(s) => s.clone() };
-        let prefix = format!("layers.{}.", i);
-        for shard in &shards {
-            let part = flame_core::serialization::load_file_filtered(
-                shard, &self.device, |k| k.starts_with(&prefix),
-            )?;
-            for (k, v) in part {
-                self.weights.insert(k, v.to_dtype(DType::BF16)?);
+        struct ErnieFacilitator;
+        impl crate::training::block_offload::BlockFacilitator for ErnieFacilitator {
+            fn block_count(&self) -> usize { LAYERS }
+            fn classify_key(&self, key: &str) -> Option<usize> {
+                let rest = key.strip_prefix("layers.")?;
+                rest.split('.').next()?.parse().ok()
             }
         }
-        Ok(())
-    }
 
-    /// Drop layer `i`'s weights from `self.weights`. No-op if not offloading.
-    fn evict_layer(&mut self, i: usize) {
-        if self.offload_shards.is_none() { return; }
-        let prefix = format!("layers.{}.", i);
-        self.weights.retain(|k, _| !k.starts_with(&prefix));
+        let shard_strs: Vec<String> = shards.iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let path_refs: Vec<&str> = shard_strs.iter().map(|s| s.as_str()).collect();
+
+        let use_streaming = std::env::var("ERNIE_BLOCK_STREAMING")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "" | "false" | "False"))
+            .unwrap_or(true);
+
+        let offloader = if use_streaming {
+            log::info!("Ernie BlockOffloader: streaming mode");
+            crate::training::block_offload::BlockOffloader::load_streaming(
+                &path_refs, &ErnieFacilitator, self.device.clone(),
+            )
+        } else {
+            log::info!("Ernie BlockOffloader: pinned-RAM mode");
+            crate::training::block_offload::BlockOffloader::load(
+                &path_refs, &ErnieFacilitator, self.device.clone(),
+            )
+        }
+        // native_layout=true: leave 2D .weight tensors in on-disk [Cout, Cin] layout.
+        // Ernie model code calls `.transpose()` itself before matmul.
+        .map(|o| o.with_native_layout(true))
+        .map_err(|e| crate::EriDiffusionError::Model(format!("BlockOffloader: {e}")))?;
+
+        self.offloader = Some(std::sync::Arc::new(std::sync::Mutex::new(offloader)));
+        log::info!("Ernie BlockOffloader ready ({} layers)", LAYERS);
+        Ok(())
     }
 
     fn w(&self, key: &str) -> Result<&Tensor> {
@@ -277,7 +289,17 @@ impl ErnieModel {
         let is_inference = !flame_core::autograd::AutogradContext::is_recording();
         let use_checkpoint = std::env::var("ERNIE_GRAD_CHECKPOINT").map(|v| v != "0").unwrap_or(true);
         for i in 0..LAYERS {
-            self.stage_layer(i)?;
+            // BlockOffloader: stream layer i from pinned host RAM into GPU slot.
+            if let Some(ref off) = self.offloader {
+                let arc = off.lock()
+                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
+                    .ensure_block(i)
+                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader ensure_block({i}): {e}")))?;
+                // Merge the block's weights into self.weights for the forward body.
+                for (k, v) in arc.iter() {
+                    self.weights.insert(k.clone(), v.clone());
+                }
+            }
 
             if is_inference {
                 // Inference fast path — borrow weights directly, no clone, no closure.
@@ -350,7 +372,14 @@ impl ErnieModel {
                 x = result;
             }
 
-            self.evict_layer(i);
+            // Evict this layer's weights from self.weights and release the GPU slot.
+            if let Some(ref off) = self.offloader {
+                let prefix = format!("layers.{}.", i);
+                self.weights.retain(|k, _| !k.starts_with(&prefix));
+                off.lock()
+                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
+                    .evict_block();
+            }
         }
 
         // ErnieImageAdaLNContinuous: LayerNorm (no affine) + linear → chunk(scale, shift).
