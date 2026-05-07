@@ -241,6 +241,22 @@ pub struct ChromaTrainingModel {
     /// Block offloader: pinned CPU → GPU sequential copy (None if all blocks on GPU).
     pub block_offloader: Option<Arc<Mutex<BlockOffloader>>>,
     device: Arc<cudarc::driver::CudaDevice>,
+    /// RoPE table cache, keyed on (h_tok, w_tok, n_txt). Building chroma's
+    /// 3-axis RoPE costs ~2 s per call (slow flame-core narrow→matmul→cos/sin
+    /// chain on small tensors). Tables only depend on shape (not on prompt
+    /// content or timestep), so caching across denoise steps cuts ~4 s/step
+    /// out of the per-step budget at 512² × CFG. Mutex<Option<…>> mirrors the
+    /// offloader's interior-mutability pattern.
+    rope_cache: Arc<Mutex<Option<RopeCacheEntry>>>,
+}
+
+#[derive(Clone)]
+struct RopeCacheEntry {
+    h_tok: usize,
+    w_tok: usize,
+    n_txt: usize,
+    pe_cos: Tensor,
+    pe_sin: Tensor,
 }
 
 impl ChromaTrainingModel {
@@ -327,6 +343,7 @@ impl ChromaTrainingModel {
             single_block_weights: single_blocks,
             block_offloader: None,
             device,
+            rope_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -482,6 +499,7 @@ impl ChromaTrainingModel {
             single_block_weights: Vec::new(),
             block_offloader: Some(Arc::new(Mutex::new(offloader))),
             device,
+            rope_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -706,11 +724,70 @@ impl ChromaTrainingModel {
         // Build img_ids and txt_ids for RoPE
         let (img_ids, txt_ids) = Self::build_position_ids(h_tok, w_tok, txt.shape().dims()[1], &self.device)?;
 
+        // Phase timing — only when CHROMA_TIMING=1 (no-swap path only).
+        let timing_setup = std::env::var("CHROMA_TIMING").is_ok();
+        let dev_for_sync = self.device.clone();
+        let sync_setup = || -> Result<()> {
+            if timing_setup {
+                dev_for_sync.synchronize()
+                    .map_err(|e| flame_core::Error::Cuda(format!("sync: {e:?}")))?;
+            }
+            Ok(())
+        };
+
+        sync_setup()?;
+        let t_approx = std::time::Instant::now();
         // Approximator: compute pooled_temb for modulation
         let pooled_temb = self.run_approximator(timesteps)?;
+        sync_setup()?;
+        let dt_approx = t_approx.elapsed();
 
-        // Build RoPE
-        let (pe_cos, pe_sin) = self.build_rope(&img_ids, &txt_ids)?;
+        let t_rope = std::time::Instant::now();
+        // Build RoPE — cached on (h_tok, w_tok, n_txt) since the tables
+        // depend only on shape (positions are integer indices, not prompt
+        // content or timestep). build_rope itself takes ~2 s/call due to
+        // a slow flame-core narrow→matmul→cos/sin chain on small tensors;
+        // caching across denoise steps cuts ~4 s/step at 512² × CFG (CFG
+        // calls forward twice per step against the same shape).
+        let n_txt_for_cache = txt.shape().dims()[1];
+        let cached_rope: Option<(Tensor, Tensor)> = {
+            let guard = self.rope_cache.lock()
+                .map_err(|e| flame_core::Error::InvalidInput(format!("rope_cache lock: {e}")))?;
+            guard.as_ref().and_then(|c| {
+                if c.h_tok == h_tok && c.w_tok == w_tok && c.n_txt == n_txt_for_cache {
+                    Some((c.pe_cos.clone(), c.pe_sin.clone()))
+                } else {
+                    None
+                }
+            })
+        };
+        let was_cached = cached_rope.is_some();
+        let (pe_cos, pe_sin) = if let Some(pair) = cached_rope {
+            pair
+        } else {
+            let (cos, sin) = self.build_rope(&img_ids, &txt_ids)?;
+            let mut guard = self.rope_cache.lock()
+                .map_err(|e| flame_core::Error::InvalidInput(format!("rope_cache lock: {e}")))?;
+            *guard = Some(RopeCacheEntry {
+                h_tok,
+                w_tok,
+                n_txt: n_txt_for_cache,
+                pe_cos: cos.clone(),
+                pe_sin: sin.clone(),
+            });
+            (cos, sin)
+        };
+        sync_setup()?;
+        let dt_rope = t_rope.elapsed();
+
+        if timing_setup {
+            log::info!(
+                "[chroma fwd] approximator: {:.1}ms | rope (cached={}): {:.1}ms",
+                dt_approx.as_secs_f64() * 1000.0,
+                was_cached,
+                dt_rope.as_secs_f64() * 1000.0,
+            );
+        }
 
         let n_txt = txt.shape().dims()[1];
         let mut img_h = img;
@@ -806,6 +883,18 @@ impl ChromaTrainingModel {
             // txt_h not needed after this point
         } else {
             // ── No-swap path: all weights on GPU, no checkpointing ──
+            // Phase timing probe (CHROMA_TIMING=1 to enable). Sync with
+            // device before each measurement to attribute time correctly.
+            let timing = std::env::var("CHROMA_TIMING").is_ok();
+            let sync_dev = || -> Result<()> {
+                if timing {
+                    self.device.synchronize()
+                        .map_err(|e| flame_core::Error::Cuda(format!("sync: {e:?}")))?;
+                }
+                Ok(())
+            };
+            sync_dev()?;
+            let t_double = std::time::Instant::now();
             for i in 0..self.num_double_blocks {
                 let (new_img, new_txt) = self.double_block(
                     &img_h, &txt_h, &pooled_temb, &pe_cos, &pe_sin, i, n_txt, None,
@@ -813,15 +902,33 @@ impl ChromaTrainingModel {
                 img_h = new_img;
                 txt_h = new_txt;
             }
+            sync_dev()?;
+            let dt_double = t_double.elapsed();
 
             let combined = Tensor::cat(&[&txt_h, &img_h], 1)?;
             let mut h = combined;
+            sync_dev()?;
+            let t_single = std::time::Instant::now();
             for i in 0..self.num_single_blocks {
                 h = self.single_block(&h, &pooled_temb, &pe_cos, &pe_sin, i, None)?;
             }
+            sync_dev()?;
+            let dt_single = t_single.elapsed();
 
             let img_out_h = h.narrow(1, n_txt, n_img)?;
             img_h = img_out_h;
+
+            if timing {
+                log::info!(
+                    "[chroma fwd] double {} blocks: {:.1}ms ({:.2}ms/blk) | single {} blocks: {:.1}ms ({:.2}ms/blk)",
+                    self.num_double_blocks,
+                    dt_double.as_secs_f64() * 1000.0,
+                    dt_double.as_secs_f64() * 1000.0 / self.num_double_blocks as f64,
+                    self.num_single_blocks,
+                    dt_single.as_secs_f64() * 1000.0,
+                    dt_single.as_secs_f64() * 1000.0 / self.num_single_blocks as f64,
+                );
+            }
         }
 
         // img_h now holds the extracted image tokens from whichever path.
