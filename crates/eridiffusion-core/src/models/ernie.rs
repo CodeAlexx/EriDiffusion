@@ -79,9 +79,9 @@ impl ErnieModel {
     /// ~3 GB/s = ~3s per denoise step. Trades wall time for VRAM headroom (frees
     /// ~10 GB so cuDNN flash SDPA can fit at 1024²). LoRA-only.
     pub fn enable_offload(&mut self, shards: Vec<std::path::PathBuf>) -> Result<()> {
-        if !self.is_lora {
-            return Err(crate::EriDiffusionError::Model("offload requires LoRA mode".into()));
-        }
+        // Offload works for both base and LoRA inference — the LoRA-only gate was
+        // artificial. Base inference at 1024² requires offload to fit within 24 GB
+        // (36 layers × 436 MB/layer = 15.7 GB weights alone).
         let to_drop: Vec<String> = self.weights.keys()
             .filter(|k| k.starts_with("layers."))
             .cloned()
@@ -272,61 +272,83 @@ impl ErnieModel {
         let sin_b = sin.to_dtype(DType::BF16)?;
 
         let mut x = x;
+        // Inference fast path: skip HashMap clone + checkpoint closure overhead.
+        // Training path: unchanged (HashMap clone + grad-checkpoint for activation offload).
+        let is_inference = !flame_core::autograd::AutogradContext::is_recording();
         let use_checkpoint = std::env::var("ERNIE_GRAD_CHECKPOINT").map(|v| v != "0").unwrap_or(true);
         for i in 0..LAYERS {
             self.stage_layer(i)?;
 
-            // Extract this layer's weights into a self-contained map so the
-            // checkpoint closure (which must be 'static) can own them.
-            let layer_prefix = format!("layers.{}.", i);
-            let mut layer_weights: HashMap<String, Tensor> = HashMap::new();
-            for (k, v) in self.weights.iter() {
-                if k.starts_with(&layer_prefix) {
-                    layer_weights.insert(k.clone(), v.clone());
-                }
-            }
-            let lora_base = i * 7;
-            let lora_adapters: Option<Vec<LoRALinear>> = if self.is_lora {
-                Some(self.lora_adapters[lora_base..lora_base+7].to_vec())
-            } else {
-                None
-            };
-
-            let x_in = x.clone();
-            let cos_c = cos_b.clone();
-            let sin_c = sin_b.clone();
-            let s_msa_c = s_msa.clone();
-            let sc_msa_c = sc_msa.clone();
-            let g_msa_c = g_msa.clone();
-            let s_mlp_c = s_mlp.clone();
-            let sc_mlp_c = sc_mlp.clone();
-            let g_mlp_c = g_mlp.clone();
-
-            let result = if use_checkpoint {
-                flame_core::autograd::AutogradContext::checkpoint(
-                    &[x_in.clone()],
-                    move || ernie_layer_forward_standalone(
-                        x_in.clone(),
-                        sc_msa_c.clone(), s_msa_c.clone(), g_msa_c.clone(),
-                        sc_mlp_c.clone(), s_mlp_c.clone(), g_mlp_c.clone(),
-                        cos_c.clone(), sin_c.clone(),
-                        layer_weights.clone(),
-                        lora_adapters.clone(),
-                        i, b, n_total,
-                    ),
-                )?
-            } else {
-                ernie_layer_forward_standalone(
-                    x_in,
-                    sc_msa_c, s_msa_c, g_msa_c,
-                    sc_mlp_c, s_mlp_c, g_mlp_c,
-                    cos_c, sin_c,
-                    layer_weights,
-                    lora_adapters,
+            if is_inference {
+                // Inference fast path — borrow weights directly, no clone, no closure.
+                let lora_base = i * 7;
+                let lora_slice: Option<&[LoRALinear]> = if self.is_lora {
+                    Some(&self.lora_adapters[lora_base..lora_base+7])
+                } else {
+                    None
+                };
+                x = block_forward_iflame(
+                    &x,
+                    &sc_msa, &s_msa, &g_msa,
+                    &sc_mlp, &s_mlp, &g_mlp,
+                    &cos_b, &sin_b,
+                    &self.weights,
+                    lora_slice,
                     i, b, n_total,
-                )?
-            };
-            x = result;
+                )?;
+            } else {
+                // Training path — extract this layer's weights into a self-contained map so the
+                // checkpoint closure (which must be 'static) can own them.
+                let layer_prefix = format!("layers.{}.", i);
+                let mut layer_weights: HashMap<String, Tensor> = HashMap::new();
+                for (k, v) in self.weights.iter() {
+                    if k.starts_with(&layer_prefix) {
+                        layer_weights.insert(k.clone(), v.clone());
+                    }
+                }
+                let lora_base = i * 7;
+                let lora_adapters: Option<Vec<LoRALinear>> = if self.is_lora {
+                    Some(self.lora_adapters[lora_base..lora_base+7].to_vec())
+                } else {
+                    None
+                };
+
+                let x_in = x.clone();
+                let cos_c = cos_b.clone();
+                let sin_c = sin_b.clone();
+                let s_msa_c = s_msa.clone();
+                let sc_msa_c = sc_msa.clone();
+                let g_msa_c = g_msa.clone();
+                let s_mlp_c = s_mlp.clone();
+                let sc_mlp_c = sc_mlp.clone();
+                let g_mlp_c = g_mlp.clone();
+
+                let result = if use_checkpoint {
+                    flame_core::autograd::AutogradContext::checkpoint(
+                        &[x_in.clone()],
+                        move || ernie_layer_forward_standalone(
+                            x_in.clone(),
+                            sc_msa_c.clone(), s_msa_c.clone(), g_msa_c.clone(),
+                            sc_mlp_c.clone(), s_mlp_c.clone(), g_mlp_c.clone(),
+                            cos_c.clone(), sin_c.clone(),
+                            layer_weights.clone(),
+                            lora_adapters.clone(),
+                            i, b, n_total,
+                        ),
+                    )?
+                } else {
+                    ernie_layer_forward_standalone(
+                        x_in,
+                        sc_msa_c, s_msa_c, g_msa_c,
+                        sc_mlp_c, s_mlp_c, g_mlp_c,
+                        cos_c, sin_c,
+                        layer_weights,
+                        lora_adapters,
+                        i, b, n_total,
+                    )?
+                };
+                x = result;
+            }
 
             self.evict_layer(i);
         }
@@ -481,6 +503,98 @@ fn ernie_layer_forward_standalone(
     let gated = up.mul(&gate)?;
     let down = linear_lora(&gated, &format!("{}.linear_fc2.weight", mlp), 6)?;
     r2.add(&g_mlp.mul(&down)?)
+}
+
+/// Inference-fast block forward — mirrors `ernie_layer_forward_standalone` but
+/// borrows `weights` directly (no HashMap clone, no checkpoint closure overhead).
+/// Only called from the inference branch (`!AutogradContext::is_recording()`).
+///
+/// Operation order is identical to `ernie_layer_forward_standalone`:
+///   AdaLN-pre SA → gated residual → AdaLN-pre SwiGLU → gated residual.
+#[allow(clippy::too_many_arguments)]
+fn block_forward_iflame(
+    x: &Tensor,
+    sc_msa: &Tensor, s_msa: &Tensor, g_msa: &Tensor,
+    sc_mlp: &Tensor, s_mlp: &Tensor, g_mlp: &Tensor,
+    cos_b: &Tensor, sin_b: &Tensor,
+    weights: &HashMap<String, Tensor>,
+    lora_adapters: Option<&[LoRALinear]>,
+    layer_idx: usize,
+    b: usize,
+    n_total: usize,
+) -> crate::Result<Tensor> {
+    let pre = format!("layers.{}.self_attention", layer_idx);
+
+    let w = |key: &str| -> crate::Result<&Tensor> {
+        weights.get(key).ok_or_else(||
+            crate::EriDiffusionError::Model(format!("ernie block {}: missing weight {}", layer_idx, key)))
+    };
+    let linear_no_lora = |x: &Tensor, w_key: &str| -> crate::Result<Tensor> {
+        Ok(x.matmul(&w(w_key)?.transpose()?)?)
+    };
+    let linear_lora = |x: &Tensor, w_key: &str, adapter_idx: usize| -> crate::Result<Tensor> {
+        let base = linear_no_lora(x, w_key)?;
+        if let Some(adapters) = lora_adapters {
+            if let Some(adapter) = adapters.get(adapter_idx) {
+                let delta = adapter.forward_delta(x)?;
+                return Ok(base.add(&delta)?);
+            }
+        }
+        Ok(base)
+    };
+    let rms_norm_full = |x: &Tensor, scale_key: &str| -> crate::Result<Tensor> {
+        Ok(flame_core::norm::rms_norm(x, &[HIDDEN], Some(w(scale_key)?), NORM_EPS)?)
+    };
+    let qk_rms_norm_local = |x: &Tensor, scale_key: &str| -> crate::Result<Tensor> {
+        let dims = x.shape().dims().to_vec();
+        let batch: usize = dims[..dims.len()-1].iter().product();
+        let x_h = x.reshape(&[batch * HEADS, HEAD_DIM])?;
+        let n = flame_core::norm::rms_norm(&x_h, &[HEAD_DIM], Some(w(scale_key)?), NORM_EPS)?;
+        Ok(n.reshape(&dims)?)
+    };
+    let rh_local = |x: &Tensor| -> crate::Result<Tensor> {
+        Ok(x.reshape(&[b, n_total, HEADS, HEAD_DIM])?.permute(&[0,2,1,3])?)
+    };
+    // Rotate-half RoPE: x * cos + [-x[half:], x[:half]] * sin.
+    // cos/sin shape: [1, 1, total, HEAD_DIM] — broadcasts over [B, H, total, HEAD_DIM].
+    let rope_local = |q: &Tensor| -> crate::Result<Tensor> {
+        let q_bf16 = q.to_dtype(DType::BF16)?.contiguous()?;
+        let half = HEAD_DIM / 2;
+        let x_first = q_bf16.narrow(3, 0, half)?.contiguous()?;
+        let x_second = q_bf16.narrow(3, half, half)?.contiguous()?;
+        let neg_second = x_second.mul_scalar(-1.0f32)?;
+        let x_rot = Tensor::cat(&[&neg_second, &x_first], 3)?;
+        let prod_cos = q_bf16.mul(cos_b)?;
+        let prod_sin = x_rot.mul(sin_b)?;
+        Ok(prod_cos.add(&prod_sin)?)
+    };
+
+    // Self-attention path
+    let r = x.clone();
+    let n = rms_norm_full(x, &format!("layers.{}.adaLN_sa_ln.weight", layer_idx))?;
+    let m = n.mul(&sc_msa.add_scalar(1.0)?)?.add(s_msa)?;
+    let q = linear_lora(&m, &format!("{}.to_q.weight", pre), 0)?;
+    let k = linear_lora(&m, &format!("{}.to_k.weight", pre), 1)?;
+    let v = linear_lora(&m, &format!("{}.to_v.weight", pre), 2)?;
+    let q_n = qk_rms_norm_local(&q, &format!("{}.norm_q.weight", pre))?;
+    let k_n = qk_rms_norm_local(&k, &format!("{}.norm_k.weight", pre))?;
+    let (qh, kh, vh) = (rh_local(&q_n)?, rh_local(&k_n)?, rh_local(&v)?);
+    let (qh, kh) = (rope_local(&qh)?, rope_local(&kh)?);
+    let attn = flame_core::attention::sdpa(&qh, &kh, &vh, None)?
+        .permute(&[0,2,1,3])?.reshape(&[b, n_total, HIDDEN])?;
+    let out = linear_lora(&attn, &format!("{}.to_out.0.weight", pre), 3)?;
+    let x = r.add(&g_msa.mul(&out)?)?;
+
+    // FFN path
+    let r2 = x.clone();
+    let n2 = rms_norm_full(&x, &format!("layers.{}.adaLN_mlp_ln.weight", layer_idx))?;
+    let m2 = n2.mul(&sc_mlp.add_scalar(1.0)?)?.add(s_mlp)?;
+    let mlp = format!("layers.{}.mlp", layer_idx);
+    let gate = linear_lora(&m2, &format!("{}.gate_proj.weight", mlp), 4)?.gelu()?;
+    let up = linear_lora(&m2, &format!("{}.up_proj.weight", mlp), 5)?;
+    let gated = up.mul(&gate)?;
+    let down = linear_lora(&gated, &format!("{}.linear_fc2.weight", mlp), 6)?;
+    Ok(r2.add(&g_mlp.mul(&down)?)?)
 }
 
 /// LoRA adapter slot ↔ base-module key mapping. Order matches `ErnieModel::load`.

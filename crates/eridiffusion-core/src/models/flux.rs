@@ -424,6 +424,14 @@ impl FluxModel {
         let (b, n_img) = (dims[0], dims[1]);
         let n_txt = txt.shape().dims()[1];
 
+        // Inference dispatch: use fused BF16 kernels (qkv_split_permute_bf16,
+        // attn_split_txt_img_bf16, gate_residual_fused_bf16) when no grad tape
+        // is being recorded. These kernels auto-dispatch to autograd-recording
+        // primitives during training; the explicit is_inference branch is only
+        // needed for gate_residual_fused_bf16 which requires a [B, DIM] gate.
+        // Training path below is bit-identical to pre-iflame code.
+        let is_inference = !AutogradContext::is_recording();
+
         // Modulation
         let img_mod = Self::linear(&vec.silu()?, self.dw(idx, "img_mod.lin.weight")?, self.dw(idx, "img_mod.lin.bias")?)?;
         let img_mods = img_mod.unsqueeze(1)?.chunk(6, 2)?;
@@ -447,8 +455,6 @@ impl FluxModel {
             bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::ImgK))),
             bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::ImgV))),
         )?;
-        let c = img_qkv.chunk(3, 2)?;
-        let (img_q, img_k, img_v) = (c[0].clone(), c[1].clone(), c[2].clone());
 
         // --- Txt attention --- (split Q/K/V LoRA)
         let txt_norm = flame_core::layer_norm::layer_norm(txt, &[DIM], None, None, NORM_EPS)?;
@@ -460,18 +466,18 @@ impl FluxModel {
             bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::TxtK))),
             bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::TxtV))),
         )?;
-        let c = txt_qkv.chunk(3, 2)?;
-        let (txt_q, txt_k, txt_v) = (c[0].clone(), c[1].clone(), c[2].clone());
 
-        // QK norm
+        // QKV split → [B, H, N, D]. `qkv_split_permute_bf16` auto-dispatches:
+        // fused CUDA kernel in inference, primitives (narrow+reshape+permute)
+        // during training so autograd records each op. Both paths are safe.
+        let (img_q, img_k, img_v) = flame_core::bf16_ops::qkv_split_permute_bf16(&img_qkv, NUM_HEADS, HEAD_DIM)?;
+        let (txt_q, txt_k, txt_v) = flame_core::bf16_ops::qkv_split_permute_bf16(&txt_qkv, NUM_HEADS, HEAD_DIM)?;
+
+        // QK norm (operates on [B, H, N, D] from qkv_split_permute_bf16)
         let img_q = Self::rms_norm_per_head(&img_q, self.dw(idx, "img_attn.norm.query_norm.scale")?)?;
         let img_k = Self::rms_norm_per_head(&img_k, self.dw(idx, "img_attn.norm.key_norm.scale")?)?;
         let txt_q = Self::rms_norm_per_head(&txt_q, self.dw(idx, "txt_attn.norm.query_norm.scale")?)?;
         let txt_k = Self::rms_norm_per_head(&txt_k, self.dw(idx, "txt_attn.norm.key_norm.scale")?)?;
-
-        // Reshape → [B, H, N, D]
-        let (img_q, img_k, img_v) = (reshape_qkv(&img_q, b, n_img)?, reshape_qkv(&img_k, b, n_img)?, reshape_qkv(&img_v, b, n_img)?);
-        let (txt_q, txt_k, txt_v) = (reshape_qkv(&txt_q, b, n_txt)?, reshape_qkv(&txt_k, b, n_txt)?, reshape_qkv(&txt_v, b, n_txt)?);
 
         // Joint attention. `.contiguous()` after each cat — H9 / GOTCHAS §2.4:
         // Tensor::cat may return non-contiguous views; downstream BF16 SDPA /
@@ -482,23 +488,37 @@ impl FluxModel {
         let v = Tensor::cat(&[&txt_v, &img_v], 2)?.contiguous()?;
         let (q, k) = Self::apply_rope(&q, &k, cos, sin)?;
 
+        // SDPA → [B, H, N_total, D]
         let attn = flame_core::attention::sdpa(&q, &k, &v, None)?;
-        let attn = attn.permute(&[0, 2, 1, 3])?.reshape(&[b, n_txt + n_img, DIM])?;
-        let txt_attn = attn.narrow(1, 0, n_txt)?;
-        let img_attn = attn.narrow(1, n_txt, n_img)?;
+
+        // Split attn back into txt/img streams. `attn_split_txt_img_bf16`
+        // auto-dispatches: fused kernel in inference, narrow+permute+reshape
+        // during training. Returns ([B, n_txt, DIM], [B, n_img, DIM]).
+        let (txt_attn, img_attn) = flame_core::bf16_ops::attn_split_txt_img_bf16(&attn, n_txt, n_img)?;
 
         // Output proj + gate + residual
         let img_proj = Self::linear(&img_attn, self.dw(idx, "img_attn.proj.weight")?, self.dw(idx, "img_attn.proj.bias")?)?;
         let img_proj = if let Some(lora) = bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::ImgProj))) {
             img_proj.add(&lora.forward_delta(&img_attn)?)?
         } else { img_proj };
-        let img = img.add(&img_g1.mul(&img_proj)?)?;
+
+        // gate_residual_fused_bf16 (inference): squeeze [B,1,DIM] gate → [B,DIM].
+        // Training path uses mul+add directly (bit-identical to pre-iflame code).
+        let img = if is_inference {
+            flame_core::bf16_ops::gate_residual_fused_bf16(img, &img_g1.squeeze(Some(1))?, &img_proj)?
+        } else {
+            img.add(&img_g1.mul(&img_proj)?)?
+        };
 
         let txt_proj = Self::linear(&txt_attn, self.dw(idx, "txt_attn.proj.weight")?, self.dw(idx, "txt_attn.proj.bias")?)?;
         let txt_proj = if let Some(lora) = bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::TxtProj))) {
             txt_proj.add(&lora.forward_delta(&txt_attn)?)?
         } else { txt_proj };
-        let txt = txt.add(&txt_g1.mul(&txt_proj)?)?;
+        let txt = if is_inference {
+            flame_core::bf16_ops::gate_residual_fused_bf16(txt, &txt_g1.squeeze(Some(1))?, &txt_proj)?
+        } else {
+            txt.add(&txt_g1.mul(&txt_proj)?)?
+        };
 
         // --- GELU MLP --- (img + txt MLP up/down LoRAs added per H5)
         let img_norm2 = flame_core::layer_norm::layer_norm(&img, &[DIM], None, None, NORM_EPS)?;
@@ -512,7 +532,11 @@ impl FluxModel {
         let img_mlp_out = if let Some(lora) = bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::ImgMlp2))) {
             img_mlp_out_base.add(&lora.forward_delta(&img_mlp_h)?)?
         } else { img_mlp_out_base };
-        let img = img.add(&img_g2.mul(&img_mlp_out)?)?;
+        let img = if is_inference {
+            flame_core::bf16_ops::gate_residual_fused_bf16(&img, &img_g2.squeeze(Some(1))?, &img_mlp_out)?
+        } else {
+            img.add(&img_g2.mul(&img_mlp_out)?)?
+        };
 
         let txt_norm2 = flame_core::layer_norm::layer_norm(&txt, &[DIM], None, None, NORM_EPS)?;
         let txt_mlp_in = txt_norm2.mul(&txt_scale2.add_scalar(1.0)?)?.add(txt_s2)?;
@@ -525,7 +549,11 @@ impl FluxModel {
         let txt_mlp_out = if let Some(lora) = bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::TxtMlp2))) {
             txt_mlp_out_base.add(&lora.forward_delta(&txt_mlp_h)?)?
         } else { txt_mlp_out_base };
-        let txt = txt.add(&txt_g2.mul(&txt_mlp_out)?)?;
+        let txt = if is_inference {
+            flame_core::bf16_ops::gate_residual_fused_bf16(&txt, &txt_g2.squeeze(Some(1))?, &txt_mlp_out)?
+        } else {
+            txt.add(&txt_g2.mul(&txt_mlp_out)?)?
+        };
 
         Ok((img, txt))
     }
@@ -536,6 +564,9 @@ impl FluxModel {
         let dims = x.shape().dims().to_vec();
         let (b, n) = (dims[0], dims[1]);
         let bundle = self.bundle.as_ref();
+
+        // Inference dispatch (see double_block_forward comment).
+        let is_inference = !AutogradContext::is_recording();
 
         // Modulation: Linear(vec.silu()) → 3*DIM
         let m = Self::linear(&vec.silu()?, self.singw(idx, "modulation.lin.weight")?, self.singw(idx, "modulation.lin.bias")?)?;
@@ -565,13 +596,12 @@ impl FluxModel {
             mlp_in_base.add(&lora.forward_delta(&x_mod)?)?
         } else { mlp_in_base };
 
-        let c = qkv.chunk(3, 2)?;
-        let (q, k, v) = (c[0].clone(), c[1].clone(), c[2].clone());
+        // QKV split → [B, H, N, D]. Auto-dispatches to primitives during training.
+        let (q, k, v) = flame_core::bf16_ops::qkv_split_permute_bf16(&qkv, NUM_HEADS, HEAD_DIM)?;
 
         let q = Self::rms_norm_per_head(&q, self.singw(idx, "norm.query_norm.scale")?)?;
         let k = Self::rms_norm_per_head(&k, self.singw(idx, "norm.key_norm.scale")?)?;
 
-        let (q, k, v) = (reshape_qkv(&q, b, n)?, reshape_qkv(&k, b, n)?, reshape_qkv(&v, b, n)?);
         let (q, k) = Self::apply_rope(&q, &k, cos, sin)?;
         let attn = flame_core::attention::sdpa(&q, &k, &v, None)?;
         let attn = attn.permute(&[0, 2, 1, 3])?.reshape(&[b, n, DIM])?;
@@ -590,7 +620,14 @@ impl FluxModel {
             l2.add(&lora.forward_delta(&fused)?)?
         } else { l2 };
 
-        x.add(&gate.mul(&l2)?).map_err(Into::into)
+        // Gated residual. Inference: gate_residual_fused_bf16 with squeezed
+        // [B,DIM] gate. Training: mul+add (bit-identical to pre-iflame code).
+        if is_inference {
+            flame_core::bf16_ops::gate_residual_fused_bf16(x, &gate.squeeze(Some(1))?, &l2)
+                .map_err(Into::into)
+        } else {
+            x.add(&gate.mul(&l2)?).map_err(Into::into)
+        }
     }
 
     // ── Full forward ─────────────────────────────────────────────────
@@ -682,10 +719,6 @@ impl FluxModel {
 
 fn parse_block_idx(rest: &str, max: usize) -> Option<usize> {
     rest.find('.').and_then(|d| rest[..d].parse::<usize>().ok()).filter(|&i| i < max)
-}
-
-fn reshape_qkv(x: &Tensor, b: usize, n: usize) -> Result<Tensor> {
-    x.reshape(&[b, n, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3]).map_err(Into::into)
 }
 
 // ── TrainableModel trait ────────────────────────────────────────────

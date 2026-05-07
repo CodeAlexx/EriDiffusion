@@ -94,15 +94,40 @@ fn main() -> anyhow::Result<()> {
         }
         m
     } else {
-        let mut all_weights = std::collections::HashMap::new();
-        for entry in std::fs::read_dir(&args.transformer_dir)? {
-            let p = entry?.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("safetensors") {
-                let part = flame_core::serialization::load_file(&p, &device)?;
-                all_weights.extend(part);
-            }
+        let mut shard_paths: Vec<PathBuf> = std::fs::read_dir(&args.transformer_dir)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
+            .collect();
+        shard_paths.sort();
+        if shard_paths.is_empty() {
+            anyhow::bail!("no safetensors shards in {:?}", args.transformer_dir);
         }
-        ErnieModel {
+        // Load shared (non-layer) weights only if offloading; otherwise load all.
+        let all_weights = if args.offload {
+            // Load only non-layer weights — layer weights will stream per-block.
+            let shared_prefixes = [
+                "x_embedder.", "text_proj.", "time_embedding.", "time_proj.",
+                "adaLN_modulation.", "final_norm.", "final_linear.", "pos_embed.",
+            ];
+            let mut wt = std::collections::HashMap::new();
+            for p in &shard_paths {
+                let part = flame_core::serialization::load_file(p, &device)?;
+                for (k, v) in part {
+                    if shared_prefixes.iter().any(|px| k.starts_with(px)) {
+                        wt.insert(k, v.to_dtype(flame_core::DType::BF16).unwrap_or(v));
+                    }
+                }
+            }
+            wt
+        } else {
+            let mut wt = std::collections::HashMap::new();
+            for p in &shard_paths {
+                let part = flame_core::serialization::load_file(p, &device)?;
+                wt.extend(part);
+            }
+            wt
+        };
+        let mut m = ErnieModel {
             config: TrainConfig::default(),
             device: device.clone(),
             weights: all_weights,
@@ -110,7 +135,12 @@ fn main() -> anyhow::Result<()> {
             parameters: Vec::new(),
             is_lora: false,
             offload_shards: None,
+        };
+        if args.offload {
+            m.enable_offload(shard_paths.clone())?;
+            log::info!("  Block offload enabled (base model) — per-layer streaming from {} shards", shard_paths.len());
         }
+        m
     };
     let mut config = model;
 

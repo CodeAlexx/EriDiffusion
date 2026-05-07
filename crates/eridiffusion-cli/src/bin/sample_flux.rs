@@ -117,7 +117,12 @@ fn main() -> anyhow::Result<()> {
     let mut encode_t5 = |text: &str| -> anyhow::Result<Tensor> {
         let e = t5_tok.encode(text, true).map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut ids: Vec<i32> = e.get_ids().iter().map(|&x| x as i32).collect();
+        // Truncate to T5_MAX_LEN, then pad with 0 to exactly T5_MAX_LEN.
+        // `build_txt_ids` always produces T5_MAX_LEN RoPE positions; the T5
+        // embedding must match that length or the RoPE table is misaligned.
+        // Mirrors inference-flame's `tokenize_t5` (flux1_infer.rs pad-to-512).
         if ids.len() > T5_MAX_LEN { ids.truncate(T5_MAX_LEN); }
+        while ids.len() < T5_MAX_LEN { ids.push(0); }
         Ok(t5.encode(&ids)?)
     };
     let encode_clip = |text: &str| -> anyhow::Result<Tensor> {

@@ -77,7 +77,14 @@ fn main() -> anyhow::Result<()> {
 
     log::info!("[4/4] Sampling at {}² ({} steps, cfg={}, shift={})...",
         args.size, args.steps, args.cfg, args.shift);
-    zimage_sampler::sample_image(
+
+    // Split path: denoise, unload transformer, then VAE-decode.
+    // At 1024² the Z-Image transformer (~11.5 GB) and the VAE conv workspace
+    // cannot both fit in 24 GB simultaneously.  Dropping the model before
+    // decode frees the VRAM the VAE's cuDNN workspace needs.
+    let _no_grad = flame_core::autograd::AutogradContext::no_grad();
+    let _ckpt = eridiffusion_core::sampler::zimage_sampler::CheckpointGuard::disable();
+    let latent = zimage_sampler::denoise_latent(
         &mut model,
         &cap_feats, Some(&cap_mask),
         Some(&cap_uncond), Some(&cap_mask_uncond),
@@ -86,10 +93,13 @@ fn main() -> anyhow::Result<()> {
         args.cfg,
         args.shift,
         args.seed,
-        &args.vae_path,
-        &args.output,
         &device,
     )?;
+    // Drop transformer weights before VAE decode to free VRAM.
+    drop(model);
+    flame_core::cuda_alloc_pool::clear_pool_cache();
+    flame_core::trim_cuda_mempool(0);
+    zimage_sampler::decode_latent_to_png(&latent, &args.vae_path, &args.output, &device)?;
 
     log::info!("Saved {:?}", args.output);
     Ok(())

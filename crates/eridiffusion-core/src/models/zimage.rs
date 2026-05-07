@@ -620,6 +620,13 @@ impl ZImageModel {
         let use_checkpoint = std::env::var("FLAME_CHECKPOINT")
             .ok().map(|v| v != "0").unwrap_or(true);
 
+        // When autograd is not recording (inference / sample_image call) we
+        // bypass the checkpoint machinery entirely and use the fused-kernel
+        // inference path.  Training keeps the existing checkpoint path so
+        // activation-offload, gradient bookkeeping, and LoRA training are
+        // byte-identical to the pre-port behavior.
+        let is_inference = !flame_core::autograd::AutogradContext::is_recording();
+
         let mut h_state = unified;
         // FLAME_RETAIN_BLOCK_GRADS=1 records block-boundary tensor IDs to
         // a global so callers can call retain_intermediate_grads on them.
@@ -630,7 +637,18 @@ impl ZImageModel {
             block_grad_ids().lock().unwrap().push(("unified".to_string(), h_state.id()));
         }
         for i in 0..n_blocks {
-            if use_checkpoint {
+            if is_inference {
+                // Inference fast path — fused kernels, no checkpoint overhead.
+                // `block_forward_iflame` mirrors inference-flame's
+                // `transformer_block`: fused_rms_norm, rope_fused_bf16,
+                // swiglu_fused_bf16, gate_residual_fused_bf16, linear_3d.
+                let block_w = self.fft_block_cast(i)?;
+                self.bundle.refresh_caches();
+                h_state = block_forward_iflame(
+                    &h_state, &unified_cos, &unified_sin, &adaln_input, i,
+                    &self.bundle, &block_w,
+                )?;
+            } else if use_checkpoint {
                 let h_c = h_state.clone();
                 let cos_c = unified_cos.clone();
                 let sin_c = unified_sin.clone();
@@ -1381,6 +1399,162 @@ fn block_forward_standalone(
     let ffn_out = add_lora(linear_no_bias(&h, "feed_forward.w2.weight")?, &h, LoraTarget::FfnW2)?;
     let ffn_post = rms_norm(&ffn_out, "ffn_norm2.weight")?;
     x.add(&gate_mlp.mul(&ffn_post)?)
+}
+
+/// Inference-mode block forward — fused kernels, no autograd requirements.
+///
+/// Mirrors inference-flame `zimage_nextdit.rs::transformer_block` but reads
+/// weights from the block-weight HashMap (same source as
+/// `block_forward_standalone`) and applies LoRA deltas at inference time.
+///
+/// Called from the forward loop when `!AutogradContext::is_recording()`.
+/// The training path continues to use `block_forward_standalone` unchanged
+/// so that gradient flow, checkpoint semantics, and LoRA training are
+/// unaffected.
+///
+/// # Fused ops used
+/// * `fused_rms_norm`          — `flame_core::ops::fused_inference`
+/// * `rope_fused_bf16`         — interleaved complex RoPE (Z-Image style)
+/// * `swiglu_fused_bf16`       — fused silu(w1)*w3
+/// * `gate_residual_fused_bf16`— fused x + tanh(gate)*residual
+///
+/// # linear_3d helper
+/// We must NOT call `fused_linear3d_native` here (EDv2 bug #6). Instead we
+/// use the `linear_3d` helper that does explicit reshape→matmul→reshape.
+fn block_forward_iflame(
+    x: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    adaln_input: &Tensor,
+    block_idx: usize,
+    bundle: &ZImageLoraBundle,
+    block_weights: &HashMap<String, Tensor>,
+) -> Result<Tensor> {
+    use flame_core::ops::fused_inference::fused_rms_norm;
+    use flame_core::bf16_ops::{gate_residual_fused_bf16, swiglu_fused_bf16};
+
+    // Weight accessor: `layers.{block_idx}.{suffix}`
+    let bw = |suffix: &str| -> Result<&Tensor> {
+        let key = format!("layers.{block_idx}.{suffix}");
+        block_weights.get(&key)
+            .ok_or_else(|| flame_core::Error::InvalidInput(format!("missing: {key}")))
+    };
+
+    // linear_3d: explicit reshape→matmul(W^T)→reshape.
+    // Weights arrive as [out, in] (PyTorch layout). We transpose once and
+    // matmul so the fused cuBLASLt path is NOT triggered (bug #6).
+    let linear_3d = |x: &Tensor, w: &Tensor| -> Result<Tensor> {
+        let dims = x.shape().dims().to_vec();
+        let m: usize = dims[..dims.len() - 1].iter().product();
+        let c = *dims.last().unwrap();
+        let x_2d = x.reshape(&[m, c])?;
+        let out = x_2d.matmul(&w.transpose()?)?;
+        let out_dim = *out.shape().dims().last().unwrap();
+        let mut new_dims = dims.clone();
+        *new_dims.last_mut().unwrap() = out_dim;
+        out.reshape(&new_dims)
+    };
+
+    // linear_3d with bias add.
+    let linear_3d_bias = |x: &Tensor, suffix_w: &str, suffix_b: &str| -> Result<Tensor> {
+        let out = linear_3d(x, bw(suffix_w)?)?;
+        out.add(bw(suffix_b)?)
+    };
+
+    // LoRA delta: adds LoRA output on top of base projection when an adapter
+    // exists for this block and target.
+    let add_lora = |base: Tensor, input: &Tensor, target: LoraTarget| -> Result<Tensor> {
+        if let Some(lora) = bundle.adapters.get(&(block_idx, target)) {
+            let delta = lora.forward_delta(&ensure_3d(input)?)
+                .map_err(|e| flame_core::FlameError::InvalidInput(
+                    format!("lora delta: {e}")))?;
+            base.add(&delta)
+        } else {
+            Ok(base)
+        }
+    };
+
+    // --- AdaLN modulation ---------------------------------------------------
+    // adaLN_modulation is ModuleList([Linear]) — NO SiLU, matching
+    // musubi-tuner `zimage_model.py:266`.
+    let mod_out = linear_3d_bias(adaln_input, "adaLN_modulation.0.weight", "adaLN_modulation.0.bias")?;
+    // mod_out shape: [B, 4*DIM] (2-D) or [1, B, 4*DIM] (3-D from ensure_3d).
+    // Squeeze batch-dim if ensure_3d added one so chunk splits on the right dim.
+    let mod_2d = if mod_out.shape().dims().len() == 3 && mod_out.shape().dims()[0] == 1 {
+        mod_out.squeeze(Some(0))?
+    } else {
+        mod_out
+    };
+    // Broadcast shape: [B, 1, 4*DIM] → chunk(4, 2) → each [B, 1, DIM].
+    let chunks = mod_2d.unsqueeze(1)?.chunk(4, 2)?;
+    let scale_msa = chunks[0].add_scalar(1.0)?;
+    let gate_msa  = chunks[1].tanh()?;
+    let scale_mlp = chunks[2].add_scalar(1.0)?;
+    let gate_mlp  = chunks[3].tanh()?;
+
+    // --- Attention branch ----------------------------------------------------
+    let dims = x.shape().dims().to_vec();
+    let (b, seq) = (dims[0], dims[1]);
+
+    // Pre-attn norm + scale modulation
+    let x_norm = fused_rms_norm(x, bw("attention_norm1.weight")?, NORM_EPS)?;
+    let x_mod  = x_norm.mul(&scale_msa)?;
+
+    // Fused QKV projection, then split
+    let qkv = linear_3d(&x_mod, bw("attention.qkv.weight")?)?;
+    let qkv_chunks = qkv.chunk(3, 2)?;
+    let q = add_lora(qkv_chunks[0].clone(), &x_mod, LoraTarget::AttnQ)?;
+    let k = add_lora(qkv_chunks[1].clone(), &x_mod, LoraTarget::AttnK)?;
+    let v = add_lora(qkv_chunks[2].clone(), &x_mod, LoraTarget::AttnV)?;
+
+    // Per-head QK RMSNorm (over head_dim=128, not full dim=3840).
+    // Flatten to [B*seq*heads, head_dim], norm, reshape back.
+    let q_flat = q.reshape(&[b * seq * NUM_HEADS, HEAD_DIM])?;
+    let k_flat = k.reshape(&[b * seq * NUM_HEADS, HEAD_DIM])?;
+    let q = fused_rms_norm(&q_flat, bw("attention.q_norm.weight")?, NORM_EPS)?
+        .reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?;
+    let k = fused_rms_norm(&k_flat, bw("attention.k_norm.weight")?, NORM_EPS)?
+        .reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?;
+    let v = v.reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?;
+
+    // Permute to [B, heads, seq, head_dim] for SDPA
+    let q = q.permute(&[0, 2, 1, 3])?;
+    let k = k.permute(&[0, 2, 1, 3])?;
+    let v = v.permute(&[0, 2, 1, 3])?;
+
+    // RoPE: Z-Image uses interleaved complex RoPE (rope_fused_bf16).
+    // cos/sin arrive as [1, seq, head_dim/2]; need [1, 1, seq, half] for the kernel.
+    let q = apply_rope_complex(&q, cos, sin)?;
+    let k = apply_rope_complex(&k, cos, sin)?;
+
+    // Scaled dot-product attention
+    let out = flame_core::attention::sdpa(&q, &k, &v, None)?;
+    let out = out.permute(&[0, 2, 1, 3])?.reshape(&[b, seq, DIM])?;
+
+    // Output projection + LoRA
+    let attn_out = add_lora(
+        linear_3d(&out, bw("attention.out.weight")?)?,
+        &out, LoraTarget::AttnOut,
+    )?;
+
+    // Post-attn norm + gated residual: x + tanh(gate_msa) * norm(attn_out)
+    let attn_post = fused_rms_norm(&attn_out, bw("attention_norm2.weight")?, NORM_EPS)?;
+    let x = gate_residual_fused_bf16(x, &gate_msa, &attn_post)?;
+
+    // --- FFN branch ----------------------------------------------------------
+    // Pre-FFN norm + scale modulation
+    let ffn_norm = fused_rms_norm(&x, bw("ffn_norm1.weight")?, NORM_EPS)?;
+    let ffn_mod  = ffn_norm.mul(&scale_mlp)?;
+
+    // SwiGLU: w2(silu(w1(x)) * w3(x)) with LoRA on each projection
+    let w1 = add_lora(linear_3d(&ffn_mod, bw("feed_forward.w1.weight")?)?, &ffn_mod, LoraTarget::FfnW1)?;
+    let w3 = add_lora(linear_3d(&ffn_mod, bw("feed_forward.w3.weight")?)?, &ffn_mod, LoraTarget::FfnW3)?;
+    let h  = swiglu_fused_bf16(&w1, &w3)?;
+    let ffn_out = add_lora(linear_3d(&h, bw("feed_forward.w2.weight")?)?, &h, LoraTarget::FfnW2)?;
+
+    // Post-FFN norm + gated residual: x + tanh(gate_mlp) * norm(ffn_out)
+    let ffn_post = fused_rms_norm(&ffn_out, bw("ffn_norm2.weight")?, NORM_EPS)?;
+    gate_residual_fused_bf16(&x, &gate_mlp, &ffn_post)
 }
 
 /// Apply complex RoPE (Z-Image style): interleaved (2i, 2i+1) pairs.

@@ -1012,19 +1012,19 @@ impl ChromaTrainingModel {
         let k = Tensor::cat(&[&txt_k, &img_k], 2)?;
         let v = Tensor::cat(&[&txt_v, &img_v], 2)?;
 
-        // RoPE
-        let q = flame_core::bf16_ops::rope_fused_bf16(&q, pe_cos, pe_sin)?;
-        let k = flame_core::bf16_ops::rope_fused_bf16(&k, pe_cos, pe_sin)?;
+        // RoPE — use autograd-recording wrapper so gradient flows through Q/K
+        // in both the no-swap training path and any future checkpoint path.
+        let q = rope_with_grad(&q, pe_cos, pe_sin)?;
+        let k = rope_with_grad(&k, pe_cos, pe_sin)?;
 
         // SDPA
         let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
-        let attn_out = attn_out.permute(&[0, 2, 1, 3])?; // [B, S_total, H, D]
-        let total_seq = n_t + n_img;
-        let attn_flat = attn_out.reshape(&[b, total_seq, DIM])?;
 
-        // Split back into txt and img
-        let txt_attn = attn_flat.narrow(1, 0, n_t)?;
-        let img_attn = attn_flat.narrow(1, n_t, n_img)?;
+        // Split attn_out [B,H,N_total,D] back into txt and img.
+        // Inference path: fused kernel (no autograd needed).
+        // Training path: falls back to narrow+permute+reshape inside the kernel.
+        let (txt_attn, img_attn) =
+            flame_core::bf16_ops::attn_split_txt_img_bf16(&attn_out, n_t, n_img)?;
 
         // Output projections
         let mut img_out = self.block_linear_bias(
@@ -1043,11 +1043,20 @@ impl ChromaTrainingModel {
         )?;
         txt_out = self.add_double_lora_delta(txt_out, &txt_attn, block_idx, DoubleLoraTarget::TxtOut)?;
 
-        // Gate + residual for attention
-        let img_gate1_unsq = img_gate1.unsqueeze(1)?;
-        let txt_gate1_unsq = txt_gate1.unsqueeze(1)?;
-        let img_r = img.add(&img_out.mul(&img_gate1_unsq)?)?;
-        let txt_r = txt.add(&txt_out.mul(&txt_gate1_unsq)?)?;
+        // Gate + residual for attention.
+        // Inference path: fused kernel. Training: falls back to elementwise.
+        let is_inference = !AutogradContext::is_recording();
+        let (img_r, txt_r) = if is_inference {
+            let img_r = flame_core::bf16_ops::gate_residual_fused_bf16(img, &img_gate1, &img_out)?;
+            let txt_r = flame_core::bf16_ops::gate_residual_fused_bf16(txt, &txt_gate1, &txt_out)?;
+            (img_r, txt_r)
+        } else {
+            let img_gate1_unsq = img_gate1.unsqueeze(1)?;
+            let txt_gate1_unsq = txt_gate1.unsqueeze(1)?;
+            let img_r = img.add(&img_out.mul(&img_gate1_unsq)?)?;
+            let txt_r = txt.add(&txt_out.mul(&txt_gate1_unsq)?)?;
+            (img_r, txt_r)
+        };
 
         // FFN: img
         let img_ffn_norm = Self::modulate_pre(&img_r, &img_shift2, &img_scale2)?;
@@ -1067,8 +1076,12 @@ impl ChromaTrainingModel {
         )?;
         img_ffn_out = self.add_double_lora_delta(img_ffn_out, &img_ffn_h, block_idx, DoubleLoraTarget::ImgFfnOut)?;
 
-        let img_gate2_unsq = img_gate2.unsqueeze(1)?;
-        let img_final = img_r.add(&img_ffn_out.mul(&img_gate2_unsq)?)?;
+        let img_final = if is_inference {
+            flame_core::bf16_ops::gate_residual_fused_bf16(&img_r, &img_gate2, &img_ffn_out)?
+        } else {
+            let img_gate2_unsq = img_gate2.unsqueeze(1)?;
+            img_r.add(&img_ffn_out.mul(&img_gate2_unsq)?)?
+        };
 
         // FFN: txt
         let txt_ffn_norm = Self::modulate_pre(&txt_r, &txt_shift2, &txt_scale2)?;
@@ -1088,8 +1101,12 @@ impl ChromaTrainingModel {
         )?;
         txt_ffn_out = self.add_double_lora_delta(txt_ffn_out, &txt_ffn_h, block_idx, DoubleLoraTarget::TxtFfnOut)?;
 
-        let txt_gate2_unsq = txt_gate2.unsqueeze(1)?;
-        let txt_final = txt_r.add(&txt_ffn_out.mul(&txt_gate2_unsq)?)?;
+        let txt_final = if is_inference {
+            flame_core::bf16_ops::gate_residual_fused_bf16(&txt_r, &txt_gate2, &txt_ffn_out)?
+        } else {
+            let txt_gate2_unsq = txt_gate2.unsqueeze(1)?;
+            txt_r.add(&txt_ffn_out.mul(&txt_gate2_unsq)?)?
+        };
 
         Ok((img_final, txt_final))
     }
@@ -1164,9 +1181,9 @@ impl ChromaTrainingModel {
         let q = Self::rms_norm_per_head(&q, self.sw_or(ext_weights, block_idx, "attn.norm_q.weight")?)?;
         let k = Self::rms_norm_per_head(&k, self.sw_or(ext_weights, block_idx, "attn.norm_k.weight")?)?;
 
-        // RoPE
-        let q = flame_core::bf16_ops::rope_fused_bf16(&q, pe_cos, pe_sin)?;
-        let k = flame_core::bf16_ops::rope_fused_bf16(&k, pe_cos, pe_sin)?;
+        // RoPE — use autograd-recording wrapper
+        let q = rope_with_grad(&q, pe_cos, pe_sin)?;
+        let k = rope_with_grad(&k, pe_cos, pe_sin)?;
 
         let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
         let attn_out = attn_out.permute(&[0, 2, 1, 3])?;
@@ -1182,8 +1199,13 @@ impl ChromaTrainingModel {
         )?;
         proj = self.add_single_lora_delta(proj, &combined, block_idx, SingleLoraTarget::ProjOut)?;
 
-        let gate_unsq = gate.unsqueeze(1)?;
-        x.add(&proj.mul(&gate_unsq)?)
+        // Gated residual — fused kernel for inference, elementwise for training.
+        if !AutogradContext::is_recording() {
+            flame_core::bf16_ops::gate_residual_fused_bf16(x, &gate, &proj)
+        } else {
+            let gate_unsq = gate.unsqueeze(1)?;
+            x.add(&proj.mul(&gate_unsq)?)
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1536,26 +1558,24 @@ fn double_block_fwd(
     let k = Tensor::cat(&[&txt_k, &img_k], 2)?;
     let v = Tensor::cat(&[&txt_v, &img_v], 2)?;
 
-    let q = flame_core::bf16_ops::rope_fused_bf16(&q, pe_cos, pe_sin)?;
-    let k = flame_core::bf16_ops::rope_fused_bf16(&k, pe_cos, pe_sin)?;
+    // rope_with_grad records Op::RoPePrecomputed so backward flows through Q/K.
+    let q = rope_with_grad(&q, pe_cos, pe_sin)?;
+    let k = rope_with_grad(&k, pe_cos, pe_sin)?;
 
     let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
-    let attn_out = attn_out.permute(&[0, 2, 1, 3])?;
-    let total_seq = n_t + n_img;
-    let attn_flat = attn_out.reshape(&[b, total_seq, DIM])?;
 
-    let txt_attn = attn_flat.narrow(1, 0, n_t)?;
-    let img_attn = attn_flat.narrow(1, n_t, n_img)?;
+    // attn_split_txt_img_bf16 falls back to narrow+permute+reshape when recording.
+    let (txt_attn, img_attn) =
+        flame_core::bf16_ops::attn_split_txt_img_bf16(&attn_out, n_t, n_img)?;
 
     let mut img_out = linear_bias_pt(&img_attn, get_w(weights, pfx, block_idx, "attn.to_out.0.weight")?, get_w(weights, pfx, block_idx, "attn.to_out.0.bias")?, pt)?;
     img_out = add_lora_delta_double(img_out, &img_attn, bundle, block_idx, DoubleLoraTarget::ImgOut)?;
     let mut txt_out = linear_bias_pt(&txt_attn, get_w(weights, pfx, block_idx, "attn.to_add_out.weight")?, get_w(weights, pfx, block_idx, "attn.to_add_out.bias")?, pt)?;
     txt_out = add_lora_delta_double(txt_out, &txt_attn, bundle, block_idx, DoubleLoraTarget::TxtOut)?;
 
-    let img_gate1_unsq = img_gate1.unsqueeze(1)?;
-    let txt_gate1_unsq = txt_gate1.unsqueeze(1)?;
-    let img_r = img.add(&img_out.mul(&img_gate1_unsq)?)?;
-    let txt_r = txt.add(&txt_out.mul(&txt_gate1_unsq)?)?;
+    // gate_residual_fused_bf16 records autograd (2026-04 fix); safe for training.
+    let img_r = flame_core::bf16_ops::gate_residual_fused_bf16(img, &img_gate1, &img_out)?;
+    let txt_r = flame_core::bf16_ops::gate_residual_fused_bf16(txt, &txt_gate1, &txt_out)?;
 
     // FFN img
     let img_ffn_norm = modulate_pre(&img_r, &img_shift2, &img_scale2)?;
@@ -1564,8 +1584,7 @@ fn double_block_fwd(
     let img_ffn_h = img_ffn_h.gelu()?;
     let mut img_ffn_out = linear_bias_pt(&img_ffn_h, get_w(weights, pfx, block_idx, "ff.net.2.weight")?, get_w(weights, pfx, block_idx, "ff.net.2.bias")?, pt)?;
     img_ffn_out = add_lora_delta_double(img_ffn_out, &img_ffn_h, bundle, block_idx, DoubleLoraTarget::ImgFfnOut)?;
-    let img_gate2_unsq = img_gate2.unsqueeze(1)?;
-    let img_final = img_r.add(&img_ffn_out.mul(&img_gate2_unsq)?)?;
+    let img_final = flame_core::bf16_ops::gate_residual_fused_bf16(&img_r, &img_gate2, &img_ffn_out)?;
 
     // FFN txt
     let txt_ffn_norm = modulate_pre(&txt_r, &txt_shift2, &txt_scale2)?;
@@ -1574,8 +1593,7 @@ fn double_block_fwd(
     let txt_ffn_h = txt_ffn_h.gelu()?;
     let mut txt_ffn_out = linear_bias_pt(&txt_ffn_h, get_w(weights, pfx, block_idx, "ff_context.net.2.weight")?, get_w(weights, pfx, block_idx, "ff_context.net.2.bias")?, pt)?;
     txt_ffn_out = add_lora_delta_double(txt_ffn_out, &txt_ffn_h, bundle, block_idx, DoubleLoraTarget::TxtFfnOut)?;
-    let txt_gate2_unsq = txt_gate2.unsqueeze(1)?;
-    let txt_final = txt_r.add(&txt_ffn_out.mul(&txt_gate2_unsq)?)?;
+    let txt_final = flame_core::bf16_ops::gate_residual_fused_bf16(&txt_r, &txt_gate2, &txt_ffn_out)?;
 
     Ok((img_final, txt_final))
 }
@@ -1623,8 +1641,9 @@ fn single_block_fwd(
     let q = rms_norm_head(&q, get_w(weights, pfx, block_idx, "attn.norm_q.weight")?)?;
     let k = rms_norm_head(&k, get_w(weights, pfx, block_idx, "attn.norm_k.weight")?)?;
 
-    let q = flame_core::bf16_ops::rope_fused_bf16(&q, pe_cos, pe_sin)?;
-    let k = flame_core::bf16_ops::rope_fused_bf16(&k, pe_cos, pe_sin)?;
+    // rope_with_grad records Op::RoPePrecomputed — needed for Q/K LoRA backward.
+    let q = rope_with_grad(&q, pe_cos, pe_sin)?;
+    let k = rope_with_grad(&k, pe_cos, pe_sin)?;
 
     let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
     let attn_out = attn_out.permute(&[0, 2, 1, 3])?;
@@ -1634,6 +1653,6 @@ fn single_block_fwd(
     let mut proj = linear_bias_pt(&combined, get_w(weights, pfx, block_idx, "proj_out.weight")?, get_w(weights, pfx, block_idx, "proj_out.bias")?, pt)?;
     proj = add_lora_delta_single(proj, &combined, bundle, block_idx, SingleLoraTarget::ProjOut)?;
 
-    let gate_unsq = gate.unsqueeze(1)?;
-    x.add(&proj.mul(&gate_unsq)?)
+    // gate_residual_fused_bf16 records autograd — safe for training.
+    flame_core::bf16_ops::gate_residual_fused_bf16(x, &gate, &proj)
 }
