@@ -289,7 +289,8 @@ impl QwenImageTrainingModel {
                     &path_refs, &QwenImageFacilitator, device.clone(),
                 )
             }
-            .map_err(|e| flame_core::Error::InvalidInput(format!("BlockOffloader: {e}")))?;
+            .map_err(|e| flame_core::Error::InvalidInput(format!("BlockOffloader: {e}")))?
+            .with_native_layout(true);
 
             log::info!("[qwenimage-trainer] BlockOffloader: {} blocks, {} shared weights",
                 offloader.block_count(), resident.len());
@@ -487,11 +488,23 @@ impl QwenImageTrainingModel {
         let (b, img_seq) = (dims[0], dims[1]);
         let txt_seq = txt_embed.shape().dims()[1];
 
-        // Precompute 3-axis RoPE (image + text)
+        // Precompute 3-axis RoPE (image + text). Per-stream tables are kept
+        // for the resident path (`self.dual_stream_block` legacy code); the
+        // BlockOffloader inference path uses the joint TXT-first
+        // concatenation below to feed `dual_stream_block_iflame` directly.
         let pack_h = latent_h / 2;
         let pack_w = latent_w / 2;
         let (img_cos, img_sin) = compute_image_rope(pack_h, pack_w, ROPE_THETA)?;
         let (txt_cos, txt_sin) = compute_text_rope(txt_seq, pack_h, pack_w, ROPE_THETA)?;
+        // Joint cos/sin in [txt, img] order — matches inference-flame's
+        // `build_rope_tables` and the `dual_stream_block_iflame` cat order.
+        // Shape: [1, 1, n_total, half] BF16, consumed by `rope_fused_bf16`.
+        let pe_cos = Tensor::cat(&[&txt_cos, &img_cos], 0)?
+            .unsqueeze(0)?
+            .unsqueeze(0)?;
+        let pe_sin = Tensor::cat(&[&txt_sin, &img_sin], 0)?
+            .unsqueeze(0)?
+            .unsqueeze(0)?;
 
         // Timestep embedding: sinusoidal(256) → Linear → SiLU → Linear
         let temb = sinusoidal_embedding(timestep, 256)?;
@@ -544,62 +557,110 @@ impl QwenImageTrainingModel {
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
 
+            // Two paths:
+            //   * Inference (`!is_recording()`): mirror inference-flame's
+            //     loop directly. `await_block` returns an `Arc<HashMap>` that
+            //     we pass straight into `dual_stream_block_iflame`; no
+            //     GPU-to-GPU `clone_block_weights`, no `Tensor::cat → narrow`
+            //     post-block round-trip. Slot reuse is gated by the
+            //     BlockOffloader's existing event tracking.
+            //   * Training (autograd recording): keep the legacy
+            //     `checkpoint_offload + clone_block_weights + cat→narrow`
+            //     path so the activation-offload pool and gradient
+            //     bookkeeping stay byte-identical to pre-port. Routes through
+            //     the **legacy** `dual_stream_block_standalone` for now — the
+            //     new fused-kernel forward needs a separate training-parity
+            //     pass before the train binary cuts over.
+            let is_inference = !flame_core::autograd::AutogradContext::is_recording();
+
             for i in 0..n_blocks {
-                let img_c = img.clone();
-                let txt_c = txt.clone();
-                let temb_c = temb.clone();
-                let ic = img_cos.clone();
-                let is_ = img_sin.clone();
-                let tc = txt_cos.clone();
-                let ts = txt_sin.clone();
-                let bundle_c = self.bundle.clone();
-                let off_clone = offloader_arc.clone();
+                if is_inference {
+                    // Inference fast path — bisect bug: route through the
+                    // verbatim iflame port (`dual_stream_block_iflame`).
+                    let raw = {
+                        let mut g = offloader_arc.lock()
+                            .map_err(|e| flame_core::Error::InvalidInput(
+                                format!("offloader lock (block {i}): {e}")
+                            ))?;
+                        g.await_block(i)
+                            .map_err(|e| flame_core::Error::InvalidInput(
+                                format!("await block {i}: {e}")
+                            ))?
+                    };
+                    if i + 1 < n_blocks {
+                        let mut g = offloader_arc.lock()
+                            .map_err(|e| flame_core::Error::InvalidInput(
+                                format!("offloader lock: {e}")
+                            ))?;
+                        g.prefetch_block(i + 1)
+                            .map_err(|e| flame_core::Error::InvalidInput(
+                                format!("prefetch {}: {e}", i + 1)
+                            ))?;
+                    }
+                    self.bundle.refresh_caches();
+                    let (new_img, new_txt) = dual_stream_block_iflame(
+                        &img, &txt, &temb, i,
+                        &pe_cos, &pe_sin,
+                        &img_cos, &img_sin, &txt_cos, &txt_sin,
+                        &raw, &self.bundle,
+                    )?;
+                    drop(raw);
+                    img = new_img;
+                    txt = new_txt;
+                } else {
+                    // Training path — unchanged from pre-port behavior.
+                    let img_c = img.clone();
+                    let txt_c = txt.clone();
+                    let temb_c = temb.clone();
+                    let ic = img_cos.clone();
+                    let is_ = img_sin.clone();
+                    let tc = txt_cos.clone();
+                    let ts = txt_sin.clone();
+                    let bundle_c = self.bundle.clone();
+                    let off_clone = offloader_arc.clone();
 
-                let block_out = flame_core::autograd::AutogradContext::checkpoint_offload(
-                    &[img_c.clone(), txt_c.clone()],
-                    move || {
-                        // Lock briefly to fetch the block's weight Arc, then
-                        // release before doing the heavy compute.
-                        let raw = {
-                            let mut g = off_clone.lock()
-                                .map_err(|e| flame_core::Error::InvalidInput(
-                                    format!("offloader lock (block {i}): {e}")
-                                ))?;
-                            g.await_block(i)
-                                .map_err(|e| flame_core::Error::InvalidInput(
-                                    format!("await block {i}: {e}")
-                                ))?
-                        };
-                        let weights = clone_block_weights(&raw)?;
-                        // Drop the slot's Arc handle now; weights holds its
-                        // own GPU clones.
-                        drop(raw);
+                    let block_out = flame_core::autograd::AutogradContext::checkpoint_offload(
+                        &[img_c.clone(), txt_c.clone()],
+                        move || {
+                            let raw = {
+                                let mut g = off_clone.lock()
+                                    .map_err(|e| flame_core::Error::InvalidInput(
+                                        format!("offloader lock (block {i}): {e}")
+                                    ))?;
+                                g.await_block(i)
+                                    .map_err(|e| flame_core::Error::InvalidInput(
+                                        format!("await block {i}: {e}")
+                                    ))?
+                            };
+                            let weights = clone_block_weights(&raw)?;
+                            drop(raw);
 
-                        bundle_c.refresh_caches();
-                        let (new_img, new_txt) = dual_stream_block_standalone(
-                            &img_c, &txt_c, &temb_c, i,
-                            &ic, &is_, &tc, &ts,
-                            &weights, &bundle_c,
-                        )?;
-                        // weights drops here, freeing this block's ~648 MB
-                        // GPU memory before the next block runs.
-                        Tensor::cat(&[&new_img, &new_txt], 1)
-                    },
-                )?;
+                            bundle_c.refresh_caches();
+                            let (new_img, new_txt) = dual_stream_block_standalone(
+                                &img_c, &txt_c, &temb_c, i,
+                                &ic, &is_, &tc, &ts,
+                                &weights, &bundle_c,
+                            )?;
+                            Tensor::cat(&[&new_img, &new_txt], 1)
+                        },
+                    )?;
 
-                // Prefetch the next block now that this block's forward is
-                // done — H2D overlaps with the post-block tensor split.
-                if i + 1 < n_blocks {
-                    let mut g = offloader_arc.lock()
-                        .map_err(|e| flame_core::Error::InvalidInput(format!("offloader lock: {e}")))?;
-                    g.prefetch_block(i + 1)
-                        .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch {}: {e}", i+1)))?;
+                    if i + 1 < n_blocks {
+                        let mut g = offloader_arc.lock()
+                            .map_err(|e| flame_core::Error::InvalidInput(
+                                format!("offloader lock: {e}")
+                            ))?;
+                        g.prefetch_block(i + 1)
+                            .map_err(|e| flame_core::Error::InvalidInput(
+                                format!("prefetch {}: {e}", i + 1)
+                            ))?;
+                    }
+
+                    let img_seq_len = img.shape().dims()[1];
+                    let txt_seq_len = txt.shape().dims()[1];
+                    img = block_out.narrow(1, 0, img_seq_len)?;
+                    txt = block_out.narrow(1, img_seq_len, txt_seq_len)?;
                 }
-
-                let img_seq_len = img.shape().dims()[1];
-                let txt_seq_len = txt.shape().dims()[1];
-                img = block_out.narrow(1, 0, img_seq_len)?;
-                txt = block_out.narrow(1, img_seq_len, txt_seq_len)?;
 
                 if i % 10 == 0 || i == n_blocks - 1 {
                     log::info!("[qwenimage-trainer] block {}/{n_blocks}", i + 1);
@@ -1394,6 +1455,265 @@ fn dual_stream_block_standalone(
         matmul_bias(&txt_ffn_act, bw("txt_mlp.net.2.weight")?, Some(bw("txt_mlp.net.2.bias")?))?,
         &txt_ffn_act, LoraTarget::TxtFfnDown)?;
     let txt = txt.add(&txt_chunks[5].mul(&txt_ffn_down)?)?;
+
+    Ok((img, txt))
+}
+
+// ---------------------------------------------------------------------------
+// Verbatim port of `inference-flame::qwenimage_dit::block_forward`
+// (qwenimage_dit.rs:1003-1197). Replaces `dual_stream_block_standalone`
+// when the BlockOffloader is constructed with `.with_native_layout(true)`.
+//
+// Differences from the legacy `dual_stream_block_standalone`:
+//   * Linear ops use `flame_core::ops::fused_inference::fused_linear3d_native`,
+//     which expects PyTorch-native `[Cout, Cin]` layout (caller must
+//     opt-in via `BlockOffloader::with_native_layout(true)`).
+//   * Joint q/k/v are concatenated `[txt, img]` (txt first), matching
+//     diffusers + inference-flame. `attn_out` is split with the same order.
+//   * RoPE is applied AFTER the joint concat using `rope_fused_bf16` over
+//     the joint `pe_cos / pe_sin` (shape `[1, 1, n_total, total_half]`
+//     BF16). The caller is responsible for supplying joint cos/sin in
+//     txt-first order (use `compute_joint_rope_pe` below).
+//   * RMS norm and LayerNorm-no-affine route through
+//     `cuda_ops_bf16::rms_norm_bf16` / `layer_norm_bf16` directly, matching
+//     inference-flame's `Self::rms_norm` / `Self::layer_norm_no_affine`.
+//
+// LoRA adaptation: inference-flame uses a `LoraStack::apply(full_key, ...)`
+// scheme keyed by full weight path. EDv2 uses `QwenImageLoraBundle.adapters`
+// keyed by `(block_idx, LoraTarget)`. This port translates each
+// `lin_lora` call site's weight suffix into the matching `LoraTarget` and
+// applies the bundle's `LoRALinear::forward_delta` exactly as the legacy
+// `add_lora` closure did.
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn dual_stream_block_iflame(
+    img: &Tensor,
+    txt: &Tensor,
+    temb: &Tensor,
+    block_idx: usize,
+    pe_cos: &Tensor,
+    pe_sin: &Tensor,
+    img_cos: &Tensor,
+    img_sin: &Tensor,
+    txt_cos: &Tensor,
+    txt_sin: &Tensor,
+    weights: &HashMap<String, Tensor>,
+    bundle: &QwenImageLoraBundle,
+) -> Result<(Tensor, Tensor)> {
+    use flame_core::ops::fused_inference::fused_linear3d_native;
+
+    let h = NUM_HEADS;
+    let d = HEAD_DIM;
+    let dim = DIM;
+    let prefix = format!("transformer_blocks.{block_idx}");
+
+    let w = |suffix: &str| -> Result<&Tensor> {
+        let key = format!("{prefix}.{suffix}");
+        weights.get(&key)
+            .ok_or_else(|| flame_core::Error::InvalidInput(format!("Missing: {key}")))
+    };
+
+    // BISECT: replaced `fused_linear3d_native` with legacy-style explicit
+    // transpose + matmul + add. Weight stored as `[Cout, Cin]` (native_layout
+    // is true on offloader), so transpose to `[Cin, Cout]` for matmul.
+    // Tests whether the cuBLASLt TRANSA=T path has a precision quirk under
+    // EDv2's specific shapes that the explicit-transpose path doesn't.
+    let linear_bias =
+        |x: &Tensor, weight: &Tensor, bias: &Tensor| -> Result<Tensor> {
+            let _ = fused_linear3d_native;
+            let dims = x.shape().dims().to_vec();
+            let in_feat = *dims.last().unwrap();
+            let batch: usize = dims[..dims.len()-1].iter().product();
+            let wt = weight.transpose()?.contiguous()?;
+            let out_feat = wt.shape().dims()[1];
+            let x_2d = x.reshape(&[batch, in_feat])?;
+            let mut out = x_2d.matmul(&wt)?;
+            out = out.add(bias)?;
+            let mut out_shape = dims[..dims.len()-1].to_vec();
+            out_shape.push(out_feat);
+            out.reshape(&out_shape)
+        };
+
+    // LoRA adapter: maps the inference-flame weight suffix to EDv2's
+    // `LoraTarget` enum and applies `forward_delta` if a per-block adapter
+    // exists. Returns the base linear output unchanged when no adapter.
+    let lin_lora = |x: &Tensor, w_suffix: &str, b_suffix: &str| -> Result<Tensor> {
+        let weight = w(w_suffix)?;
+        let bias = w(b_suffix)?;
+        let base = linear_bias(x, weight, bias)?;
+        let target = match w_suffix {
+            "attn.to_q.weight" => Some(LoraTarget::ImgQ),
+            "attn.to_k.weight" => Some(LoraTarget::ImgK),
+            "attn.to_v.weight" => Some(LoraTarget::ImgV),
+            "attn.to_out.0.weight" => Some(LoraTarget::ImgOut),
+            "img_mlp.net.0.proj.weight" => Some(LoraTarget::ImgFfnUp),
+            "img_mlp.net.2.weight" => Some(LoraTarget::ImgFfnDown),
+            "attn.add_q_proj.weight" => Some(LoraTarget::TxtQ),
+            "attn.add_k_proj.weight" => Some(LoraTarget::TxtK),
+            "attn.add_v_proj.weight" => Some(LoraTarget::TxtV),
+            "attn.to_add_out.weight" => Some(LoraTarget::TxtOut),
+            "txt_mlp.net.0.proj.weight" => Some(LoraTarget::TxtFfnUp),
+            "txt_mlp.net.2.weight" => Some(LoraTarget::TxtFfnDown),
+            _ => None,
+        };
+        if let Some(target) = target {
+            if let Some(lora) = bundle.adapters.get(&(block_idx, target)) {
+                let input_3d = if x.shape().dims().len() == 2 { x.unsqueeze(0)? } else { x.clone() };
+                let delta = lora.forward_delta(&input_3d)?;
+                return base.add(&delta);
+            }
+        }
+        Ok(base)
+    };
+
+    // RMS norm matching inference-flame's `Self::rms_norm`: reshape to 2D,
+    // call `cuda_ops_bf16::rms_norm_bf16(x_2d, Some(scale), eps)`, reshape
+    // back. Used for QK head-norm.
+    let rms_norm_iflame = |x: &Tensor, scale: &Tensor, eps: f32| -> Result<Tensor> {
+        let dims = x.shape().dims().to_vec();
+        let hidden = *dims.last().unwrap();
+        let batch: usize = dims[..dims.len() - 1].iter().product();
+        let x_2d = x.reshape(&[batch, hidden])?;
+        let out = flame_core::cuda_ops_bf16::rms_norm_bf16(&x_2d, Some(scale), eps)?;
+        out.reshape(&dims)
+    };
+
+    // LayerNorm without affine, matching inference-flame's
+    // `Self::layer_norm_no_affine`. Used for the per-stream pre-attn /
+    // pre-FFN norm; the gain+bias comes from the adaptive modulation
+    // (img_scale1/shift1, etc).
+    let layer_norm_no_affine = |x: &Tensor, eps: f32| -> Result<Tensor> {
+        let dims = x.shape().dims().to_vec();
+        let hidden = *dims.last().unwrap();
+        let batch: usize = dims[..dims.len() - 1].iter().product();
+        let x_2d = x.reshape(&[batch, hidden])?;
+        let out = flame_core::cuda_ops_bf16::layer_norm_bf16(&x_2d, None, None, eps)?;
+        out.reshape(&dims)
+    };
+
+    let b = img.shape().dims()[0];
+    let n_img = img.shape().dims()[1];
+    let n_txt = txt.shape().dims()[1];
+
+    // ── img_mod(temb) and txt_mod(temb) ──
+    // nn.Sequential(SiLU, Linear(dim, 6*dim))
+    //
+    // `temb` arrives as [B, dim]. The Linear expects 3D input; unsqueeze to
+    // [B, 1, dim] and squeeze back.
+    let temb_silu = temb.silu()?;
+    let img_mods = lin_lora(&temb_silu.unsqueeze(1)?, "img_mod.1.weight", "img_mod.1.bias")?
+        .squeeze(Some(1))?;
+    let txt_mods = lin_lora(&temb_silu.unsqueeze(1)?, "txt_mod.1.weight", "txt_mod.1.bias")?
+        .squeeze(Some(1))?;
+    // Split each into two halves (norm1, norm2), each 3*dim:
+    //   [shift, scale, gate] for norm1 and then [shift, scale, gate] for norm2.
+    let img_mod1 = img_mods.narrow(1, 0, 3 * dim)?;
+    let img_mod2 = img_mods.narrow(1, 3 * dim, 3 * dim)?;
+    let txt_mod1 = txt_mods.narrow(1, 0, 3 * dim)?;
+    let txt_mod2 = txt_mods.narrow(1, 3 * dim, 3 * dim)?;
+
+    let img_shift1 = img_mod1.narrow(1, 0, dim)?;
+    let img_scale1 = img_mod1.narrow(1, dim, dim)?;
+    let img_gate1  = img_mod1.narrow(1, 2 * dim, dim)?;
+    let img_shift2 = img_mod2.narrow(1, 0, dim)?;
+    let img_scale2 = img_mod2.narrow(1, dim, dim)?;
+    let img_gate2  = img_mod2.narrow(1, 2 * dim, dim)?;
+
+    let txt_shift1 = txt_mod1.narrow(1, 0, dim)?;
+    let txt_scale1 = txt_mod1.narrow(1, dim, dim)?;
+    let txt_gate1  = txt_mod1.narrow(1, 2 * dim, dim)?;
+    let txt_shift2 = txt_mod2.narrow(1, 0, dim)?;
+    let txt_scale2 = txt_mod2.narrow(1, dim, dim)?;
+    let txt_gate2  = txt_mod2.narrow(1, 2 * dim, dim)?;
+
+    // ── norm1 + modulate for both streams ──
+    //   norm(x) * (1 + scale)[:, None] + shift[:, None]
+    let img_normed = layer_norm_no_affine(img, NORM_EPS)?;
+    let img_modulated = img_normed
+        .mul(&img_scale1.add_scalar(1.0)?.unsqueeze(1)?)?
+        .add(&img_shift1.unsqueeze(1)?)?;
+
+    let txt_normed = layer_norm_no_affine(txt, NORM_EPS)?;
+    let txt_modulated = txt_normed
+        .mul(&txt_scale1.add_scalar(1.0)?.unsqueeze(1)?)?
+        .add(&txt_shift1.unsqueeze(1)?)?;
+
+    // ── Q/K/V projections — keep the legacy [B, S, H, D] layout (NOT
+    // pre-permuted to [B, H, N, D]) so we can match legacy's per-stream
+    // apply_rope. Joint attention then cats and permutes once.
+    let img_q = lin_lora(&img_modulated, "attn.to_q.weight", "attn.to_q.bias")?
+        .reshape(&[b, n_img, h, d])?;
+    let img_k = lin_lora(&img_modulated, "attn.to_k.weight", "attn.to_k.bias")?
+        .reshape(&[b, n_img, h, d])?;
+    let img_v = lin_lora(&img_modulated, "attn.to_v.weight", "attn.to_v.bias")?
+        .reshape(&[b, n_img, h, d])?;
+
+    let txt_q = lin_lora(&txt_modulated, "attn.add_q_proj.weight", "attn.add_q_proj.bias")?
+        .reshape(&[b, n_txt, h, d])?;
+    let txt_k = lin_lora(&txt_modulated, "attn.add_k_proj.weight", "attn.add_k_proj.bias")?
+        .reshape(&[b, n_txt, h, d])?;
+    let txt_v = lin_lora(&txt_modulated, "attn.add_v_proj.weight", "attn.add_v_proj.bias")?
+        .reshape(&[b, n_txt, h, d])?;
+
+    // ── QK RMSNorm — legacy `rms_norm_per_head` operates on
+    // [B, S, H*D] (pre-reshape) and reshapes to [B*S*H, D] internally;
+    // we already have [B, S, H, D], so route through the same kernel
+    // family by collapsing to 2D over the head dim.
+    let img_q = rms_norm_iflame(&img_q, w("attn.norm_q.weight")?, NORM_EPS)?;
+    let img_k = rms_norm_iflame(&img_k, w("attn.norm_k.weight")?, NORM_EPS)?;
+    let txt_q = rms_norm_iflame(&txt_q, w("attn.norm_added_q.weight")?, NORM_EPS)?;
+    let txt_k = rms_norm_iflame(&txt_k, w("attn.norm_added_k.weight")?, NORM_EPS)?;
+
+    // ── Apply RoPE per-stream (legacy style) — bisect from joint
+    // `rope_fused_bf16` to verify whether the joint-RoPE path is buggy.
+    // pe_cos / pe_sin args are unused in this mode.
+    let _ = (pe_cos, pe_sin);
+    let img_q = apply_rope(&img_q, img_cos, img_sin)?;
+    let img_k = apply_rope(&img_k, img_cos, img_sin)?;
+    let txt_q = apply_rope(&txt_q, txt_cos, txt_sin)?;
+    let txt_k = apply_rope(&txt_k, txt_cos, txt_sin)?;
+
+    // ── Concat img + txt (legacy order) and permute to joint attn shape ──
+    let q = Tensor::cat(&[&img_q, &txt_q], 1)?.permute(&[0, 2, 1, 3])?;
+    let k = Tensor::cat(&[&img_k, &txt_k], 1)?.permute(&[0, 2, 1, 3])?;
+    let v = Tensor::cat(&[&img_v, &txt_v], 1)?.permute(&[0, 2, 1, 3])?;
+
+    // ── Joint SDPA ──
+    let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
+
+    // ── Split img + txt back out (legacy order; matches the cat above) ──
+    let total_n = n_txt + n_img;
+    let attn_2d = attn_out.permute(&[0, 2, 1, 3])?.reshape(&[b, total_n, dim])?;
+    let img_attn = attn_2d.narrow(1, 0, n_img)?;
+    let txt_attn = attn_2d.narrow(1, n_img, n_txt)?;
+
+    let img_attn = lin_lora(&img_attn, "attn.to_out.0.weight", "attn.to_out.0.bias")?;
+    let txt_attn = lin_lora(&txt_attn, "attn.to_add_out.weight", "attn.to_add_out.bias")?;
+
+    // ── Gated residual (using gate1) ──
+    let img = img.add(&img_gate1.unsqueeze(1)?.mul(&img_attn)?)?;
+    let txt = txt.add(&txt_gate1.unsqueeze(1)?.mul(&txt_attn)?)?;
+
+    // ── FFN path for img ──
+    let img_normed2 = layer_norm_no_affine(&img, NORM_EPS)?;
+    let img_mlp_in = img_normed2
+        .mul(&img_scale2.add_scalar(1.0)?.unsqueeze(1)?)?
+        .add(&img_shift2.unsqueeze(1)?)?;
+    let img_mlp = lin_lora(&img_mlp_in, "img_mlp.net.0.proj.weight", "img_mlp.net.0.proj.bias")?;
+    let img_mlp = img_mlp.gelu()?;
+    let img_mlp = lin_lora(&img_mlp, "img_mlp.net.2.weight", "img_mlp.net.2.bias")?;
+    let img = img.add(&img_gate2.unsqueeze(1)?.mul(&img_mlp)?)?;
+
+    // ── FFN path for txt ──
+    let txt_normed2 = layer_norm_no_affine(&txt, NORM_EPS)?;
+    let txt_mlp_in = txt_normed2
+        .mul(&txt_scale2.add_scalar(1.0)?.unsqueeze(1)?)?
+        .add(&txt_shift2.unsqueeze(1)?)?;
+    let txt_mlp = lin_lora(&txt_mlp_in, "txt_mlp.net.0.proj.weight", "txt_mlp.net.0.proj.bias")?;
+    let txt_mlp = txt_mlp.gelu()?;
+    let txt_mlp = lin_lora(&txt_mlp, "txt_mlp.net.2.weight", "txt_mlp.net.2.bias")?;
+    let txt = txt.add(&txt_gate2.unsqueeze(1)?.mul(&txt_mlp)?)?;
 
     Ok((img, txt))
 }

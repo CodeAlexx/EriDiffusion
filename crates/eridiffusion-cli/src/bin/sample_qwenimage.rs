@@ -77,22 +77,37 @@ fn main() -> anyhow::Result<()> {
     let te = Qwen25VLEncoder::new(te_weights, te_cfg, device.clone());
 
     let encode = |text: &str| -> anyhow::Result<Tensor> {
-        // Wrap in PROMPT_TEMPLATE_ENCODE then drop system-prompt prefix —
-        // matches prepare_qwenimage and train_qwenimage exactly.
+        // Wrap in PROMPT_TEMPLATE_ENCODE, then drop the leading system
+        // prompt and TRIM trailing pad tokens — matches inference-flame's
+        // `qwenimage_encode::encode_and_trim` (qwenimage_encode.rs:92-115).
+        // The diffusers QwenImage DiT was trained with variable-length
+        // text embeddings; padding the embedding to a fixed `max_text_len`
+        // pollutes joint attention with junk pad-token hidden states and
+        // produces noise-only output. Trim back to the actual content
+        // length (real tokens − DROP_IDX) before returning.
         let wrapped = format!("{PROMPT_PREFIX}{text}{PROMPT_SUFFIX}");
         let enc = tokenizer.encode(wrapped, false)
             .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
         let raw_ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
         let work_len = args.max_text_len + DROP_IDX;
         let mut ids: Vec<i32> = raw_ids.iter().take(work_len).copied().collect();
+        let real_len_pre_pad = ids.len();
         ids.resize(work_len, QWEN_PAD_ID);
+        let real_len = real_len_pre_pad.min(work_len);
+        if real_len <= DROP_IDX {
+            anyhow::bail!(
+                "prompt tokenized to only {real_len} ids; expected > {DROP_IDX} after PROMPT_TEMPLATE_ENCODE wrap"
+            );
+        }
+        let kept_len = real_len - DROP_IDX;
         let full_hidden = te.encode(&ids)?.to_dtype(DType::BF16)?;
-        full_hidden.narrow(1, DROP_IDX, args.max_text_len)
+        full_hidden.narrow(1, DROP_IDX, kept_len)
             .map_err(|e| anyhow::anyhow!("narrow: {e}"))
     };
 
     log::info!("[2/4] Encoding prompt + negative prompt...");
     let cond = encode(&args.prompt)?;
+    log::info!("  cond shape={:?}", cond.shape().dims());
     let uncond = if args.cfg > 1.0 {
         Some(encode(&args.negative_prompt)?)
     } else {

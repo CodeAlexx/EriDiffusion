@@ -142,24 +142,38 @@ fn main() -> anyhow::Result<()> {
 
         // ── Caption → Qwen2.5-VL hidden state with PROPER template ───────
         // Wrap the caption in the qwen-image PROMPT_TEMPLATE_ENCODE, encode,
-        // then drop the system-prompt prefix (DROP_IDX tokens). The DiT was
-        // trained against this exact slice — feeding it raw or full
-        // template embeddings produces out-of-distribution conditioning.
+        // drop the system-prompt prefix (DROP_IDX tokens), and TRIM trailing
+        // pad-token hidden states. The DiT was trained against variable-
+        // length text embeddings (per-prompt content length), so padding
+        // every prompt to a fixed `max_text_len` pollutes joint attention
+        // with junk pad-token hiddens — the DiT learns to attend to
+        // padding noise. Mirrors inference-flame's
+        // `qwenimage_encode::encode_and_trim` (qwenimage_encode.rs:92-115).
         let caption = std::fs::read_to_string(txt_path).unwrap_or_default();
         let caption = caption.trim();
         let wrapped = format!("{PROMPT_PREFIX}{caption}{PROMPT_SUFFIX}");
         let enc = tokenizer.encode(wrapped, false)
             .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
         let raw_ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
-        // Pad/truncate to (max_text_len + DROP_IDX) so post-drop length is
-        // exactly max_text_len.
+        // Pad/truncate to (max_text_len + DROP_IDX). `real_len` is the
+        // pre-pad length (capped at `work_len`); we narrow the encoder
+        // output to `[1, real_len - DROP_IDX, 3584]` so trailing pad
+        // tokens are dropped from the saved cache.
         let work_len = args.max_text_len + DROP_IDX;
         let mut ids: Vec<i32> = raw_ids.iter().take(work_len).copied().collect();
+        let real_len_pre_pad = ids.len();
         ids.resize(work_len, QWEN_PAD_ID);
+        let real_len = real_len_pre_pad.min(work_len);
+        if real_len <= DROP_IDX {
+            anyhow::bail!(
+                "caption tokenized to only {real_len} ids; expected > {DROP_IDX} after PROMPT_TEMPLATE_ENCODE wrap"
+            );
+        }
+        let kept_len = real_len - DROP_IDX;
         // Encode: [1, work_len, 3584]
         let full_hidden = te.encode(&ids)?.to_dtype(DType::BF16)?;
-        // Drop the system-prompt prefix → [1, max_text_len, 3584]
-        let text_hidden = full_hidden.narrow(1, DROP_IDX, args.max_text_len)?;
+        // Drop system-prompt prefix + trailing pads → [1, kept_len, 3584]
+        let text_hidden = full_hidden.narrow(1, DROP_IDX, kept_len)?;
 
         let mut tensors: HashMap<String, Tensor> = HashMap::new();
         tensors.insert("latent".into(), latent.to_dtype(DType::BF16)?);

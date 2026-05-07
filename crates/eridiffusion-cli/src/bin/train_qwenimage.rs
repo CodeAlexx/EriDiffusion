@@ -180,17 +180,28 @@ fn main() -> anyhow::Result<()> {
 
         let encode_one = |text: &str| -> anyhow::Result<Tensor> {
             // Match prepare_qwenimage's PROMPT_TEMPLATE_ENCODE wrap +
-            // DROP_IDX slice. Training-time prompt encoding MUST match
-            // sample-time prompt encoding or the DiT sees OOD conditioning.
+            // DROP_IDX slice + trailing-pad trim. The DiT was trained
+            // against variable-length text embeddings (per-prompt content
+            // length); padding to a fixed `sample_max_text_len` would
+            // pollute joint attention with junk pad-token hiddens. Mirrors
+            // inference-flame's `qwenimage_encode::encode_and_trim`.
             let wrapped = format!("{PROMPT_PREFIX}{text}{PROMPT_SUFFIX}");
             let enc = tok.encode(wrapped, false)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let raw_ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
             let work_len = args.sample_max_text_len + DROP_IDX;
             let mut ids: Vec<i32> = raw_ids.iter().take(work_len).copied().collect();
+            let real_len_pre_pad = ids.len();
             ids.resize(work_len, QWEN_PAD_ID);
+            let real_len = real_len_pre_pad.min(work_len);
+            if real_len <= DROP_IDX {
+                anyhow::bail!(
+                    "sample prompt tokenized to only {real_len} ids; expected > {DROP_IDX} after PROMPT_TEMPLATE_ENCODE wrap"
+                );
+            }
+            let kept_len = real_len - DROP_IDX;
             let full_hidden = te.encode(&ids)?.to_dtype(DType::BF16)?;
-            full_hidden.narrow(1, DROP_IDX, args.sample_max_text_len)
+            full_hidden.narrow(1, DROP_IDX, kept_len)
                 .map_err(|e| anyhow::anyhow!("narrow: {e}"))
         };
         let cond_1 = encode_one(&p1)?;
