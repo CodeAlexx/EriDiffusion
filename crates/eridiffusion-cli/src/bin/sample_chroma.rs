@@ -32,7 +32,13 @@ const DEFAULT_T5_TOKENIZER: &str =
 /// Chroma uses fixed T5 padding to 256 tokens (not 512) — shorter is fine
 /// because the training model's forward always uses the full token sequence
 /// length as passed in. Chroma trains against fixed-length padding.
-const T5_SEQ_LEN: usize = 256;
+// Match inference-flame's chroma_gen / chroma_encode (both use 512). T5
+// attends to pad tokens, so different total seq lengths produce different
+// real-token outputs even for short prompts. Pre-fix at 256, the encoded
+// cond differed from chroma1-HD's expected distribution and produced
+// content-dependent glitches (some prompts denoised cleanly, others
+// collapsed into striped/speckle output).
+const T5_SEQ_LEN: usize = 512;
 
 /// FLUX VAE constants — Chroma uses the same VAE as FLUX.
 const AE_IN_CHANNELS: usize = 16;
