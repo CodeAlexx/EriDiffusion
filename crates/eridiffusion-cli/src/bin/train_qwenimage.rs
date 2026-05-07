@@ -26,6 +26,17 @@ use std::path::PathBuf;
 
 const SEED_DEFAULT: u64 = 42;
 const QWEN_PAD_ID: i32 = 151643;
+/// Qwen-Image canonical prompt template (`pipeline_qwenimage.py::
+/// PROMPT_TEMPLATE_ENCODE`). The DiT was trained against text embeddings
+/// produced by this template; raw captions = OOD conditioning.
+const PROMPT_PREFIX: &str =
+    "<|im_start|>system\nDescribe the image by detailing the color, shape, size, \
+     texture, quantity, text, spatial relationships of the objects and background:\
+     <|im_end|>\n<|im_start|>user\n";
+const PROMPT_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n";
+/// Drop the system-prompt prefix (matches Python
+/// `PROMPT_TEMPLATE_ENCODE_START_IDX`).
+const DROP_IDX: usize = 34;
 
 #[derive(Parser)]
 struct Args {
@@ -55,12 +66,17 @@ struct Args {
     #[arg(long, default_value_t = SEED_DEFAULT)] seed: u64,
 
     // ── Periodic-sample (mirrors train_ernie pattern) ─────────────────────
-    /// Render a sample every N steps. `0` disables. ALWAYS renders a
-    /// step-0 baseline (LoRA = identity, so this captures base-model output)
-    /// when > 0, plus every N steps thereafter, plus a final sample at the
-    /// end of training. Per-sample cost: ~30s + denoise time.
+    /// Render samples every N steps. `0` disables. When > 0: renders a
+    /// step-0 baseline (LoRA = identity, base-model output for sanity
+    /// check), then every N steps, then a final sample after training.
+    /// Two prompts are rendered each time so we see both pose/style
+    /// variations as the LoRA imprints. Per-sample cost: ~30s + denoise.
     #[arg(long, default_value = "0")] sample_every: usize,
-    #[arg(long, default_value = "")] sample_prompt: String,
+    /// First prompt — caption-style with the LoRA trigger word.
+    #[arg(long)] sample_prompt_1: Option<String>,
+    /// Second prompt — different scene/outfit but same trigger word style.
+    #[arg(long)] sample_prompt_2: Option<String>,
+    /// Negative prompt (shared across both prompts). Empty disables uncond.
     #[arg(long, default_value = "")] sample_neg_prompt: String,
     /// `qwen_image_vae.safetensors` (wan21 internal-key format) for the
     /// in-process VAE decode. Required if --sample-every > 0.
@@ -70,8 +86,10 @@ struct Args {
     #[arg(long)] sample_text_encoder: Option<PathBuf>,
     /// `tokenizer.json` for Qwen2.5-VL. Required if --sample-every > 0.
     #[arg(long)] sample_tokenizer: Option<PathBuf>,
-    #[arg(long, default_value = "512")] sample_size: usize,
-    #[arg(long, default_value = "20")] sample_steps: usize,
+    #[arg(long, default_value = "1024")] sample_size: usize,
+    /// Inference-flame's qwenimage_gen defaults to 50 steps; lower (20) shows
+    /// visible texture artifacts at 1024² even with norm-rescaled CFG.
+    #[arg(long, default_value = "50")] sample_steps: usize,
     #[arg(long, default_value = "4.0")] sample_cfg: f32,
     #[arg(long, default_value = "42")] sample_seed: u64,
     #[arg(long, default_value_t = 512)] sample_max_text_len: usize,
@@ -138,13 +156,19 @@ fn main() -> anyhow::Result<()> {
     // So pre-encode prompts NOW (TE only resident on GPU), drop the TE, then
     // load DiT into the freed memory. Mirrors train_ernie with order swapped.
     let periodic_sample = args.sample_every > 0;
-    let (sample_cond, sample_uncond, sample_vae_path) = if periodic_sample {
+    let (sample_cond_1, sample_cond_2, sample_uncond, sample_vae_path) = if periodic_sample {
         let te_path = args.sample_text_encoder.as_ref()
             .ok_or_else(|| anyhow::anyhow!("--sample-every > 0 requires --sample-text-encoder"))?;
         let tok_path = args.sample_tokenizer.as_ref()
             .ok_or_else(|| anyhow::anyhow!("--sample-every > 0 requires --sample-tokenizer"))?;
         let vae_path = args.sample_vae.as_ref()
             .ok_or_else(|| anyhow::anyhow!("--sample-every > 0 requires --sample-vae"))?
+            .clone();
+        let p1 = args.sample_prompt_1.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--sample-every > 0 requires --sample-prompt-1"))?
+            .clone();
+        let p2 = args.sample_prompt_2.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--sample-every > 0 requires --sample-prompt-2"))?
             .clone();
 
         log::info!("[sample-setup] loading Qwen2.5-VL + tokenizer for prompt pre-encode...");
@@ -155,30 +179,38 @@ fn main() -> anyhow::Result<()> {
         let te = Qwen25VLEncoder::new(te_weights, te_cfg, device.clone());
 
         let encode_one = |text: &str| -> anyhow::Result<Tensor> {
-            let enc = tok.encode(text, true)
+            // Match prepare_qwenimage's PROMPT_TEMPLATE_ENCODE wrap +
+            // DROP_IDX slice. Training-time prompt encoding MUST match
+            // sample-time prompt encoding or the DiT sees OOD conditioning.
+            let wrapped = format!("{PROMPT_PREFIX}{text}{PROMPT_SUFFIX}");
+            let enc = tok.encode(wrapped, false)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let mut ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
-            if ids.len() > args.sample_max_text_len { ids.truncate(args.sample_max_text_len); }
-            ids.resize(args.sample_max_text_len, QWEN_PAD_ID);
-            Ok(te.encode(&ids)?.to_dtype(DType::BF16)?)
+            let raw_ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
+            let work_len = args.sample_max_text_len + DROP_IDX;
+            let mut ids: Vec<i32> = raw_ids.iter().take(work_len).copied().collect();
+            ids.resize(work_len, QWEN_PAD_ID);
+            let full_hidden = te.encode(&ids)?.to_dtype(DType::BF16)?;
+            full_hidden.narrow(1, DROP_IDX, args.sample_max_text_len)
+                .map_err(|e| anyhow::anyhow!("narrow: {e}"))
         };
-        let cond = encode_one(&args.sample_prompt)?;
+        let cond_1 = encode_one(&p1)?;
+        let cond_2 = encode_one(&p2)?;
         let uncond = if args.sample_cfg > 1.0 {
             Some(encode_one(&args.sample_neg_prompt)?)
         } else {
             None
         };
-        log::info!("[sample-setup] dropping text encoder; cond={:?}{}",
-            cond.shape().dims(),
+        log::info!("[sample-setup] dropping text encoder; cond_1={:?} cond_2={:?}{}",
+            cond_1.shape().dims(), cond_2.shape().dims(),
             uncond.as_ref().map(|u| format!(", uncond={:?}", u.shape().dims())).unwrap_or_default(),
         );
         drop(te);
         flame_core::cuda_alloc_pool::clear_pool_cache();
         flame_core::trim_cuda_mempool(0);
-        log::info!("[sample-setup] periodic sample enabled (every {} steps).", args.sample_every);
-        (Some(cond), uncond, Some(vae_path))
+        log::info!("[sample-setup] periodic sample enabled (every {} steps; 2 prompts).", args.sample_every);
+        (Some(cond_1), Some(cond_2), uncond, Some(vae_path))
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
 
     log::info!("Loading Qwen-Image transformer...");
@@ -286,23 +318,9 @@ fn main() -> anyhow::Result<()> {
         log::info!("Continuing from step {}/{}", start_step, args.steps);
     }
 
-    // Step-0 baseline sample (LoRA-init = base model output). Only meaningful
-    // when starting fresh (start_step == 0). The sample-setup ran already
-    // (before DiT load) — `sample_cond`/`sample_uncond`/`sample_vae_path`
-    // are bound from there.
-    if periodic_sample && start_step == 0 {
-        let cond = sample_cond.as_ref().unwrap();
-        let uncond = sample_uncond.as_ref();
-        let vae_path = sample_vae_path.as_ref().unwrap();
-        let out_path = args.output_dir.join("sample_step0_base.png");
-        log::info!("[sample step=0] BASELINE → {}", out_path.display());
-        if let Err(e) = qwenimage_inline_sample(
-            &mut model, cond, uncond, vae_path, &out_path,
-            args.sample_size, args.sample_steps, args.sample_cfg, args.sample_seed, &device,
-        ) {
-            log::warn!("[sample step=0] failed: {e}");
-        }
-    }
+    // No step-0 / no in-loop sampling — per "do it once, like inference".
+    // The single sample lands AFTER training completes, with the activation
+    // offload pool torn down so the 1024² VAE decode has full GPU.
 
     let clipper = GradientClipper::clip_by_norm(1.0);
     let mut rng = StdRng::seed_from_u64(args.seed);
@@ -422,47 +440,39 @@ fn main() -> anyhow::Result<()> {
             save_ckpt(&path, &model, &optimizer, args.rank, args.lora_alpha, args.seed, &args.save_mode, step_num)?;
         }
 
-        // Periodic inline sample. After the sample returns, drop the
-        // sampler's transient GPU buffers (VAE decoder + Euler-loop scratch)
-        // before resuming training, otherwise the next forward step OOMs at
-        // mid-block prefetch (verified at the 15-step smoke 2026-05-06).
-        if periodic_sample && step_num % args.sample_every == 0 && step_num < args.steps {
-            let cond = sample_cond.as_ref().unwrap();
-            let uncond = sample_uncond.as_ref();
-            let vae_path = sample_vae_path.as_ref().unwrap();
-            let out_path = args.output_dir.join(format!("sample_step{}.png", step_num));
-            log::info!("[sample step={}] → {}", step_num, out_path.display());
-            if let Err(e) = qwenimage_inline_sample(
-                &mut model, cond, uncond, vae_path, &out_path,
-                args.sample_size, args.sample_steps, args.sample_cfg, args.sample_seed, &device,
-            ) {
-                log::warn!("[sample step={}] failed: {e}", step_num);
-            }
-            // Force release of GPU memory the sampler held (VAE weights,
-            // Euler-loop scratch). flame_core's mempool keeps a release
-            // threshold of MAX by default; trim back to 0 here so training
-            // gets a fresh GPU budget.
-            flame_core::cuda_alloc_pool::clear_pool_cache();
-            flame_core::trim_cuda_mempool(0);
-            AutogradContext::clear();
-        }
+        // No in-loop sampling — see top comment.
     }
 
     let final_path = args.output_dir.join(format!("qwenimage_lora_{}steps.safetensors", args.steps));
     save_ckpt(&final_path, &model, &optimizer, args.rank, args.lora_alpha, args.seed, &args.save_mode, args.steps)?;
 
-    // Final sample after training completes.
+    // Final sample after training — single pass, both prompts, 1024².
+    //
+    // Tear down the activation offload pool first: it holds ~19 GB of GPU
+    // staging buffers that the VAE decoder needs for the 1024² mid-block
+    // attention. With the pool gone, the 1024² decode fits on 24 GB GPU.
+    // (Once training is complete the pool isn't needed anymore.)
     if periodic_sample {
-        let cond = sample_cond.as_ref().unwrap();
+        log::info!("[sample FINAL] tearing down activation offload pool to free GPU for 1024² decode...");
+        flame_core::autograd::clear_activation_offload_pool();
+        flame_core::cuda_alloc_pool::clear_pool_cache();
+        flame_core::trim_cuda_mempool(0);
+
+        let cond_1 = sample_cond_1.as_ref().unwrap();
+        let cond_2 = sample_cond_2.as_ref().unwrap();
         let uncond = sample_uncond.as_ref();
         let vae_path = sample_vae_path.as_ref().unwrap();
-        let out_path = args.output_dir.join(format!("sample_step{}_final.png", args.steps));
-        log::info!("[sample FINAL step={}] → {}", args.steps, out_path.display());
-        if let Err(e) = qwenimage_inline_sample(
-            &mut model, cond, uncond, vae_path, &out_path,
-            args.sample_size, args.sample_steps, args.sample_cfg, args.sample_seed, &device,
-        ) {
-            log::warn!("[sample FINAL] failed: {e}");
+        for (idx, cond) in [cond_1, cond_2].iter().enumerate() {
+            let out_path = args.output_dir.join(format!("sample_step{}_final_p{}.png", args.steps, idx + 1));
+            log::info!("[sample FINAL step={} p{}] → {}", args.steps, idx + 1, out_path.display());
+            if let Err(e) = qwenimage_inline_sample(
+                &mut model, cond, uncond, vae_path, &out_path,
+                args.sample_size, args.sample_steps, args.sample_cfg, args.sample_seed, &device,
+            ) {
+                log::warn!("[sample FINAL p{}] failed: {e}", idx + 1);
+            }
+            flame_core::cuda_alloc_pool::clear_pool_cache();
+            flame_core::trim_cuda_mempool(0);
         }
     }
     let trained = args.steps - start_step;

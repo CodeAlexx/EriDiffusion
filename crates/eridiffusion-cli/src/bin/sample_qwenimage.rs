@@ -12,6 +12,15 @@ use eridiffusion_core::sampler::qwenimage_sampler;
 
 const QWEN_PAD_ID: i32 = 151643;
 const TXT_PAD_LEN_DEFAULT: usize = 512;
+/// Qwen-Image PROMPT_TEMPLATE_ENCODE — must match prepare_qwenimage and
+/// train_qwenimage's sample-setup exactly, otherwise the DiT sees
+/// out-of-distribution conditioning.
+const PROMPT_PREFIX: &str =
+    "<|im_start|>system\nDescribe the image by detailing the color, shape, size, \
+     texture, quantity, text, spatial relationships of the objects and background:\
+     <|im_end|>\n<|im_start|>user\n";
+const PROMPT_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n";
+const DROP_IDX: usize = 34;
 
 #[derive(Parser)]
 struct Args {
@@ -29,7 +38,7 @@ struct Args {
     /// `tokenizer.json` for Qwen2.5-VL (Qwen-Image-2512's tokenizer subdir).
     #[arg(long)] tokenizer_path: PathBuf,
     #[arg(long, default_value = "512")] size: usize,
-    #[arg(long, default_value = "20")] steps: usize,
+    #[arg(long, default_value = "50")] steps: usize,
     /// CFG scale. Set to 1.0 to disable classifier-free guidance.
     #[arg(long, default_value = "4.0")] cfg: f32,
     #[arg(long, default_value = "42")] seed: u64,
@@ -68,12 +77,18 @@ fn main() -> anyhow::Result<()> {
     let te = Qwen25VLEncoder::new(te_weights, te_cfg, device.clone());
 
     let encode = |text: &str| -> anyhow::Result<Tensor> {
-        let enc = tokenizer.encode(text, true)
+        // Wrap in PROMPT_TEMPLATE_ENCODE then drop system-prompt prefix —
+        // matches prepare_qwenimage and train_qwenimage exactly.
+        let wrapped = format!("{PROMPT_PREFIX}{text}{PROMPT_SUFFIX}");
+        let enc = tokenizer.encode(wrapped, false)
             .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
-        let mut ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
-        if ids.len() > args.max_text_len { ids.truncate(args.max_text_len); }
-        ids.resize(args.max_text_len, QWEN_PAD_ID);
-        Ok(te.encode(&ids)?.to_dtype(DType::BF16)?)
+        let raw_ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
+        let work_len = args.max_text_len + DROP_IDX;
+        let mut ids: Vec<i32> = raw_ids.iter().take(work_len).copied().collect();
+        ids.resize(work_len, QWEN_PAD_ID);
+        let full_hidden = te.encode(&ids)?.to_dtype(DType::BF16)?;
+        full_hidden.narrow(1, DROP_IDX, args.max_text_len)
+            .map_err(|e| anyhow::anyhow!("narrow: {e}"))
     };
 
     log::info!("[2/4] Encoding prompt + negative prompt...");

@@ -163,13 +163,22 @@ fn sample_inner(
         // Conditional prediction
         let cond_pred = model.forward(&x, &t_vec, txt_embed, latent_h, latent_w)?;
 
-        // CFG if enabled
+        // CFG if enabled. Qwen-Image uses **norm-rescaled** CFG:
+        //   comb     = neg + scale * (cond - neg)
+        //   ratio    = ‖cond‖₂ / ‖comb‖₂   (along last dim, keepdim)
+        //   out      = comb * ratio
+        // The rescale keeps the magnitude of the combined velocity equal
+        // to the cond prediction's — this is what produces clean
+        // (non-grainy) high-frequency detail at high CFG values. Raw FLUX-
+        // style blend produces visible texture artifacts at 1024².
+        // (pipeline_qwenimage.py:704-708)
         let noise_pred = if cfg_scale > 1.0 {
             if let Some(uncond) = txt_embed_uncond {
                 let uncond_pred = model.forward(&x, &t_vec, uncond, latent_h, latent_w)?;
                 let diff = cond_pred.sub(&uncond_pred)?;
                 let scaled = diff.mul_scalar(cfg_scale)?;
-                uncond_pred.add(&scaled)?
+                let comb = uncond_pred.add(&scaled)?;
+                norm_rescale_cfg(&cond_pred, &comb).unwrap_or(comb)
             } else {
                 cond_pred
             }
@@ -195,17 +204,19 @@ fn sample_inner(
     // Unpack: [1, seq, 64] → [1, 16, H_lat, W_lat]
     let latent = qwen_model::unpack_latents(&x, latent_h, latent_w)?;
 
-    // VAE decode. qwen_image_vae.safetensors is wan21 internal-key format
-    // (verified per docs/MIGRATION_AUDIT_2026-05-05.md). Qwen-Image trains
-    // on RAW VAE z (musubi `scale_shift_latents` is identity), so decode
-    // through the raw path — no scale/shift, no per-channel normalization.
-    // Wan21VaeDecoder clamps RGB output to [-1, 1].
+    // VAE decode. The diffusers QwenImage DiT outputs **per-channel
+    // normalized** latents `(z - MEAN) / STD`; the VAE decoder must
+    // un-normalize before running convs. Using `decode_image_raw` here
+    // skips the un-normalization and produces a fine high-frequency
+    // texture across the whole image (verified by inference-flame's
+    // `qwenimage_decoder.rs::decode` → `wan21_vae::decode_image`, which
+    // always applies `z = z * STD + MEAN` before forward).
     let t_vae = std::time::Instant::now();
     let vae = Wan21VaeDecoder::from_safetensors(
         &vae_path.to_string_lossy(),
         device,
     )?;
-    let rgb = vae.decode_image_raw(&latent)?;
+    let rgb = vae.decode_image_normalized(&latent)?;
     log::info!("  VAE decoded in {:.1}s", t_vae.elapsed().as_secs_f32());
 
     // Save PNG
@@ -213,6 +224,23 @@ fn sample_inner(
     log::info!("  saved {}", output_png.display());
 
     Ok(())
+}
+
+/// Qwen-Image norm-rescaled CFG (`pipeline_qwenimage.py:704-708`):
+///   ratio = ‖cond‖₂ / ‖comb‖₂  computed along the last dim with keepdim
+///   out   = comb * ratio
+/// Returns None on failure (caller falls back to plain `comb`).
+fn norm_rescale_cfg(cond: &Tensor, comb: &Tensor) -> Option<Tensor> {
+    let last_dim = cond.shape().dims().len().saturating_sub(1);
+    if last_dim == 0 { return None; }
+    let cond_sq = cond.mul(cond).ok()?;
+    let comb_sq = comb.mul(comb).ok()?;
+    let cond_sum = cond_sq.sum_dim_keepdim(last_dim).ok()?;
+    let comb_sum = comb_sq.sum_dim_keepdim(last_dim).ok()?;
+    let cond_norm = cond_sum.sqrt().ok()?;
+    let comb_norm = comb_sum.sqrt().ok()?;
+    let ratio = cond_norm.div(&comb_norm).ok()?;
+    comb.mul(&ratio).ok()
 }
 
 fn save_tensor_as_png(rgb: &Tensor, path: &Path) -> Result<()> {

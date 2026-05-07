@@ -269,9 +269,27 @@ impl QwenImageTrainingModel {
                 }
             }
 
-            let offloader = crate::training::block_offload::BlockOffloader::load(
-                &path_refs, &QwenImageFacilitator, device.clone(),
-            ).map_err(|e| flame_core::Error::InvalidInput(format!("BlockOffloader: {e}")))?;
+            // Streaming mode caps pinned host RAM at 2 × max_block_bytes
+            // (≈1.3 GB for Qwen-Image-2512) instead of pinning every block
+            // upfront (≈39 GB), at the cost of a per-block CPU memcpy from
+            // the safetensors mmap into the staging buffer at each prefetch.
+            // Recommended for sample-only paths and any host where the full
+            // pinned footprint would not fit.
+            let use_streaming = std::env::var("QWEN_BLOCK_STREAMING")
+                .ok()
+                .map(|v| !matches!(v.as_str(), "0" | "" | "false" | "False"))
+                .unwrap_or(false);
+            let offloader = if use_streaming {
+                log::info!("[qwenimage-trainer] BlockOffloader: streaming mode (QWEN_BLOCK_STREAMING=1)");
+                crate::training::block_offload::BlockOffloader::load_streaming(
+                    &path_refs, &QwenImageFacilitator, device.clone(),
+                )
+            } else {
+                crate::training::block_offload::BlockOffloader::load(
+                    &path_refs, &QwenImageFacilitator, device.clone(),
+                )
+            }
+            .map_err(|e| flame_core::Error::InvalidInput(format!("BlockOffloader: {e}")))?;
 
             log::info!("[qwenimage-trainer] BlockOffloader: {} blocks, {} shared weights",
                 offloader.block_count(), resident.len());

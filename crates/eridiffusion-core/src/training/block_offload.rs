@@ -50,6 +50,7 @@ extern "C" {
     fn cudaEventCreateWithFlags(event: *mut *mut c_void, flags: u32) -> i32;
     fn cudaEventDestroy(event: *mut c_void) -> i32;
     fn cudaEventRecord(event: *mut c_void, stream: *mut c_void) -> i32;
+    fn cudaEventSynchronize(event: *mut c_void) -> i32;
     fn cudaStreamWaitEvent(stream: *mut c_void, event: *mut c_void, flags: u32) -> i32;
     fn cudaDeviceSynchronize() -> i32;
 }
@@ -92,6 +93,18 @@ impl CudaEvent {
         let s = unsafe { cudaEventRecord(self.raw, stream) };
         if s != 0 {
             anyhow::bail!("cudaEventRecord (stream) failed: {s}");
+        }
+        Ok(())
+    }
+
+    /// Block the calling host thread until this event fires. Used by the
+    /// streaming-mode prefetch path before reusing a shared pinned staging
+    /// buffer: the staging is the H2D source, so the CPU must wait until the
+    /// previous H2D has finished reading it before overwriting.
+    fn synchronize(&self) -> anyhow::Result<()> {
+        let s = unsafe { cudaEventSynchronize(self.raw) };
+        if s != 0 {
+            anyhow::bail!("cudaEventSynchronize failed: {s}");
         }
         Ok(())
     }
@@ -196,6 +209,63 @@ struct PinnedTensor {
 }
 
 // ---------------------------------------------------------------------------
+// Streaming-mode state
+//
+// In `Pinned` mode (default), every block's BF16-converted bytes live in
+// pinned host RAM for the offloader's lifetime — total ≈ full model size.
+// For Qwen-Image-2512 that is ≈39 GB, which OOMs a 62 GB box once libtorch
+// and any leftover pinned pages are accounted for.
+//
+// In `Streaming` mode, the safetensors files stay mmap'd and the offloader
+// records only file offsets per block. At each `prefetch_block` we copy the
+// block's bytes from mmap into one of two pinned staging buffers (sized to
+// the largest block), then issue async H2D from the staging into fresh GPU
+// tensors — exactly as the pinned path does, just with the staging filled
+// on demand. Total pinned RAM = 2 × max_block_bytes ≈ 1.3 GB for the same
+// model.
+//
+// The two staging buffers are paired with the two GPU slots: staging[i]
+// always feeds slots[i]. Before reusing staging[i], the CPU waits on the
+// previous tenant's `h2d_done` event so the in-flight H2D has actually
+// finished reading the buffer. This is a host-side wait and means the CPU
+// memcpy phase of prefetch cannot overlap with that prior H2D — for
+// inference (compute >> transfer) the wait is usually zero, and for
+// training the streaming path is opt-in (pinned remains the default for
+// training where overlap matters).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+enum StreamSrcDtype {
+    Bf16,
+    F16,
+    F32,
+}
+
+struct StreamingTensorEntry {
+    name: String,
+    file_idx: usize,
+    file_offset: usize,
+    /// Bytes the source occupies in the file (depends on src_dtype).
+    src_byte_len: usize,
+    src_dtype: StreamSrcDtype,
+    shape: Vec<usize>,
+    num_elems: usize,
+}
+
+struct StreamingState {
+    /// Live mmaps of every input safetensors file. Indexed by `file_idx`.
+    files: Vec<memmap2::Mmap>,
+    /// Per-block ordered list of tensors. Order must be deterministic — the
+    /// streaming prefetch packs them sequentially into the staging buffer.
+    blocks: Vec<Vec<StreamingTensorEntry>>,
+    /// Two pinned staging buffers, sized to the largest block's BF16 byte
+    /// length. `staging[i]` feeds `slots[i]`.
+    staging: [PinnedHostBuffer<u8>; 2],
+    /// Capacity of each staging buffer in bytes (`max_block_bf16_bytes`).
+    staging_capacity: usize,
+}
+
+// ---------------------------------------------------------------------------
 // SlotState — one GPU-side buffer slot
 // ---------------------------------------------------------------------------
 
@@ -260,7 +330,13 @@ impl SlotState {
 /// memory. Two GPU slots for prefetch/compute overlap.
 pub struct BlockOffloader {
     /// Per-block weights in pinned CPU memory. Index = block_idx.
+    /// Empty `Vec` when `streaming` is `Some` — the streaming path stores
+    /// per-block tensor entries inside `StreamingState` instead.
     cpu_blocks: Vec<HashMap<String, PinnedTensor>>,
+
+    /// Streaming-mode state. `Some` when constructed via
+    /// [`Self::load_streaming`]; `None` for the default pinned path.
+    streaming: Option<StreamingState>,
 
     /// The CUDA device for GPU allocations.
     device: Arc<CudaDevice>,
@@ -279,6 +355,19 @@ pub struct BlockOffloader {
 
     /// Total pinned CPU bytes allocated.
     total_pinned_bytes: usize,
+
+    /// Whether to keep weights in PyTorch-native `[Cout, Cin]` layout instead
+    /// of pre-transposing every 2D `.weight` to `[Cin, Cout]` in
+    /// `prepare_weights`. Default `false` (legacy behavior — pre-transpose
+    /// for callers that use `Tensor::matmul` against `[Cin, Cout]`).
+    ///
+    /// Set to `true` via [`Self::with_native_layout`] when the caller's
+    /// forward path uses `flame_core::ops::fused_inference::fused_linear3d_native`,
+    /// which does the transpose inside cuBLASLt via TRANSA=T and therefore
+    /// expects native `[Cout, Cin]`. Pre-transposing in that case would put
+    /// the weight in the wrong layout for the GEMM and silently produce
+    /// garbage.
+    native_layout: bool,
 }
 
 // Safety: BlockOffloader is always accessed behind a Mutex (serialized).
@@ -533,13 +622,184 @@ impl BlockOffloader {
 
         Ok(Self {
             cpu_blocks,
+            streaming: None,
             device,
             transfer_stream,
             slots: [SlotState::Empty, SlotState::Empty],
             active: 0,
             prefetch_in_flight: None,
             total_pinned_bytes,
+            native_layout: false,
         })
+    }
+
+    /// Streaming-mode constructor: keeps the safetensors files mmap'd and
+    /// records per-block tensor offsets, instead of pinning every block's
+    /// BF16 bytes upfront. Two pinned staging buffers (sized to the largest
+    /// block) are filled on demand at each `prefetch_block`.
+    ///
+    /// Use this when the model's pinned-RAM footprint would not fit:
+    /// Qwen-Image-2512 (≈39 GB pinned) on a 62 GB box already pushes the
+    /// limit and OOMs once libtorch and any leftover state are loaded.
+    /// Streaming brings pinned RAM down to `2 × max_block_bytes` (≈1.3 GB
+    /// for Qwen-Image-2512).
+    ///
+    /// Limitations:
+    /// - Source dtypes supported: `BF16`, `F16`, `F32`. `F8_E4M3` is rejected
+    ///   (the pinned path's CPU-dequant or `BLOCKOFF_FP8_PINNED` GPU-dequant
+    ///   would have to move into the prefetch hot path; not needed for any
+    ///   current streaming caller).
+    /// - The per-block H2D source is a shared staging buffer reused across
+    ///   prefetches into the same slot. Before reuse, the CPU waits on the
+    ///   prior tenant's `h2d_done` event — host-side, so the CPU memcpy phase
+    ///   of prefetch cannot overlap with that prior H2D. For inference this
+    ///   wait is usually zero (compute >> transfer); for training keep using
+    ///   the pinned path.
+    pub fn load_streaming(
+        paths: &[&str],
+        facilitator: &dyn BlockFacilitator,
+        device: Arc<CudaDevice>,
+    ) -> anyhow::Result<Self> {
+        let block_count = facilitator.block_count();
+        let mut blocks: Vec<Vec<StreamingTensorEntry>> =
+            (0..block_count).map(|_| Vec::new()).collect();
+        let mut files: Vec<memmap2::Mmap> = Vec::with_capacity(paths.len());
+
+        for &path in paths {
+            let (header, data_start, mmap) = Self::mmap_safetensors(path)?;
+            let file_idx = files.len();
+            files.push(mmap);
+
+            let metadata: serde_json::Value = serde_json::from_str(&header)?;
+            let metadata_obj = metadata
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("invalid safetensors metadata"))?;
+
+            for (name, info) in metadata_obj {
+                if name == "__metadata__" {
+                    continue;
+                }
+                let block_idx = match facilitator.classify_key(name) {
+                    Some(idx) => idx,
+                    None => continue,
+                };
+                if block_idx >= block_count {
+                    anyhow::bail!(
+                        "classify_key returned {block_idx} >= block_count {block_count} for {name:?}"
+                    );
+                }
+
+                let shape: Vec<usize> = info["shape"]
+                    .as_array()
+                    .ok_or_else(|| anyhow::anyhow!("missing shape for {name}"))?
+                    .iter()
+                    .map(|v| v.as_u64().unwrap_or(0) as usize)
+                    .collect();
+                let num_elems: usize = shape.iter().product();
+                if num_elems == 0 {
+                    continue;
+                }
+
+                let offsets = info["data_offsets"]
+                    .as_array()
+                    .ok_or_else(|| anyhow::anyhow!("missing data_offsets for {name}"))?;
+                let start = data_start
+                    + offsets.first().and_then(|v| v.as_u64())
+                        .ok_or_else(|| anyhow::anyhow!("bad start offset for {name}"))? as usize;
+                let end = data_start
+                    + offsets.get(1).and_then(|v| v.as_u64())
+                        .ok_or_else(|| anyhow::anyhow!("bad end offset for {name}"))? as usize;
+                let src_byte_len = end.saturating_sub(start);
+
+                let dtype_str = info["dtype"].as_str().unwrap_or("F32");
+                let src_dtype = match dtype_str {
+                    "BF16" => StreamSrcDtype::Bf16,
+                    "F16" => StreamSrcDtype::F16,
+                    "F32" => StreamSrcDtype::F32,
+                    "F8_E4M3" => anyhow::bail!(
+                        "BlockOffloader::load_streaming: F8_E4M3 not supported in streaming mode (key {name:?}); use the pinned `load_fp8_stream` constructor instead"
+                    ),
+                    _ => continue,
+                };
+
+                blocks[block_idx].push(StreamingTensorEntry {
+                    name: name.clone(),
+                    file_idx,
+                    file_offset: start,
+                    src_byte_len,
+                    src_dtype,
+                    shape,
+                    num_elems,
+                });
+            }
+        }
+
+        // Largest per-block BF16 footprint determines staging size.
+        let max_block_bf16_bytes = blocks
+            .iter()
+            .map(|entries| entries.iter().map(|e| e.num_elems * 2).sum::<usize>())
+            .max()
+            .unwrap_or(0);
+        if max_block_bf16_bytes == 0 {
+            anyhow::bail!(
+                "BlockOffloader::load_streaming: no block tensors classified across {} files",
+                paths.len()
+            );
+        }
+
+        let staging0 = PinnedHostBuffer::<u8>::with_capacity_elems(
+            max_block_bf16_bytes,
+            PinnedAllocFlags::DEFAULT,
+        )
+        .map_err(|e| anyhow::anyhow!("staging buffer 0 alloc ({} bytes): {e}", max_block_bf16_bytes))?;
+        let staging1 = PinnedHostBuffer::<u8>::with_capacity_elems(
+            max_block_bf16_bytes,
+            PinnedAllocFlags::DEFAULT,
+        )
+        .map_err(|e| anyhow::anyhow!("staging buffer 1 alloc ({} bytes): {e}", max_block_bf16_bytes))?;
+
+        let total_pinned_bytes = max_block_bf16_bytes * 2;
+
+        let transfer_stream = device
+            .fork_default_stream()
+            .map_err(|e| anyhow::anyhow!("failed to create transfer stream: {e:?}"))?;
+
+        log::info!(
+            "BlockOffloader (streaming): {} blocks, max block {:.1} MB, staging {:.1} MB pinned ({} files mmap'd)",
+            block_count,
+            max_block_bf16_bytes as f64 / (1024.0 * 1024.0),
+            total_pinned_bytes as f64 / (1024.0 * 1024.0),
+            files.len(),
+        );
+
+        let streaming = StreamingState {
+            files,
+            blocks,
+            staging: [staging0, staging1],
+            staging_capacity: max_block_bf16_bytes,
+        };
+
+        Ok(Self {
+            cpu_blocks: Vec::new(),
+            streaming: Some(streaming),
+            device,
+            transfer_stream,
+            slots: [SlotState::Empty, SlotState::Empty],
+            active: 0,
+            prefetch_in_flight: None,
+            total_pinned_bytes,
+            native_layout: false,
+        })
+    }
+
+    /// Opt into native `[Cout, Cin]` weight layout — disables the
+    /// `prepare_weights` pre-transpose and leaves 2D `.weight` tensors as
+    /// stored in the safetensors file. Required by callers using
+    /// `flame_core::ops::fused_inference::fused_linear3d_native`. See the
+    /// `native_layout` field doc for details.
+    pub fn with_native_layout(mut self, native: bool) -> Self {
+        self.native_layout = native;
+        self
     }
 
     // -----------------------------------------------------------------------
@@ -604,7 +864,24 @@ impl BlockOffloader {
             }
         }
 
+        // Streaming-mode extra: the per-slot pinned staging buffer is the H2D
+        // source and is reused across prefetches into this slot. Wait on the
+        // prior tenant's `h2d_done` event host-side before overwriting it.
+        // No-op when the event was never recorded (slot was Empty) or when
+        // the H2D has already drained.
+        if self.streaming.is_some() {
+            if let Some(prior) = self.slots[target].events() {
+                if prior.h2d_recorded.load(Ordering::Acquire) {
+                    prior.h2d_done.synchronize()?;
+                }
+            }
+        }
+
         self.slots[target] = SlotState::Empty; // drop old GPU tensors (now safe)
+
+        if self.streaming.is_some() {
+            return self.prefetch_block_streaming_inner(block_idx, target);
+        }
 
         let block = &self.cpu_blocks[block_idx];
         if block.is_empty() {
@@ -726,6 +1003,194 @@ impl BlockOffloader {
         Ok(())
     }
 
+    /// Streaming-mode prefetch: copies the block's bytes from the mmap'd
+    /// safetensors files into `staging[target]`, then issues async H2D from
+    /// the staging buffer into fresh GPU tensors. Caller is responsible for:
+    ///   * already having waited on `slots[target]`'s prior `compute_done`
+    ///     (transfer-stream wait) and `h2d_done` (host-side sync) events;
+    ///   * having reset `slots[target]` to `Empty`.
+    fn prefetch_block_streaming_inner(
+        &mut self,
+        block_idx: usize,
+        target: usize,
+    ) -> anyhow::Result<()> {
+        // Empty block — synthesize a Prepared slot with fresh events and
+        // return, matching the pinned path's empty-block branch.
+        {
+            let stream_state = self
+                .streaming
+                .as_ref()
+                .expect("streaming mode dispatch invariant");
+            if stream_state.blocks[block_idx].is_empty() {
+                let events = SlotEvents::new()?;
+                events.h2d_recorded.store(true, Ordering::Release);
+                self.slots[target] = SlotState::Prepared {
+                    block_idx,
+                    tensors: Arc::new(HashMap::new()),
+                    events,
+                };
+                return Ok(());
+            }
+        }
+
+        let events = SlotEvents::new()?;
+
+        // Match pinned path: ensure transfer stream sees prior default-stream
+        // work before we issue H2D on it.
+        self.transfer_stream
+            .wait_for_default()
+            .map_err(|e| anyhow::anyhow!("wait_for_default: {e:?}"))?;
+
+        if std::env::var("BLOCKOFF_MEM_DEBUG").is_ok() {
+            let (free, total) = flame_core::cuda::utils::cuda_mem_get_info().unwrap_or((0, 0));
+            eprintln!(
+                "[blockoff streaming] prefetch block {} starting: GPU free={} MiB / total={} MiB",
+                block_idx,
+                free / (1024 * 1024),
+                total / (1024 * 1024)
+            );
+        }
+
+        let device = self.device.clone();
+        let stream_ptr = self.transfer_stream.stream as *mut c_void;
+        let mut tensors: HashMap<String, Tensor> = HashMap::new();
+
+        // Single mutable borrow scope for streaming state. The staging buffer
+        // is mutated via raw pointer so we can both write CPU bytes into it
+        // (Phase A) and read them out as the H2D source (Phase B) within the
+        // same iteration without violating Rust aliasing — the only outstanding
+        // reference to the staging memory inside this block is the raw
+        // pointer.
+        {
+            let stream_state = self
+                .streaming
+                .as_mut()
+                .expect("streaming mode dispatch invariant");
+            let StreamingState {
+                files,
+                blocks,
+                staging,
+                staging_capacity,
+            } = stream_state;
+            let staging_capacity_local = *staging_capacity;
+            let block_entries = &blocks[block_idx];
+            let staging_buf = &mut staging[target];
+            let staging_ptr: *mut u8 = staging_buf.as_mut_ptr();
+            // Mark the staging len so debug prints / future readers see the
+            // real fill amount; not load-bearing for correctness because every
+            // H2D uses an explicit byte count.
+            unsafe {
+                staging_buf.set_len(staging_capacity_local.min(staging_buf.capacity_bytes()));
+            }
+
+            tensors.reserve(block_entries.len());
+            let mut cursor: usize = 0;
+            for entry in block_entries {
+                let bf16_bytes = entry.num_elems * 2;
+                if cursor + bf16_bytes > staging_capacity_local {
+                    anyhow::bail!(
+                        "BlockOffloader streaming: staging overflow at block {} tensor {} \
+                         (cursor={} need={} cap={})",
+                        block_idx,
+                        entry.name,
+                        cursor,
+                        bf16_bytes,
+                        staging_capacity_local
+                    );
+                }
+
+                // Phase A — CPU memcpy/convert from mmap → staging at offset.
+                let raw_end = entry.file_offset + entry.src_byte_len;
+                let mmap = &files[entry.file_idx];
+                if raw_end > mmap.len() {
+                    anyhow::bail!(
+                        "BlockOffloader streaming: out-of-range slice for {} ({}..{} > {})",
+                        entry.name,
+                        entry.file_offset,
+                        raw_end,
+                        mmap.len()
+                    );
+                }
+                let raw = &mmap[entry.file_offset..raw_end];
+                unsafe {
+                    let dst = staging_ptr.add(cursor);
+                    match entry.src_dtype {
+                        StreamSrcDtype::Bf16 => {
+                            std::ptr::copy_nonoverlapping(raw.as_ptr(), dst, bf16_bytes);
+                        }
+                        StreamSrcDtype::F16 => {
+                            let dst_u16 = dst as *mut u16;
+                            for i in 0..entry.num_elems {
+                                let bits =
+                                    u16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]);
+                                *dst_u16.add(i) = f32_to_bf16(f16_to_f32(bits));
+                            }
+                        }
+                        StreamSrcDtype::F32 => {
+                            let dst_u16 = dst as *mut u16;
+                            for i in 0..entry.num_elems {
+                                let f = f32::from_le_bytes([
+                                    raw[i * 4],
+                                    raw[i * 4 + 1],
+                                    raw[i * 4 + 2],
+                                    raw[i * 4 + 3],
+                                ]);
+                                *dst_u16.add(i) = f32_to_bf16(f);
+                            }
+                        }
+                    }
+                }
+
+                // Phase B — alloc GPU and async H2D from staging[target] at
+                // `cursor` into the fresh GPU buffer. Same `unsafe alloc`
+                // rationale as the pinned path: every byte is overwritten by
+                // the immediately-following memcpy_async on the same stream.
+                let gpu_buf = unsafe { device.alloc::<u16>(entry.num_elems) }.map_err(|e| {
+                    let (free, total) =
+                        flame_core::cuda::utils::cuda_mem_get_info().unwrap_or((0, 0));
+                    anyhow::anyhow!(
+                        "GPU alloc (streaming) for {} ({} elems, need={} MiB) failed; \
+                         free={} MiB total={} MiB: {e:?}",
+                        entry.name,
+                        entry.num_elems,
+                        bf16_bytes / (1024 * 1024),
+                        free / (1024 * 1024),
+                        total / (1024 * 1024)
+                    )
+                })?;
+                let gpu_dst = (*gpu_buf.device_ptr() as u64) as *mut c_void;
+                let host_src = unsafe { staging_ptr.add(cursor) } as *const c_void;
+                memcpy_async_host_to_device(gpu_dst, host_src, bf16_bytes, stream_ptr)
+                    .map_err(|e| {
+                        anyhow::anyhow!("H2D (streaming) for {}: {e}", entry.name)
+                    })?;
+
+                let tensor = Tensor::from_bf16_slice_gpu(
+                    gpu_buf,
+                    Shape::from_dims(&entry.shape),
+                    device.clone(),
+                );
+                tensors.insert(entry.name.clone(), tensor);
+
+                cursor += bf16_bytes;
+            }
+        }
+
+        // All H2D copies are on the transfer stream. Record h2d_done so the
+        // default stream can gate its compute kernels on the GPU side.
+        events.h2d_done.record_on(stream_ptr)?;
+        events.h2d_recorded.store(true, Ordering::Release);
+
+        self.slots[target] = SlotState::Raw {
+            block_idx,
+            tensors,
+            fp8_pending: HashMap::new(),
+            events,
+        };
+        self.prefetch_in_flight = Some(block_idx);
+        Ok(())
+    }
+
     /// Wait for prefetched block, prepare weights, return ready tensors.
     ///
     /// If `block_idx` is already prepared on the active slot, returns instantly.
@@ -777,7 +1242,7 @@ impl BlockOffloader {
 
             let raw = self.slots[slot_idx].take();
             if let SlotState::Raw { block_idx: idx, mut tensors, fp8_pending, events } = raw {
-                Self::prepare_weights(&mut tensors, fp8_pending)?;
+                Self::prepare_weights(&mut tensors, fp8_pending, self.native_layout)?;
                 let arc = Arc::new(tensors);
                 // Reset the per-handle compute_recorded flag — a new tenant
                 // is taking the slot. h2d_recorded stays true (the H2D
@@ -816,7 +1281,7 @@ impl BlockOffloader {
 
         let raw = self.slots[target].take();
         if let SlotState::Raw { block_idx: idx, mut tensors, fp8_pending, events } = raw {
-            Self::prepare_weights(&mut tensors, fp8_pending)?;
+            Self::prepare_weights(&mut tensors, fp8_pending, self.native_layout)?;
             let arc = Arc::new(tensors);
             events.compute_recorded.store(false, Ordering::Release);
             self.slots[target] = SlotState::Prepared {
@@ -920,6 +1385,7 @@ impl BlockOffloader {
     fn prepare_weights(
         bw: &mut HashMap<String, Tensor>,
         fp8_pending: HashMap<String, Fp8Pending>,
+        native_layout: bool,
     ) -> anyhow::Result<()> {
         // Dequant any FP8-pending entries first. The transfer-stream sync
         // before this call guarantees the H2D is done; the dequant kernel
@@ -942,7 +1408,16 @@ impl BlockOffloader {
             let t = bw.remove(&key).unwrap();
             let t = if t.dtype() != DType::BF16 { t.to_dtype(DType::BF16)? } else { t };
             let t = t.requires_grad_(false);
-            let t = if key.ends_with(".weight") && t.rank() == 2 && !key.ends_with(".scale") {
+            // Default (legacy) layout: pre-transpose every 2D `.weight` to
+            // `[Cin, Cout]` for callers using `Tensor::matmul`. When
+            // `native_layout` is set (callers using `fused_linear3d_native`),
+            // skip the transpose so the GEMM gets PyTorch-native
+            // `[Cout, Cin]` and uses cuBLASLt TRANSA=T internally.
+            let t = if !native_layout
+                && key.ends_with(".weight")
+                && t.rank() == 2
+                && !key.ends_with(".scale")
+            {
                 t.transpose()?.requires_grad_(false)
             } else {
                 t

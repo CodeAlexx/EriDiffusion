@@ -26,6 +26,21 @@ use std::path::PathBuf;
 const QWEN_PAD_ID: i32 = 151643;
 const TXT_PAD_LEN_DEFAULT: usize = 512;
 
+/// Qwen-Image canonical prompt template — matches `pipeline_qwenimage.py:
+/// PROMPT_TEMPLATE_ENCODE`. The DiT was trained against text embeddings
+/// produced by this exact template, so caching plain captions produces
+/// out-of-distribution conditioning and wrecks both training and
+/// inference. Keep verbatim.
+const PROMPT_PREFIX: &str =
+    "<|im_start|>system\nDescribe the image by detailing the color, shape, size, \
+     texture, quantity, text, spatial relationships of the objects and background:\
+     <|im_end|>\n<|im_start|>user\n";
+const PROMPT_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n";
+
+/// Number of leading tokens to drop from the encoded hidden state — the
+/// system-prompt portion. Matches Python `PROMPT_TEMPLATE_ENCODE_START_IDX`.
+const DROP_IDX: usize = 34;
+
 #[derive(Parser)]
 struct Args {
     #[arg(long)] input_dir: PathBuf,
@@ -118,19 +133,33 @@ fn main() -> anyhow::Result<()> {
         let img_t = Tensor::from_vec(
             pixels, Shape::from_dims(&[1, 3, hu, wu]), device.clone(),
         )?.to_dtype(DType::BF16)?;
-        // [1, 16, H/8, W/8] raw — Qwen-Image scale_shift_latents is identity.
-        let latent = vae.encode_image_raw(&img_t)?;
+        // [1, 16, H/8, W/8] **normalized** — diffusers QwenImage DiT trains
+        // and predicts in `(z - MEAN) / STD` space. Cache must be in this
+        // space too so the trainer's targets match the DiT's native output
+        // distribution. (Sampler's `decode_image_normalized` un-normalizes
+        // before running VAE convs.)
+        let latent = vae.encode_image_normalized(&img_t)?;
 
-        // ── Caption → Qwen2.5-VL last hidden state ────────────────────────
+        // ── Caption → Qwen2.5-VL hidden state with PROPER template ───────
+        // Wrap the caption in the qwen-image PROMPT_TEMPLATE_ENCODE, encode,
+        // then drop the system-prompt prefix (DROP_IDX tokens). The DiT was
+        // trained against this exact slice — feeding it raw or full
+        // template embeddings produces out-of-distribution conditioning.
         let caption = std::fs::read_to_string(txt_path).unwrap_or_default();
         let caption = caption.trim();
-        let enc = tokenizer.encode(caption, true)
+        let wrapped = format!("{PROMPT_PREFIX}{caption}{PROMPT_SUFFIX}");
+        let enc = tokenizer.encode(wrapped, false)
             .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
-        let mut ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
-        if ids.len() > args.max_text_len { ids.truncate(args.max_text_len); }
-        ids.resize(args.max_text_len, QWEN_PAD_ID);
-        // [1, max_text_len, 3584]
-        let text_hidden = te.encode(&ids)?.to_dtype(DType::BF16)?;
+        let raw_ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
+        // Pad/truncate to (max_text_len + DROP_IDX) so post-drop length is
+        // exactly max_text_len.
+        let work_len = args.max_text_len + DROP_IDX;
+        let mut ids: Vec<i32> = raw_ids.iter().take(work_len).copied().collect();
+        ids.resize(work_len, QWEN_PAD_ID);
+        // Encode: [1, work_len, 3584]
+        let full_hidden = te.encode(&ids)?.to_dtype(DType::BF16)?;
+        // Drop the system-prompt prefix → [1, max_text_len, 3584]
+        let text_hidden = full_hidden.narrow(1, DROP_IDX, args.max_text_len)?;
 
         let mut tensors: HashMap<String, Tensor> = HashMap::new();
         tensors.insert("latent".into(), latent.to_dtype(DType::BF16)?);
