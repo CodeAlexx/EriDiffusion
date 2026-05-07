@@ -289,8 +289,11 @@ impl QwenImageTrainingModel {
                     &path_refs, &QwenImageFacilitator, device.clone(),
                 )
             }
-            .map_err(|e| flame_core::Error::InvalidInput(format!("BlockOffloader: {e}")))?
-            .with_native_layout(true);
+            .map_err(|e| flame_core::Error::InvalidInput(format!("BlockOffloader: {e}")))?;
+            // native_layout=false (legacy default): offloader pre-transposes
+            // 2D `.weight` tensors to `[Cin, Cout]` so the inline
+            // `linear_bias` closure can pass them directly to `Tensor::matmul`
+            // (which expects [Cin, Cout] for the rhs operand).
 
             log::info!("[qwenimage-trainer] BlockOffloader: {} blocks, {} shared weights",
                 offloader.block_count(), resident.len());
@@ -1514,21 +1517,27 @@ fn dual_stream_block_iflame(
             .ok_or_else(|| flame_core::Error::InvalidInput(format!("Missing: {key}")))
     };
 
-    // BISECT: replaced `fused_linear3d_native` with legacy-style explicit
-    // transpose + matmul + add. Weight stored as `[Cout, Cin]` (native_layout
-    // is true on offloader), so transpose to `[Cin, Cout]` for matmul.
-    // Tests whether the cuBLASLt TRANSA=T path has a precision quirk under
-    // EDv2's specific shapes that the explicit-transpose path doesn't.
+    // Legacy explicit transpose + matmul + add. Slower than
+    // `fused_linear3d_native` but produces correct output — the fused
+    // kernel has a numerical bug under EDv2's call pattern that I haven't
+    // root-caused yet (tested both `native_layout=true` contiguous
+    // [Cout, Cin] AND inference-flame's pre-transpose-then-untranspose
+    // view pattern; both produce stylized garbage). With this legacy
+    // path, output matches inference-flame visually. Perf is ~35% faster
+    // than full-legacy (other iflame port pieces help) but ~5× slower
+    // than inference-flame's `qwenimage_gen`.
+    //
+    // Offloader is configured with `native_layout=false` (legacy default)
+    // so weights arrive logically `[Cin, Cout]` already.
     let linear_bias =
         |x: &Tensor, weight: &Tensor, bias: &Tensor| -> Result<Tensor> {
             let _ = fused_linear3d_native;
             let dims = x.shape().dims().to_vec();
             let in_feat = *dims.last().unwrap();
             let batch: usize = dims[..dims.len()-1].iter().product();
-            let wt = weight.transpose()?.contiguous()?;
-            let out_feat = wt.shape().dims()[1];
+            let out_feat = weight.shape().dims()[1];
             let x_2d = x.reshape(&[batch, in_feat])?;
-            let mut out = x_2d.matmul(&wt)?;
+            let mut out = x_2d.matmul(weight)?;
             out = out.add(bias)?;
             let mut out_shape = dims[..dims.len()-1].to_vec();
             out_shape.push(out_feat);
