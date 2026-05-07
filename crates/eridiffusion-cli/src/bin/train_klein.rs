@@ -342,17 +342,20 @@ fn main() -> anyhow::Result<()> {
 
         let grads = loss.backward()?;
 
-        // clip_grad_norm = 1.0 (klein preset default; ERNIE memory: convergence killer if omitted).
-        let mut total_norm_sq = 0f32;
-        for param in &params {
-            if let Some(g) = grads.get(param.id()) {
-                let g_f32 = g.to_dtype(DType::F32)?;
-                let sq = g_f32.square()?.mean()?;
-                let n = g_f32.shape().dims().iter().product::<usize>() as f32;
-                total_norm_sq += sq.to_vec()?[0] * n;
-            }
-        }
-        let total_norm = total_norm_sq.sqrt();
+        // clip_grad_norm = 1.0 (klein preset default; ERNIE memory: convergence killer
+        // if omitted).
+        //
+        // Fusion Sprint Phase 5: replaced the per-tensor `.to_vec()?[0]` loop
+        // (N D2H syncs per step) with `flame_core::ops::grad_norm::global_l2_norm`,
+        // which keeps the L2 reduction on device and does ONE D2H sync at the end
+        // for the host-side scale. For Klein 9B LoRA (~200 LoRA tensors) that's a
+        // 200× reduction in sync count.
+        let grad_refs: Vec<&flame_core::Tensor> = params
+            .iter()
+            .filter_map(|p| grads.get(p.id()))
+            .collect();
+        let total_norm = flame_core::ops::grad_norm::global_l2_norm(&grad_refs)?
+            .item()? as f32;
         if dbg_on {
             eprintln!("[OT_DEBUG step={:5}] grad_norm_pre_clip={:.4e}", step, total_norm);
         }

@@ -320,16 +320,13 @@ fn main() -> anyhow::Result<()> {
         // gradients destabilize training and the LoRA never converges on
         // identity (verified vs OT preset).
         const CLIP_GRAD_NORM: f32 = 1.0;
-        let mut total_norm_sq = 0f32;
-        for param in &params {
-            if let Some(g) = grads.get(param.id()) {
-                let g_f32 = g.to_dtype(DType::F32)?;
-                let sq = g_f32.square()?.mean()?;
-                let n = g_f32.shape().dims().iter().product::<usize>() as f32;
-                total_norm_sq += sq.to_vec()?[0] * n; // sum of squares = mean * n
-            }
-        }
-        let total_norm = total_norm_sq.sqrt();
+        // Fusion Sprint Phase 5: device-resident global L2 norm — one D2H per step.
+        let grad_refs: Vec<&flame_core::Tensor> = params
+            .iter()
+            .filter_map(|p| grads.get(p.id()))
+            .collect();
+        let total_norm = flame_core::ops::grad_norm::global_l2_norm(&grad_refs)?
+            .item()? as f32;
         // Match OT_DEBUG_STATS line in upstream Python so a `grep grad_norm_pre_clip` diffs cleanly.
         if debug_grads_enabled || std::env::var("OT_DEBUG_STATS").map_or(false, |v| !matches!(v.as_str(), "0"|""|"false"|"FALSE")) {
             eprintln!("[OT_DEBUG step={:5}] grad_norm_pre_clip={:.4e}", step, total_norm);

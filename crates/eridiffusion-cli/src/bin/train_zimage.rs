@@ -341,16 +341,13 @@ fn main() -> anyhow::Result<()> {
         let grads = loss.backward()?;
         // OT default: clip_grad_norm = 1.0. Mirrors train_ernie.rs.
         const CLIP_GRAD_NORM: f32 = 1.0;
-        let mut total_norm_sq = 0f32;
-        for param in &params {
-            if let Some(g) = grads.get(param.id()) {
-                let g_f32 = g.to_dtype(DType::F32)?;
-                let sq = g_f32.square()?.mean()?;
-                let n = g_f32.shape().dims().iter().product::<usize>() as f32;
-                total_norm_sq += sq.to_vec()?[0] * n;
-            }
-        }
-        let total_norm = total_norm_sq.sqrt();
+        // Fusion Sprint Phase 5: device-resident global L2 norm — one D2H per step.
+        let grad_refs: Vec<&flame_core::Tensor> = params
+            .iter()
+            .filter_map(|p| grads.get(p.id()))
+            .collect();
+        let total_norm = flame_core::ops::grad_norm::global_l2_norm(&grad_refs)?
+            .item()? as f32;
         let scale = if total_norm > CLIP_GRAD_NORM { CLIP_GRAD_NORM / total_norm } else { 1.0 };
         for param in &params {
             if let Some(g) = grads.get(param.id()) {
