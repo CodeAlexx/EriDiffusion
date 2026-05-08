@@ -1,16 +1,32 @@
-//! train_klein — Klein 4B/9B LoRA training, mirroring upstream Python BaseFlux2Setup.
+//! train_slider_klein — Klein 4B/9B Slider-LoRA training (Concept Sliders, Gandikota et al. 2023).
 //!
-//! Pipeline per step (matches OT preset `klein9b_lora_boxjana.json` defaults):
-//!   1. Load cached `latent` ([1, 128, h, w] BF16, KleinVaeEncoder.encode output)
-//!      and `text_embedding` ([1, 512, joint_dim] BF16).
-//!   2. Sample timestep ∈ [0, num_train_timesteps) per LOGIT_NORMAL distribution
-//!      with `timestep_shift=1.0` (4B+9B preset default).
-//!   3. sigma = (floor(t)+1) / 1000;  noisy = noise·sigma + clean·(1-sigma).
-//!   4. Forward → [1, 128, h, w]; target = noise - clean (rectified flow).
-//!   5. Loss = mean MSE in F32.  clip_grad_norm = 1.0 (preset default; matches ERNIE).
+//! Differs from `train_klein` in objective only: instead of supervising against
+//! the rectified-flow target `noise - clean`, we supervise the LoRA so that
+//! scaling it by α ∈ [-1, +1] interpolates between two prompts (positive ↔
+//! negative). The dataset latent is reused as a generic noisy-input source;
+//! its caption is ignored (the slider direction is fixed at startup from
+//! `--slider-positive-prompt` / `--slider-negative-prompt`).
 //!
-//! Single seed=42 (memory: feedback_default_seed_42).
-//! AdamW(lr=3e-5 by default, beta=0.9/0.999, weight_decay=0.01) — matches Klein 9B preset.
+//! Per-step pipeline:
+//!   1. Load `latent` from cache (the cache caption embedding is ignored).
+//!   2. Sample timestep + build `noisy = noise·σ + latent·(1-σ)`.
+//!   3. Run FOUR forwards on `noisy`:
+//!        a. Base + positive (no LoRA, no_grad)  → ε_pos   (DETACHED)
+//!        b. Base + negative (no LoRA, no_grad)  → ε_neg   (DETACHED)
+//!        c. Base+LoRA + positive                 → ε_pos_lora (autograd)
+//!        d. Base+LoRA + negative                 → ε_neg_lora (autograd)
+//!   4. target_pos = ε_pos + scale·(ε_pos - ε_neg);   target_neg = ε_neg - scale·(ε_pos - ε_neg)
+//!      loss = mean((ε_pos_lora - target_pos)²) + mean((ε_neg_lora - target_neg)²)
+//!   5. Backward; gradients flow only through the LoRA branches.
+//!
+//! LoRA toggle: `KleinModel.is_lora` is a public field; we flip it `false`
+//! before the two base forwards and restore it before the two LoRA forwards.
+//! When `is_lora=false`, `forward_inner` builds `lora = None` and calls the
+//! pure base path. The base passes also run under `AutogradContext::no_grad`
+//! so their activations don't bloat memory.
+//!
+//! Single seed=42; AdamW(lr=3e-5, beta=0.9/0.999, wd=0.01) — same defaults
+//! as `train_klein`. Reference paper: <https://arxiv.org/abs/2311.12092>.
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -24,11 +40,9 @@ use eridiffusion_core::sampler::klein_sampler;
 use eridiffusion_core::training::board::BoardWriter;
 use eridiffusion_core::training::checkpoint::{self, CkptHeader};
 use eridiffusion_core::training::features::{
-    caption_dropout, disk_check, ema_advanced::EmaConfig, loss_weight, masked_loss,
-    multi_backend::MultiBackend, noise_modifiers, sample_library::SampleLibrary, timestep_bias,
-    tread, validation::ValidationLoop,
+    disk_check, multi_backend::MultiBackend,
+    noise_modifiers, sample_library::SampleLibrary, slider, tread, validation::ValidationLoop,
 };
-use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::health::GpuHealthMonitor;
 use eridiffusion_core::training::features::lr_schedule;
 use eridiffusion_core::training::features::webhook::WebhookClient;
@@ -38,10 +52,7 @@ const NUM_TRAIN_TIMESTEPS: usize = 1000;
 const LOGIT_NORMAL_BIAS: f32 = 0.0;
 const LOGIT_NORMAL_SCALE: f32 = 1.0;
 const TIMESTEP_SHIFT: f32 = 1.0;        // klein preset default
-/// Default training seed. Used when `--seed` is not specified. Matches the
-/// historical hard-coded constant so default-off byte invariance against
-/// pre-flag runs is preserved.
-const DEFAULT_SEED: u64 = 42;
+const SEED: u64 = 42;
 const CLIP_GRAD_NORM: f32 = 1.0;        // klein preset default — essential for convergence
 
 #[derive(Parser)]
@@ -112,17 +123,6 @@ struct Args {
     #[arg(long, default_value_t = 0.0)] caption_dropout_probability: f32,
     #[arg(long, default_value_t = 1.0)] noise_offset_probability: f32,
     #[arg(long, default_value_t = 0.0)] gamma_input_perturbation: f32,
-    /// Pyramid / multi-resolution noise: number of additional resolution
-    /// levels to mix into the per-step training noise. `0` (default) is a
-    /// no-op — byte-identical to no-multires. Each level `k ∈ 1..=N` adds
-    /// `discount^k * bilinear_up(randn(H/2^k, W/2^k))` on top of the base
-    /// randn. Kohya / SimpleTuner / OneTrainer all expose this; reasonable
-    /// values are `4..10`.
-    #[arg(long, default_value_t = 0)] multires_noise_iterations: usize,
-    /// Per-level discount factor for `--multires-noise-iterations`. Standard
-    /// values: 0.3 (default — OneTrainer convention) or 0.5 (Kohya).
-    /// Smaller = subtler. No effect when iterations = 0.
-    #[arg(long, default_value_t = 0.3)] multires_noise_discount: f32,
     #[arg(long, default_value_t = 0.0)] huber_strength: f32,
     #[arg(long, default_value_t = 0.0)] lr_min_factor: f32,
     #[arg(long)] validation_dataset_dir: Option<PathBuf>,
@@ -140,26 +140,10 @@ struct Args {
     /// `--no-bucket-report` style with `--bucket-report=false` to suppress.
     #[arg(long, default_value_t = true)] bucket_report: bool,
     #[arg(long, default_value_t = 0.0)] masked_loss_weight: f32,
-    /// Master switch for EMA shadow. When `true` an F32 shadow is built from
-    /// the trainable LoRA params at startup, and updated after every
-    /// `opt.step` via the diffusers-style power-decay schedule
-    /// (see `--ema-inv-gamma`, `--ema-power`, `--ema-min-decay`,
-    /// `--ema-update-after-step`, `--ema-max-decay`). Training loss is
-    /// byte-identical to `--ema=false` because the shadow is parallel — only
-    /// `--ema-validation-swap` makes it visible at sample / checkpoint time.
-    /// Adds ~rank·param_count·4 bytes of GPU memory; on Klein 9B at rank=16
-    /// that's ~200 MB. Shadow is NOT yet persisted across `--resume-full`
-    /// (re-initialises from live params on resume).
-    #[arg(long, default_value_t = false)] ema: bool,
     #[arg(long, default_value_t = 1.0)] ema_inv_gamma: f32,
     #[arg(long, default_value_t = 0.6667)] ema_power: f32,
     #[arg(long, default_value_t = 0)] ema_update_after_step: u64,
     #[arg(long, default_value_t = 0.0)] ema_min_decay: f32,
-    /// Asymptote of the decay schedule. `update_with_schedule` clamps the
-    /// per-step computed decay to `[ema_min_decay, ema_max_decay]`. Standard
-    /// values: 0.999 (fast averaging), 0.9999 (default — diffusers EMAModel),
-    /// 0.99995 (very slow).
-    #[arg(long, default_value_t = 0.9999)] ema_max_decay: f32,
     /// Phase 3: swap EMA shadow weights into live params at sample/checkpoint
     /// time. Default false. No effect when EMA is not constructed.
     #[arg(long, default_value_t = false)] ema_validation_swap: bool,
@@ -173,41 +157,6 @@ struct Args {
     /// in Phase 5. Selecting a non-AdamW optimizer logs a warning and falls
     /// back to AdamW for now.
     #[arg(long, default_value = "adamw")] optimizer: String,
-    /// Stochastic rounding on the F32 → BF16 store at the end of each fused
-    /// AdamW step. Default off → byte-identical to prior commits. When on,
-    /// long-horizon BF16-param training accumulates small grads correctly
-    /// instead of stalling when the per-step update is below ½·ulp(BF16).
-    /// Per-element rounding entropy is derived from the optimizer's step
-    /// counter mixed with `(tensor_idx, elem_idx)` — reproducible across
-    /// reruns with the same seed and step count.
-    #[arg(long, default_value_t = false)] adamw_stochastic_round: bool,
-
-    /// Master seed for the training-side RNG (timestep + caption-dropout +
-    /// noise-modifier rng) and for things like the periodic-sample seed
-    /// derivative. Default `42` matches the previous hard-coded constant
-    /// — runs without `--seed` are byte-identical to pre-flag commits.
-    /// To repro a non-default run end-to-end, also pass the same value to
-    /// `prepare_klein` (its `--crop-style random` rng seed lives there).
-    #[arg(long, default_value_t = DEFAULT_SEED)] seed: u64,
-
-    /// Multi-distribution timestep bias strategy. Reshapes the per-step
-    /// timestep distribution after the base sampler. `none` (default) is
-    /// byte-identical to no biasing. `later` pulls samples toward the
-    /// high-noise end (×`--timestep-bias-multiplier`); `earlier` pulls
-    /// toward 0. `range` clamps the entire distribution into
-    /// `[--timestep-bias-range-min, --timestep-bias-range-max]` (fractions
-    /// of NUM_TRAIN_TIMESTEPS) by linear remap.
-    #[arg(long, default_value = "none")] timestep_bias_strategy: String,
-    /// Strength for `--timestep-bias-strategy later|earlier`. `0.0` = no
-    /// bias, `1.0` = fully collapsed to the target end. Clamped at apply
-    /// time. Ignored for `none` and `range`.
-    #[arg(long, default_value_t = 0.0)] timestep_bias_multiplier: f32,
-    /// Lower bound for `--timestep-bias-strategy range`, fraction of
-    /// NUM_TRAIN_TIMESTEPS in `[0, 1]`. Ignored otherwise.
-    #[arg(long, default_value_t = 0.0)] timestep_bias_range_min: f32,
-    /// Upper bound for `--timestep-bias-strategy range`, fraction in
-    /// `[0, 1]`. Ignored otherwise.
-    #[arg(long, default_value_t = 1.0)] timestep_bias_range_max: f32,
 
     // ── Phase 6 multi-feature rollout ─────────────────────────────────────
     /// Per-backend repeat count (sample weight multiplier). Length must match
@@ -241,6 +190,18 @@ struct Args {
     /// notifications at training start, each checkpoint save, completion,
     /// and on panic. Default unset → no notifications, no `ureq` calls.
     #[arg(long)] webhook_url: Option<String>,
+
+    // ── Slider-LoRA (concept slider) — REQUIRED for this binary ───────────
+    /// Positive concept prompt — the direction the slider pushes toward at
+    /// positive α. Encoded once at startup and reused every step.
+    #[arg(long)] slider_positive_prompt: String,
+    /// Negative concept prompt — the direction the slider pushes away from at
+    /// positive α. Encoded once at startup and reused every step.
+    #[arg(long)] slider_negative_prompt: String,
+    /// Magnitude of the slider direction. Default 2.0 follows the original
+    /// Concept Sliders paper. Larger values train a stronger slider but
+    /// risk overshoot and instability; smaller values are subtler.
+    #[arg(long, default_value = "2.0")] slider_scale: f32,
 }
 
 /// LOGIT_NORMAL timestep sample. Returns continuous t in [0, 1000).
@@ -329,36 +290,58 @@ fn main() -> anyhow::Result<()> {
     };
     config.validation_prompts_file = args.validation_prompts_file.clone();
 
-    // ── Periodic sample setup (must run BEFORE Klein DiT load) ───────────
-    // Klein 9B DiT is ~18 GB; Qwen3 8B is ~16 GB; loading both at once on
-    // 24 GB OOMs. Encode the sample prompt FIRST, drop Qwen3, then load DiT.
-    // (Klein 4B + Qwen3 4B fit together, so this never bit before the 9B run.)
+    // ── Slider prompt encoding (REQUIRED) + periodic sample setup ────────
+    // The slider needs `slider_positive_prompt` / `slider_negative_prompt`
+    // encoded once at startup; we also opportunistically encode the periodic-
+    // sample prompts in the same Qwen3 lifetime to avoid loading it twice.
+    // Klein 9B DiT (~18 GB) + Qwen3 8B (~16 GB) cannot coexist on 24 GB, so
+    // Qwen3 is dropped before DiT load.
     let periodic = args.sample_every > 0;
-    let (sample_cap, sample_uncond, sample_vae_path) = if periodic {
-        let qwen3_path = args.sample_qwen3.as_ref()
+    if periodic {
+        let _ = args.sample_qwen3.as_ref()
             .ok_or_else(|| anyhow::anyhow!("--sample-every > 0 requires --sample-qwen3"))?;
-        let tok_path = args.sample_tokenizer.as_ref()
+        let _ = args.sample_tokenizer.as_ref()
             .ok_or_else(|| anyhow::anyhow!("--sample-every > 0 requires --sample-tokenizer"))?;
-        let vae_path = args.sample_vae.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("--sample-every > 0 requires --sample-vae"))?
-            .clone();
-        log::info!("[sample-setup] loading Qwen3 + tokenizer to encode prompt once (before DiT load)...");
-        let qwen_w = klein_load_qwen3(qwen3_path, &device)?;
-        let qcfg = Qwen3Encoder::config_from_weights(&qwen_w)?;
-        let qwen = Qwen3Encoder::new(qwen_w, qcfg, device.clone());
-        let tok = tokenizers::Tokenizer::from_file(tok_path)
-            .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+        let _ = args.sample_vae.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--sample-every > 0 requires --sample-vae"))?;
+    }
+    // Slider always requires Qwen3 + tokenizer (cache caption is ignored).
+    let qwen3_path = args.sample_qwen3.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("--sample-qwen3 is required (slider needs Qwen3 to encode positive/negative prompts)"))?;
+    let tok_path = args.sample_tokenizer.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("--sample-tokenizer is required (slider needs tokenizer.json)"))?;
+
+    log::info!("[slider-setup] loading Qwen3 + tokenizer to encode slider prompts (before DiT load)...");
+    let qwen_w = klein_load_qwen3(qwen3_path, &device)?;
+    let qcfg = Qwen3Encoder::config_from_weights(&qwen_w)?;
+    let qwen = Qwen3Encoder::new(qwen_w, qcfg, device.clone());
+    let tok = tokenizers::Tokenizer::from_file(tok_path)
+        .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    let slider_pos_emb = klein_encode_prompt(&qwen, &tok, &args.slider_positive_prompt)?;
+    let slider_neg_emb = klein_encode_prompt(&qwen, &tok, &args.slider_negative_prompt)?;
+    log::info!(
+        "[slider-setup] positive=\"{}\" → {:?}",
+        args.slider_positive_prompt, slider_pos_emb.shape().dims()
+    );
+    log::info!(
+        "[slider-setup] negative=\"{}\" → {:?}",
+        args.slider_negative_prompt, slider_neg_emb.shape().dims()
+    );
+    log::info!("[slider-setup] slider_scale={}", args.slider_scale);
+
+    let (sample_cap, sample_uncond, sample_vae_path) = if periodic {
+        let vae_path = args.sample_vae.as_ref().unwrap().clone();
         let cap = klein_encode_prompt(&qwen, &tok, &args.sample_prompt)?;
         let unc = klein_encode_prompt(&qwen, &tok, &args.sample_neg_prompt)?;
         log::info!("[sample-setup] cap={:?} uncond={:?}", cap.shape().dims(), unc.shape().dims());
-        drop(qwen);
-        flame_core::cuda_alloc_pool::clear_pool_cache();
-        flame_core::trim_cuda_mempool(0);
-        log::info!("[sample-setup] Qwen3 dropped; VAE will load lazily per sample. Periodic sample enabled (every {} steps).", args.sample_every);
         (Some(cap), Some(unc), Some(vae_path))
     } else {
         (None, None, None)
     };
+    drop(qwen);
+    flame_core::cuda_alloc_pool::clear_pool_cache();
+    flame_core::trim_cuda_mempool(0);
+    log::info!("[slider-setup] Qwen3 dropped; DiT will load next.");
 
     let shards = collect_klein_shards(&args.transformer)?;
     log::info!("Loading Klein transformer from {} shard(s) (rank={} alpha={})",
@@ -374,36 +357,6 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("No trainable parameters — TrainingMethod::Lora produced empty param list");
     }
 
-    // EMA shadow (Phase 3 advanced). Built from current live params (post
-    // resume_lora / pre-step-0). Updated after each opt.step via
-    // `update_with_schedule`. Optional swap into live params at sample /
-    // checkpoint time when --ema-validation-swap is set.
-    let ema_cfg = EmaConfig {
-        inv_gamma: args.ema_inv_gamma,
-        power: args.ema_power,
-        update_after_step: args.ema_update_after_step,
-        min_decay: args.ema_min_decay,
-        max_decay: args.ema_max_decay,
-    };
-    let mut ema: Option<ParameterEma> = if args.ema {
-        let _g = AutogradContext::no_grad();
-        let e = ParameterEma::new(&params, args.ema_max_decay)
-            .map_err(|e| anyhow::anyhow!("EMA construction failed: {e}"))?;
-        log::info!(
-            "[ema] WIRED — {} shadow tensors, inv_gamma={} power={} update_after_step={} min_decay={} max_decay={} validation_swap={}",
-            e.len(),
-            ema_cfg.inv_gamma,
-            ema_cfg.power,
-            ema_cfg.update_after_step,
-            ema_cfg.min_decay,
-            ema_cfg.max_decay,
-            args.ema_validation_swap,
-        );
-        Some(e)
-    } else {
-        None
-    };
-
     // Phase 1: optimizer dispatch is wired only at the CLI surface. Non-AdamW
     // selection logs a warning and falls back to AdamW; full dispatch lands
     // in Phase 5.
@@ -416,34 +369,6 @@ fn main() -> anyhow::Result<()> {
         Err(e) => log::warn!("--optimizer parse: {} — falling back to AdamW", e),
     }
     let mut opt = AdamW::new(args.lr, 0.9, 0.999, 1e-8, 0.01);
-    opt.set_stochastic_round(args.adamw_stochastic_round);
-    if args.adamw_stochastic_round {
-        log::info!(
-            "[adamw] stochastic-round enabled — F32→BF16 stores will use lower-16-bit hash-driven rounding (loss curves will diverge from round-to-nearest baseline by tiny per-step noise)"
-        );
-    }
-
-    // Timestep bias config — defaults are byte-identical (Strategy::None).
-    let timestep_bias_cfg = {
-        let strategy = timestep_bias::Strategy::parse(&args.timestep_bias_strategy)
-            .map_err(|e| anyhow::anyhow!("--timestep-bias-strategy: {e}"))?;
-        let cfg = timestep_bias::BiasConfig {
-            strategy,
-            multiplier: args.timestep_bias_multiplier,
-            range_min: args.timestep_bias_range_min,
-            range_max: args.timestep_bias_range_max,
-        };
-        if strategy != timestep_bias::Strategy::None {
-            log::info!(
-                "[timestep-bias] strategy={} multiplier={} range=[{}, {}]",
-                strategy.as_str(),
-                cfg.multiplier,
-                cfg.range_min,
-                cfg.range_max
-            );
-        }
-        cfg
-    };
 
     // Caption dropout startup check: if requested but no uncond source is
     // available (sample mode is off), disable the feature with a warning so
@@ -638,7 +563,7 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
-    let mut rng = rand::rngs::StdRng::seed_from_u64(args.seed);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
 
     // ── Step-0 baseline sample (LoRA-init = base model output) ───────────
     // SKIPPED for Klein 9B + --offload: the inline sample at training-time-resident
@@ -759,14 +684,9 @@ fn main() -> anyhow::Result<()> {
         let bs = args.batch_size.max(1);
         let mut latents = Vec::with_capacity(bs);
         let mut txts = Vec::with_capacity(bs);
-        // Phase 3: optional per-pixel masks. Only allocated when masked-loss
-        // is active (`masked_loss_weight > 0.0`); otherwise stays empty and
-        // the loss path is byte-identical to the prior commit.
-        let mut masks: Vec<flame_core::Tensor> = if config.masked_loss_weight > 0.0 {
-            Vec::with_capacity(bs)
-        } else {
-            Vec::new()
-        };
+        // Slider mode: no per-pixel mask path. Kept as an empty Vec so the
+        // later `_ = masks` silence still type-checks.
+        let masks: Vec<flame_core::Tensor> = Vec::new();
         for b in 0..bs {
             // Phase 2: when multi-backend is active, pick by weight; else fall
             // back to the historical (step * bs + b) % N round-robin which the
@@ -783,10 +703,8 @@ fn main() -> anyhow::Result<()> {
             let t = sample.get("text_embedding")
                 .ok_or_else(|| anyhow::anyhow!("cache {} missing 'text_embedding'", cache_path.display()))?
                 .to_dtype(DType::BF16)?;
-            if config.masked_loss_weight > 0.0 {
-                let m = masked_loss::load_mask(&sample, l.shape(), device.clone())?;
-                masks.push(m);
-            }
+            // masked_loss is unused in slider mode (no noise-vs-clean target).
+            let _ = config.masked_loss_weight;
             latents.push(l);
             txts.push(t);
         }
@@ -801,28 +719,23 @@ fn main() -> anyhow::Result<()> {
             Tensor::cat(&txts.iter().collect::<Vec<_>>(), 0)?
         };
 
-        // Phase 1: caption dropout — with prob `p`, swap the conditional
-        // caption embedding for the cached unconditional one. When `p == 0.0`
-        // (default), this is a noop and consumes no rng.
-        let txt = if effective_caption_dropout_prob > 0.0 {
-            if let Some(unc) = sample_uncond.as_ref() {
-                // Tile uncond to match batch size if needed.
-                let uncond_b = if unc.shape().dims()[0] == bs {
-                    unc.clone()
-                } else {
-                    let mut tgt = unc.shape().dims().to_vec();
-                    tgt[0] = bs;
-                    unc.broadcast_to(&Shape::from_dims(&tgt))?
-                };
-                caption_dropout::maybe_drop_caption(
-                    &txt, &uncond_b, effective_caption_dropout_prob, &mut rng,
-                )?
+        // Slider mode: the cache caption embedding is IGNORED. The slider
+        // direction is fixed at startup from `--slider-positive-prompt` and
+        // `--slider-negative-prompt`, encoded into `slider_pos_emb` and
+        // `slider_neg_emb`. We tile each to match the batch size.
+        let _ = txt; // silence unused — kept above for shape logging at step 0
+        let tile_to_bs = |emb: &Tensor| -> anyhow::Result<Tensor> {
+            let dims = emb.shape().dims();
+            if dims[0] == bs {
+                Ok(emb.clone())
             } else {
-                txt
+                let mut tgt = dims.to_vec();
+                tgt[0] = bs;
+                Ok(emb.broadcast_to(&Shape::from_dims(&tgt))?)
             }
-        } else {
-            txt
         };
+        let pos_txt = tile_to_bs(&slider_pos_emb)?;
+        let neg_txt = tile_to_bs(&slider_neg_emb)?;
 
         // Per-batch-element timesteps. upstream Python samples shape [B] (line
         // 99 BaseFlux2Setup.py: `batch_size=batch['latent_image'].shape[0]`).
@@ -830,13 +743,7 @@ fn main() -> anyhow::Result<()> {
         let mut sigma_per_b: Vec<f32> = Vec::with_capacity(bs);
         let mut t_model_per_b: Vec<f32> = Vec::with_capacity(bs);
         for _ in 0..bs {
-            let raw_t = sample_timestep_logit_normal(&mut rng);
-            // Default-off: Strategy::None → returns raw_t unchanged.
-            let t_continuous = timestep_bias::apply_bias(
-                raw_t,
-                NUM_TRAIN_TIMESTEPS as f32,
-                &timestep_bias_cfg,
-            );
+            let t_continuous = sample_timestep_logit_normal(&mut rng);
             let sigma_idx = (t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
             let sigma = (sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32;
             t_per_b.push(t_continuous);
@@ -847,15 +754,6 @@ fn main() -> anyhow::Result<()> {
         // by multiplying each batch element separately and stacking.
         let noise = Tensor::randn(latent.shape().clone(), 0.0, 1.0, device.clone())?
             .to_dtype(DType::BF16)?;
-        // Pyramid / multi-resolution noise (additive). Default-off when
-        // `multires_noise_iterations == 0`: returns noise.clone() with no rng
-        // consumption and no extra alloc → byte-identical to baseline.
-        let noise = noise_modifiers::maybe_apply_multires_noise(
-            &noise,
-            args.multires_noise_iterations,
-            args.multires_noise_discount,
-            &mut rng,
-        )?;
         // Phase 1: noise modifiers — offset noise (per-channel constant added
         // to noise) + input perturbation (gaussian extra noise on noise). Both
         // are no-ops at default config (offset_noise_weight=0.0,
@@ -890,7 +788,10 @@ fn main() -> anyhow::Result<()> {
             }
             Tensor::cat(&pieces.iter().collect::<Vec<_>>(), 0)?
         };
-        let target = clean_noise.sub(&latent)?;
+        // Slider doesn't use a noise-vs-clean target. Keep `clean_noise` /
+        // `latent` references silent for the unused-binding lints.
+        let _ = clean_noise;
+        let _ = masks;
         // timestep tensor shape [B] — model.forward broadcasts over batch.
         let timestep = Tensor::from_vec(
             t_model_per_b.clone(),
@@ -902,93 +803,80 @@ fn main() -> anyhow::Result<()> {
         let sigma_idx = (t_per_b[0].floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
 
         if step == 0 {
-            log::info!("step 0 | batch={} latent={:?} text={:?} sigma[0]={:.4} (idx={})",
-                bs, latent.shape().dims(), txt.shape().dims(), sigma, sigma_idx);
+            log::info!(
+                "step 0 | batch={} latent={:?} pos_txt={:?} neg_txt={:?} sigma[0]={:.4} (idx={})",
+                bs, latent.shape().dims(),
+                pos_txt.shape().dims(), neg_txt.shape().dims(),
+                sigma, sigma_idx
+            );
         }
 
-        // Build a TreadStep this step iff TREAD is configured AND keep_ratio<1.
-        // The single-block stream concatenates [txt, img] → T_total tokens.
-        // Klein latent is `[B, in_ch, H_lat, W_lat]` → n_img = H_lat*W_lat.
-        let tread_step = if let Some(ref ranges) = tread_ranges {
-            let dims = noisy.shape().dims();
-            let (h_lat, w_lat) = (dims[2], dims[3]);
-            let n_img = h_lat * w_lat;
-            let txt_len = txt.shape().dims()[1];
-            let t_total = txt_len + n_img;
-            // Use the FIRST range; multi-range routing is a Phase 5 follow-up.
-            let (lo, hi) = ranges[0];
-            Some(tread::TreadStep::new(
-                t_total,
-                args.tread_keep_ratio,
-                (lo, hi),
-                &mut rng,
-            ))
-        } else {
-            None
+        // TREAD is incompatible with the slider 4-forward path (the routed
+        // tokens differ between passes); explicitly disable it for clarity.
+        let _ = &tread_ranges;
+        let tread_step: Option<&tread::TreadStep> = None;
+
+        // ── 4-forward slider step ─────────────────────────────────────────
+        // Two base passes (no LoRA, no_grad) feed the detached target; two
+        // with-LoRA passes carry the gradient. We toggle `model.is_lora`
+        // to disable the LoRA delta on the base passes — the public field
+        // is read at the start of each block in `forward_inner`.
+        let saved_is_lora = model.is_lora;
+
+        let (eps_pos, eps_neg) = {
+            let _g = AutogradContext::no_grad();
+            model.is_lora = false;
+            let ep = model.forward_train(&noisy, &pos_txt, &timestep, tread_step)?;
+            let ep_f = ep.to_dtype(DType::F32)?;
+            drop(ep);
+            AutogradContext::clear();
+            flame_core::cuda_alloc_pool::clear_pool_cache();
+            flame_core::trim_cuda_mempool(0);
+            let en = model.forward_train(&noisy, &neg_txt, &timestep, tread_step)?;
+            let en_f = en.to_dtype(DType::F32)?;
+            drop(en);
+            AutogradContext::clear();
+            flame_core::cuda_alloc_pool::clear_pool_cache();
+            flame_core::trim_cuda_mempool(0);
+            (ep_f, en_f)
         };
 
-        let pred = model.forward_train(&noisy, &txt, &timestep, tread_step.as_ref())?;
-        if pred.shape().dims() != target.shape().dims() {
+        // Restore LoRA for the gradient-carrying passes.
+        model.is_lora = saved_is_lora;
+        let eps_pos_lora = model.forward_train(&noisy, &pos_txt, &timestep, tread_step)?;
+        let eps_neg_lora = model.forward_train(&noisy, &neg_txt, &timestep, tread_step)?;
+        if eps_pos_lora.shape().dims() != eps_pos.shape().dims() {
             anyhow::bail!(
-                "predicted velocity shape {:?} != target {:?}",
-                pred.shape().dims(), target.shape().dims());
+                "slider shape mismatch: lora {:?} vs base {:?}",
+                eps_pos_lora.shape().dims(),
+                eps_pos.shape().dims()
+            );
         }
 
-        // F32 mean MSE — matches OT default (loss_weight_fn=CONSTANT, mse_strength=1.0).
-        // Phase 1: combined MSE+MAE+Huber loss + per-step loss weighting.
-        // Default-off invariance: when mse=1.0, mae=0.0, huber=0.0 AND
-        // loss_weight_fn=Constant AND min_snr_gamma=None, this collapses to
-        // exactly the previous (pred-target).square().mean() formula.
-        let pred_f32 = pred.to_dtype(DType::F32)?;
-        let target_f32 = target.to_dtype(DType::F32)?;
-        // Phase 3: when masked-loss is active, take the manual diff path so we
-        // can multiply the per-element diff by a per-pixel mask BEFORE squaring
-        // and reducing. When masked_loss_weight == 0.0 (default) we route
-        // through `combined_loss` exactly like Phase 1+2 → byte invariance.
-        let raw_loss = if config.masked_loss_weight > 0.0 && !masks.is_empty() {
-            let mask_t = if bs == 1 {
-                masks.into_iter().next().unwrap()
-            } else {
-                Tensor::cat(&masks.iter().collect::<Vec<_>>(), 0)?
-            };
-            // Caller is responsible for square + mean after `apply_loss_mask`.
-            // Combined MSE/MAE/Huber strengths are NOT applied on this path —
-            // masked-loss currently only supports the MSE-equivalent reduction.
-            // mae/huber under masked-loss is a Phase-future enhancement.
-            let diff = pred_f32.sub(&target_f32)?;
-            let masked_diff =
-                masked_loss::apply_loss_mask(&diff, &mask_t, config.masked_loss_weight)?;
-            masked_diff.square()?.mean()?
-        } else {
-            loss_weight::combined_loss(
-                &pred_f32,
-                &target_f32,
-                config.mse_strength as f32,
-                config.mae_strength as f32,
-                args.huber_strength,
-            )?
-        };
-        // Klein is flow-matching → v-prediction-style SNR weighting.
-        let loss = loss_weight::apply_loss_weight(
-            &raw_loss,
-            sigma,
-            config.loss_weight_fn,
-            args.min_snr_gamma,
-            true,
+        let loss = slider::slider_loss(
+            &eps_pos_lora,
+            &eps_neg_lora,
+            &eps_pos,
+            &eps_neg,
+            args.slider_scale,
         )?;
         let loss_val = loss.to_vec()?[0];
+        if !loss_val.is_finite() {
+            anyhow::bail!("slider loss not finite at step {step}: {loss_val}");
+        }
         total_loss += loss_val;
 
-        // === OT_DEBUG_STATS-format per-step line (mirrors train_ernie + upstream Python patch) ===
+        // === Slider-mode per-step debug line ===
         let dbg_on = dbg::enabled("OT_DEBUG_STATS");
         if dbg_on {
-            let p_st = dbg::stats(&pred);
-            let t_st = dbg::stats(&target);
+            let pl = dbg::stats(&eps_pos_lora);
+            let nl = dbg::stats(&eps_neg_lora);
+            let pb = dbg::stats(&eps_pos);
+            let nb = dbg::stats(&eps_neg);
             eprintln!(
-                "[OT_DEBUG step={:5}] t={:.2} loss(pre-scale)={:.4} | pred[mean={:+.3e} std={:.3e} max|·|={:.3e}] target[mean={:+.3e} std={:.3e} max|·|={:.3e}]",
+                "[OT_DEBUG step={:5}] t={:.2} slider_loss={:.4} | pos_lora[std={:.3e}] neg_lora[std={:.3e}] pos_base[std={:.3e}] neg_base[std={:.3e}]",
                 step, t_continuous, loss_val,
-                p_st.mean, p_st.std, p_st.abs_max,
-                t_st.mean, t_st.std, t_st.abs_max,
+                pl.std, nl.std, pb.std, nb.std,
             );
         }
 
@@ -1045,12 +933,6 @@ fn main() -> anyhow::Result<()> {
             opt.set_lr(cur_lr);
             opt.step(&params)?;
             opt.zero_grad(&params);
-            if let Some(ref mut e) = ema {
-                // 1-based step → matches the schedule's `update_after_step`
-                // semantics (step==update_after_step returns 0 / "skip").
-                e.update_with_schedule(&params, &ema_cfg, (step + 1) as u64)
-                    .map_err(|err| anyhow::anyhow!("EMA update failed at step {}: {err}", step + 1))?;
-            }
         }
         AutogradContext::clear();
 
@@ -1060,105 +942,15 @@ fn main() -> anyhow::Result<()> {
             loss_val, total_norm, cur_lr, t_start, board.as_ref(),
         );
 
-        // Phase 2: validation eval pass (no_grad) every `validation_every_steps`.
-        // step+1 because `step` here is 0-based; ValidationLoop::should_run
-        // expects the 1-based completed-step number.
-        if let Some(ref vloop) = validation_loop {
-            if vloop.should_run(step + 1) {
-                let mut sum = 0.0_f32;
-                let mut count = 0_usize;
-                for vfile in &vloop.cache_files {
-                    let _g = AutogradContext::no_grad();
-                    let sample = match flame_core::serialization::load_file(vfile, &device) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            log::warn!("[validation] load {} failed: {e}", vfile.display());
-                            continue;
-                        }
-                    };
-                    let v_lat = match sample.get("latent") {
-                        Some(t) => t.to_dtype(DType::BF16)?,
-                        None => {
-                            log::warn!("[validation] {} missing latent", vfile.display());
-                            continue;
-                        }
-                    };
-                    let v_txt = match sample.get("text_embedding") {
-                        Some(t) => t.to_dtype(DType::BF16)?,
-                        None => {
-                            log::warn!("[validation] {} missing text_embedding", vfile.display());
-                            continue;
-                        }
-                    };
-                    // Sample timestep + noise identically to training. Validation
-                    // uses its OWN run-side RNG so it does not perturb the
-                    // training-side seeded sequence (byte invariance).
-                    let mut vrng = rand::rngs::StdRng::seed_from_u64(args.seed ^ (step as u64 + 1));
-                    let t_continuous = sample_timestep_logit_normal(&mut vrng);
-                    let sigma_idx = (t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
-                    let sigma = (sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32;
-                    let v_noise = Tensor::randn(v_lat.shape().clone(), 0.0, 1.0, device.clone())?
-                        .to_dtype(DType::BF16)?;
-                    let v_noisy = v_noise.mul_scalar(sigma)?
-                        .add(&v_lat.mul_scalar(1.0 - sigma)?)?;
-                    let v_target = v_noise.sub(&v_lat)?;
-                    let v_t_model = sigma_idx as f32 / NUM_TRAIN_TIMESTEPS as f32;
-                    let v_timestep = Tensor::from_vec(
-                        vec![v_t_model],
-                        Shape::from_dims(&[v_lat.shape().dims()[0]]),
-                        device.clone(),
-                    )?;
-                    let v_pred = match model.forward(&v_noisy, &v_txt, &v_timestep) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            log::warn!("[validation] forward failed: {e}");
-                            continue;
-                        }
-                    };
-                    let v_loss = v_pred.to_dtype(DType::F32)?
-                        .sub(&v_target.to_dtype(DType::F32)?)?
-                        .square()?
-                        .mean()?;
-                    let v_loss_val = v_loss.to_vec()?[0];
-                    if v_loss_val.is_finite() {
-                        sum += v_loss_val;
-                        count += 1;
-                    }
-                    AutogradContext::clear();
-                }
-                if count > 0 {
-                    let val_avg = sum / count as f32;
-                    log::info!(
-                        "[validation step={}] loss/val = {:.4} ({} samples)",
-                        step + 1,
-                        val_avg,
-                        count
-                    );
-                    if let Some(b) = &board {
-                        b.log_scalar("loss/val", (step + 1) as u64, val_avg as f64);
-                    }
-                }
-            }
-        }
+        // Validation pass is disabled in slider mode — the held-out cache
+        // would feed a noise-vs-clean target that is meaningless against
+        // the slider objective. A slider-aware validation harness is a
+        // Phase 5+ follow-up.
+        let _ = &validation_loop;
 
         // ── Periodic save + inline sample (every N steps) ───────────────
         let step_num = step + 1;
         if periodic && step_num % args.sample_every == 0 && step_num < args.steps {
-            // EMA swap: when `--ema --ema-validation-swap`, save and sample
-            // see EMA-averaged weights. `backup` returned only in that case;
-            // restored at the end of this block. Updates resume against the
-            // ORIGINAL live tensors after restore.
-            let ema_backup = if args.ema_validation_swap {
-                if let Some(ref e) = ema {
-                    let _g = AutogradContext::no_grad();
-                    Some(e.swap_with_live(&params)
-                        .map_err(|err| anyhow::anyhow!("EMA swap_with_live (mid) failed: {err}"))?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
             let mid_ckpt = args.output_dir.join(format!("klein_lora_step{step_num}.safetensors"));
             // Phase 7: disk-space pre-check. 2 GB threshold covers Klein 9B
             // LoRA full save (~520 MB) + safety margin. On insufficient space
@@ -1176,7 +968,7 @@ fn main() -> anyhow::Result<()> {
                 if save_mode_full {
                     let header = CkptHeader::from_adamw(
                         "train_klein", step_num as u64, &opt,
-                        args.rank, args.lora_alpha as f32, args.seed, String::new(),
+                        args.rank, args.lora_alpha as f32, SEED, String::new(),
                     );
                     let named = model.named_parameters();
                     if let Err(e) = checkpoint::save_full(&mid_ckpt, &named, &opt, &header) {
@@ -1260,14 +1052,6 @@ fn main() -> anyhow::Result<()> {
                     log::warn!("[sample step={step_num} seed={seed}] failed: {e}");
                 }
             }
-            // Restore live params before the next training step so the
-            // optimizer's accumulated moments stay consistent with the
-            // tensors they were taken against.
-            if let (Some(backup), Some(ref e)) = (ema_backup, &ema) {
-                let _g = AutogradContext::no_grad();
-                e.restore_swapped(&params, backup)
-                    .map_err(|err| anyhow::anyhow!("EMA restore_swapped (mid) failed: {err}"))?;
-            }
         }
     }
 
@@ -1276,19 +1060,6 @@ fn main() -> anyhow::Result<()> {
     let wall_time = t_start.elapsed().as_secs_f64();
     log::info!("Training complete: {trained} new steps (total={}), avg loss={:.4}", args.steps, avg_loss);
     if let Some(b) = &board { b.set_status("completed"); }
-
-    // Final EMA swap (covers both final save and final sample below). No
-    // restore at the very end — process exits, no further training. Skipped
-    // when --ema-validation-swap is off or no EMA was constructed.
-    if args.ema_validation_swap {
-        if let Some(ref e) = ema {
-            let _g = AutogradContext::no_grad();
-            // Discard the backup: training is over, restore is unnecessary.
-            let _ = e.swap_with_live(&params)
-                .map_err(|err| anyhow::anyhow!("EMA swap_with_live (final) failed: {err}"))?;
-            log::info!("[ema] swapped EMA shadow into live params for final save + sample");
-        }
-    }
 
     let ckpt = args.output_dir.join(format!("klein_lora_{}steps.safetensors", args.steps));
     // Phase 7: final-checkpoint disk-space pre-check. Skip + log on shortage.
@@ -1304,7 +1075,7 @@ fn main() -> anyhow::Result<()> {
         if save_mode_full {
             let header = CkptHeader::from_adamw(
                 "train_klein", args.steps as u64, &opt,
-                args.rank, args.lora_alpha as f32, args.seed, String::new(),
+                args.rank, args.lora_alpha as f32, SEED, String::new(),
             );
             let named = model.named_parameters();
             if let Err(e) = checkpoint::save_full(&ckpt, &named, &opt, &header) {

@@ -105,3 +105,128 @@ pub fn build_txt_ids(
     let data = vec![0.0f32; txt_len * 3];
     Tensor::from_vec(data, Shape::from_dims(&[txt_len, 3]), device)
 }
+
+// ---------------------------------------------------------------------------
+// DPM++ 2M multistep sampler (flow-matching, data-prediction form)
+// ---------------------------------------------------------------------------
+//
+// Clean-room port from inference-flame's `exponential_multistep.rs`.
+// Reference: Lu et al. 2022, "DPM-Solver++" (arXiv:2211.01095), §4.
+//
+// For chroma + flux family: 2nd-order multistep, 1 NFE/step. Tighter
+// convergence than Euler at the same step count — useful for chroma
+// where users typically want stronger prompt adherence than Euler at
+// 26 steps gives.
+
+/// `λ(σ) = log((1-σ)/σ)`, clamped to avoid ±inf at endpoints. λ
+/// increases as σ decreases; `h = λ_next - λ > 0` for denoising.
+#[inline]
+pub fn lambda_from_sigma(sigma: f32) -> f32 {
+    let s = sigma.clamp(1.0e-6, 1.0 - 1.0e-6);
+    ((1.0 - s) / s).ln()
+}
+
+/// Bounded ring buffer of past `(denoised, λ)` pairs for multistep
+/// samplers. `push()` evicts the oldest entry when full. `get(0)` is
+/// the most recent, `get(1)` the one before, etc.
+pub struct MultistepHistory {
+    capacity: usize,
+    denoised: Vec<Tensor>,
+    lambdas: Vec<f32>,
+    head: usize,
+    len: usize,
+}
+
+impl MultistepHistory {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            denoised: Vec::with_capacity(capacity.max(1)),
+            lambdas: Vec::with_capacity(capacity.max(1)),
+            head: usize::MAX,
+            len: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize { self.len }
+    pub fn is_empty(&self) -> bool { self.len == 0 }
+
+    pub fn push(&mut self, denoised: Tensor, lambda: f32) {
+        if self.denoised.len() < self.capacity {
+            self.denoised.push(denoised);
+            self.lambdas.push(lambda);
+            self.head = self.denoised.len() - 1;
+            self.len += 1;
+        } else {
+            let write = (self.head + 1) % self.capacity;
+            self.denoised[write] = denoised;
+            self.lambdas[write] = lambda;
+            self.head = write;
+        }
+    }
+
+    pub fn get(&self, back: usize) -> Option<(&Tensor, f32)> {
+        if back >= self.len { return None; }
+        let idx = (self.head + self.capacity - back) % self.capacity;
+        Some((&self.denoised[idx], self.lambdas[idx]))
+    }
+}
+
+#[inline]
+fn lincomb2(x: &Tensor, a: f32, y: &Tensor, b: f32) -> Result<Tensor> {
+    x.mul_scalar(a)?.add(&y.mul_scalar(b)?)
+}
+
+#[inline]
+fn lincomb3(x: &Tensor, a: f32, y: &Tensor, b: f32, z: &Tensor, c: f32) -> Result<Tensor> {
+    lincomb2(x, a, y, b)?.add(&z.mul_scalar(c)?)
+}
+
+/// 2nd-order multistep DPM++ step in data-prediction form for
+/// rectified-flow models. One NFE per step (the velocity pred you
+/// would have computed for Euler anyway). Falls back to 1st-order on
+/// the first step (empty history).
+///
+/// Inputs:
+///   * `x`         — current latent (σ)
+///   * `denoised`  — data prediction at σ:  `x - σ·v` (v = velocity pred)
+///   * `sigma`     — current σ
+///   * `sigma_next`— next σ (smaller for denoising)
+///   * `history`   — ring buffer storing `(denoised_prev, λ_prev)`
+///
+/// Returns `x_next`. Caller pushes `(denoised, λ_curr)` after the step.
+pub fn dpmpp_2m_step(
+    x: &Tensor,
+    denoised: &Tensor,
+    sigma: f32,
+    sigma_next: f32,
+    history: &MultistepHistory,
+) -> Result<Tensor> {
+    let lambda = lambda_from_sigma(sigma);
+    let lambda_next = lambda_from_sigma(sigma_next);
+    let h = lambda_next - lambda;
+    let alpha_next = 1.0 - sigma_next;
+    let sigma_ratio = sigma_next / sigma;
+    // (-h).expm1() = e^{-h} - 1 ≤ 0 (h > 0 in denoising direction)
+    let em1 = ((-h).exp()) - 1.0;
+
+    // First step or empty history → 1st-order data-pred step.
+    if history.is_empty() {
+        return lincomb2(x, sigma_ratio, denoised, -alpha_next * em1);
+    }
+
+    let (denoised_prev, lambda_prev) = match history.get(0) {
+        Some(v) => v,
+        None => return lincomb2(x, sigma_ratio, denoised, -alpha_next * em1),
+    };
+    let h_prev = lambda - lambda_prev;
+    if !(h_prev > 0.0 && h > 0.0) {
+        return lincomb2(x, sigma_ratio, denoised, -alpha_next * em1);
+    }
+    let r = h_prev / h;
+    let inv_2r = 0.5 / r;
+
+    let c_d = -alpha_next * em1 * (1.0 + inv_2r);
+    let c_p =  alpha_next * em1 * inv_2r;
+    lincomb3(x, sigma_ratio, denoised, c_d, denoised_prev, c_p)
+}

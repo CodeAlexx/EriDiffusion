@@ -207,7 +207,8 @@ fn main() -> anyhow::Result<()> {
         // wanted, advance seed by `idx`.
         let mut latent = {
             use rand::SeedableRng;
-            let _rng = rand::rngs::StdRng::seed_from_u64(args.seed);
+            // Per-prompt seed offset for diverse compositions in batch sampling.
+            let _rng = rand::rngs::StdRng::seed_from_u64(args.seed.wrapping_add(idx as u64));
             Tensor::randn(Shape::from_dims(&[1, 128, hp, wp]), 0.0, 1.0, device.clone())?
                 .to_dtype(DType::BF16)?
         };

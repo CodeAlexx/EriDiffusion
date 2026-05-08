@@ -695,6 +695,35 @@ impl KleinModel {
         txt: &Tensor,
         timestep: &Tensor,
     ) -> Result<Tensor> {
+        self.forward_inner(img_packed_bchw, txt, timestep, None)
+    }
+
+    /// Training forward with optional TREAD routing. When `tread` is `None`,
+    /// behaves byte-identically to [`Self::forward`]. When `Some`, gathers
+    /// the kept-token subset at single-block index `tread.route_block_start`,
+    /// runs the routed range on those tokens only, and scatters back at
+    /// `tread.route_block_end` via `Tensor::index_assign`.
+    ///
+    /// **Default-off invariance**: the inference path (`forward`) calls this
+    /// with `tread = None`, which short-circuits all gather/scatter logic
+    /// — no extra clones, no rng draws, no kernel launches.
+    pub fn forward_train(
+        &mut self,
+        img_packed_bchw: &Tensor,
+        txt: &Tensor,
+        timestep: &Tensor,
+        tread: Option<&crate::training::features::tread::TreadStep>,
+    ) -> Result<Tensor> {
+        self.forward_inner(img_packed_bchw, txt, timestep, tread)
+    }
+
+    fn forward_inner(
+        &mut self,
+        img_packed_bchw: &Tensor,
+        txt: &Tensor,
+        timestep: &Tensor,
+        tread: Option<&crate::training::features::tread::TreadStep>,
+    ) -> Result<Tensor> {
         let dims = img_packed_bchw.shape().dims().to_vec();
         let (b, c, h_lat, w_lat) = (dims[0], dims[1], dims[2], dims[3]);
         if c != self.kconfig.in_channels {
@@ -856,23 +885,49 @@ impl KleinModel {
         let mut x = Tensor::cat(&[&txt, &img], 1)?;
         let txt_len = txt.shape().dims()[1];
 
+        // TREAD residual stash (Phase 4.5). When `tread` is `Some` AND the
+        // current block index hits `route_block_start`, we save the
+        // pre-routed `x` here, gather the kept tokens, run the routed range
+        // on the smaller tensor, then `index_assign` the result back at
+        // `route_block_end`. When `tread` is `None`, both branches below are
+        // dead code paths — no overhead, byte-identical to pre-Phase-4.5.
+        //
+        // RoPE handling: `pe_cos` / `pe_sin` are shape `[1, 1, T_total, D/2]`
+        // (positional embeddings indexed by sequence position). Inside the
+        // routed range we must use a same-N-as-x gathered version so the
+        // block's `apply_rope_klein` shape-checks line up. The gather is
+        // along dim=2 with the same `keep_indices`.
+        let mut tread_skip_residual: Option<Tensor> = None;
+        let mut pe_cos_routed: Option<Tensor> = None;
+        let mut pe_sin_routed: Option<Tensor> = None;
+
         for i in 0..self.kconfig.num_single {
-            let prefix = format!("single_blocks.{i}.");
-            let unified_idx = self.kconfig.num_double + i;
-            // BlockOffloader: stream single block (unified_idx) from pinned host RAM.
-            if let Some(ref off) = self.offloader {
-                let arc = off.lock()
-                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
-                    .ensure_block(unified_idx)
-                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader ensure_block({unified_idx}): {e}")))?;
-                for (k, v) in arc.iter() {
-                    self.weights.insert(k.clone(), v.clone());
+            // ---- TREAD: enter routed range — gather kept tokens ----
+            if let Some(t) = tread {
+                if i == t.route_block_start && tread_skip_residual.is_none() {
+                    if t.total_tokens != x.shape().dims()[1] {
+                        return Err(crate::EriDiffusionError::Model(format!(
+                            "Klein TREAD: total_tokens {} != x[T] {}",
+                            t.total_tokens, x.shape().dims()[1]
+                        )));
+                    }
+                    tread_skip_residual = Some(x.clone());
+                    // x is the activation residual; rope/sdpa kernels demand
+                    // owning storage. clone_result() resolves arena → owning.
+                    x = t.gather_routed(&x)?.clone_result()?;
+                    // Gather pe_cos / pe_sin along dim=2 to the kept tokens.
+                    // BF16 `index_select` returns arena-backed storage which
+                    // `rope_fused_bf16` rejects; clone_result() materializes
+                    // arena → owning BF16 in one shot.
+                    let device = x.device();
+                    let idx = t.keep_index_tensor(device)?;
+                    pe_cos_routed = Some(pe_cos.index_select(2, &idx)?.clone_result()?);
+                    pe_sin_routed = Some(pe_sin.index_select(2, &idx)?.clone_result()?);
                 }
             }
-            let mut layer_weights: HashMap<String, Tensor> = HashMap::new();
-            for (k, v) in self.weights.iter() {
-                if k.starts_with(&prefix) { layer_weights.insert(k.clone(), v.clone()); }
-            }
+
+            let prefix = format!("single_blocks.{i}.");
+            let unified_idx = self.kconfig.num_double + i;
             let lora_base = self.kconfig.num_double * DOUBLE_LORA_SLOTS + i * SINGLE_LORA_SLOTS;
             let lora = if self.is_lora {
                 Some(self.lora_adapters[lora_base..lora_base + SINGLE_LORA_SLOTS].to_vec())
@@ -880,35 +935,137 @@ impl KleinModel {
 
             let x_in = x.clone();
             let mods_c = single_mods.clone();
-            let pe_cos_c = pe_cos.clone();
-            let pe_sin_c = pe_sin.clone();
+            // Pick the right pe_cos / pe_sin: routed-gathered when inside the
+            // route range, otherwise the original full-T tensors. Tread=None
+            // → both `pe_*_routed` are None → unconditional .clone() of the
+            // full-T pe_cos/pe_sin (zero-overhead).
+            let inside_route = tread
+                .map(|t| i >= t.route_block_start && i < t.route_block_end)
+                .unwrap_or(false);
+            let pe_cos_c = if inside_route {
+                pe_cos_routed.as_ref().expect("pe_cos_routed set on entry").clone()
+            } else {
+                pe_cos.clone()
+            };
+            let pe_sin_c = if inside_route {
+                pe_sin_routed.as_ref().expect("pe_sin_routed set on entry").clone()
+            } else {
+                pe_sin.clone()
+            };
             let nh = self.kconfig.num_heads;
             let hd = self.kconfig.head_dim;
+
+            // OOM fix (2026-05-08): Klein 9B (17.5 GB) used to OOM around block
+            // 28 because the checkpoint closure captured `layer_weights` — a
+            // HashMap of GPU Tensor handles for the whole block — and the
+            // closure is held in `ctx.checkpoint_fns` until backward replay.
+            // 24 closures × ~700 MB/block = full 24 GB before backward even
+            // started. The post-block `evict_block` couldn't free anything
+            // because the closure clones still pinned the storage.
+            //
+            // Fix: when offloading, the closure captures the offloader Arc +
+            // unified_idx + prefix only (small, no GPU memory). Inside the
+            // closure body it calls `ensure_block(unified_idx)` to (re-)load
+            // the block on demand — first call comes from the forward path
+            // (slot 1/2 LRU rotation), subsequent calls during backward
+            // replay re-fetch from pinned RAM. This way only the 2 GPU slots
+            // (~1.4 GB on 9B) are ever live across all blocks.
+            //
+            // Non-offload path (resident weights) keeps the previous capture
+            // behavior — Tensor handles are cheap clones of already-resident
+            // GPU storage, no slot management needed.
+            let mut layer_weights: HashMap<String, Tensor> = HashMap::new();
+            if self.offloader.is_none() {
+                for (k, v) in self.weights.iter() {
+                    if k.starts_with(&prefix) { layer_weights.insert(k.clone(), v.clone()); }
+                }
+            }
+            let offloader_for_closure = self.offloader.clone();
+            let prefix_for_closure = prefix.clone();
 
             x = if use_checkpoint {
                 flame_core::autograd::AutogradContext::checkpoint(
                     &[x_in.clone()],
-                    move || single_block_forward_standalone(
-                        x_in.clone(), mods_c.clone(),
-                        pe_cos_c.clone(), pe_sin_c.clone(),
-                        layer_weights.clone(), lora.clone(),
-                        i, nh, hd, inner, mlp,
-                    ),
+                    move || {
+                        // Build per-block weight map: from offloader (re-fetch
+                        // a slot on every call so backward replay works) or
+                        // from the captured resident snapshot.
+                        let lw: HashMap<String, Tensor> = if let Some(ref off) = offloader_for_closure {
+                            let arc = off.lock()
+                                .map_err(|e| flame_core::FlameError::InvalidInput(
+                                    format!("Klein single {i}: offloader lock: {e}")))?
+                                .ensure_block(unified_idx)
+                                .map_err(|e| flame_core::FlameError::InvalidInput(
+                                    format!("Klein single {i}: offloader ensure_block({unified_idx}): {e}")))?;
+                            // Strip the "single_blocks.{i}." prefix-key check
+                            // is a no-op since the offloader returns exactly
+                            // this block's tensors keyed by their full name.
+                            let mut m = HashMap::with_capacity(arc.len());
+                            for (k, v) in arc.iter() {
+                                if k.starts_with(&prefix_for_closure) {
+                                    m.insert(k.clone(), v.clone());
+                                }
+                            }
+                            m
+                        } else {
+                            layer_weights.clone()
+                        };
+                        single_block_forward_standalone(
+                            x_in.clone(), mods_c.clone(),
+                            pe_cos_c.clone(), pe_sin_c.clone(),
+                            lw, lora.clone(),
+                            i, nh, hd, inner, mlp,
+                        )
+                    },
                 )?
             } else {
-                single_block_forward_standalone(
+                // Non-checkpoint path: legacy behavior — load via offloader
+                // into self.weights, run, evict.
+                if let Some(ref off) = self.offloader {
+                    let arc = off.lock()
+                        .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
+                        .ensure_block(unified_idx)
+                        .map_err(|e| crate::EriDiffusionError::Model(format!("offloader ensure_block({unified_idx}): {e}")))?;
+                    for (k, v) in arc.iter() {
+                        if k.starts_with(&prefix) { layer_weights.insert(k.clone(), v.clone()); }
+                    }
+                }
+                let out = single_block_forward_standalone(
                     x_in, mods_c, pe_cos_c, pe_sin_c,
                     layer_weights, lora, i, nh, hd, inner, mlp,
-                )?
+                )?;
+                if let Some(ref off) = self.offloader {
+                    off.lock()
+                        .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
+                        .evict_block();
+                }
+                out
             };
-            // Evict single block from weights and release GPU slot.
-            if let Some(ref off) = self.offloader {
-                self.weights.retain(|k, _| !k.starts_with(&prefix));
-                off.lock()
-                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
-                    .evict_block();
+
+            // ---- TREAD: exit routed range — scatter back ----
+            // route_block_end is half-open (block end is the FIRST block
+            // that runs again on the full sequence). So scatter when the
+            // next iteration index equals route_block_end.
+            if let Some(t) = tread {
+                if i + 1 == t.route_block_end {
+                    if let Some(skip) = tread_skip_residual.take() {
+                        x = t.scatter_routed(&x, &skip)?;
+                        pe_cos_routed = None;
+                        pe_sin_routed = None;
+                    }
+                }
             }
         }
+
+        // Safety: if `route_block_end` was past the last single block, the
+        // exit branch above never fired — scatter now so the rest of the
+        // forward sees full-sequence activations again.
+        if let (Some(t), Some(skip)) = (tread, tread_skip_residual.take()) {
+            x = t.scatter_routed(&x, &skip)?;
+            pe_cos_routed = None;
+            pe_sin_routed = None;
+        }
+        let _ = (&pe_cos_routed, &pe_sin_routed);
 
         // ---- Extract image tokens ----
         let total_len = x.shape().dims()[1];

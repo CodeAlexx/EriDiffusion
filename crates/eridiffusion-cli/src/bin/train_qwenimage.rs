@@ -20,7 +20,14 @@ use flame_core::gradient_clip::GradientClipper;
 use eridiffusion_core::encoders::qwen25vl::Qwen25VLEncoder;
 use eridiffusion_core::models::{qwenimage as qwen_model, QwenImageTrainingModel};
 use eridiffusion_core::sampler::qwenimage_sampler;
+use eridiffusion_core::training::board::BoardWriter;
 use eridiffusion_core::training::checkpoint::{self, CkptHeader};
+use eridiffusion_core::config::LrScheduler;
+use eridiffusion_core::training::features::{
+    ema_advanced::EmaConfig, loss_weight, lr_schedule, noise_modifiers, timestep_bias,
+};
+use eridiffusion_core::training::ema::ParameterEma;
+use eridiffusion_core::training::training_features::OptimizerKind;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::path::PathBuf;
 
@@ -93,6 +100,69 @@ struct Args {
     #[arg(long, default_value = "4.0")] sample_cfg: f32,
     #[arg(long, default_value = "42")] sample_seed: u64,
     #[arg(long, default_value_t = 512)] sample_max_text_len: usize,
+
+    // ── Phase 0 multi-feature rollout (default-off; Phase 1+ will consume) ──
+    #[arg(long)] min_snr_gamma: Option<f32>,
+    #[arg(long, default_value_t = 0.0)] caption_dropout_probability: f32,
+    #[arg(long, default_value_t = 1.0)] noise_offset_probability: f32,
+    #[arg(long, default_value_t = 0.0)] gamma_input_perturbation: f32,
+    #[arg(long, default_value_t = 0.0)] huber_strength: f32,
+    #[arg(long, default_value_t = 0.0)] lr_min_factor: f32,
+    #[arg(long)] validation_dataset_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 0)] validation_every_steps: u64,
+    #[arg(long, num_args = 0..)] multi_backend_weights: Vec<f32>,
+    /// Phase 2: paired with --multi-backend-weights. Klein-only wiring; other
+    /// trainers accept-and-warn until per-model wiring lands.
+    #[arg(long, num_args = 0..)] multi_backend_cache_dirs: Vec<std::path::PathBuf>,
+    /// Phase 2: validation prompt library JSON (Klein-only wiring; other
+    /// trainers accept-and-warn).
+    #[arg(long)] validation_prompts_file: Option<std::path::PathBuf>,
+    #[arg(long, default_value_t = 0.0)] masked_loss_weight: f32,
+    /// Master switch for EMA shadow. When `true` an F32 shadow is built from
+    /// current live params (post resume_lora / pre-step-0) and updated after
+    /// each opt.step via `update_with_schedule` per the EmaConfig schedule
+    /// (see `--ema-inv-gamma`, `--ema-power`, `--ema-min-decay`,
+    /// `--ema-update-after-step`, `--ema-max-decay`). Training loss is
+    /// byte-identical to `--ema=false` because the shadow is parallel — only
+    /// `--ema-validation-swap` makes it visible at sample / checkpoint time.
+    #[arg(long, default_value_t = false)] ema: bool,
+    #[arg(long, default_value_t = 1.0)] ema_inv_gamma: f32,
+    #[arg(long, default_value_t = 0.6667)] ema_power: f32,
+    #[arg(long, default_value_t = 0)] ema_update_after_step: u64,
+    #[arg(long, default_value_t = 0.0)] ema_min_decay: f32,
+    /// Phase 3: EMA decay clamp upper bound. The schedule clamps the
+    /// per-step computed decay to `[ema_min_decay, ema_max_decay]`. Standard
+    /// values: 0.999 (fast averaging), 0.9999 (default — diffusers EMAModel),
+    /// 0.99999 (very slow averaging).
+    #[arg(long, default_value_t = 0.9999)] ema_max_decay: f32,
+    /// Phase 3: swap EMA shadow weights into live params at sample/checkpoint
+    /// time. Default false. No effect when EMA is not constructed.
+    #[arg(long, default_value_t = false)] ema_validation_swap: bool,
+    #[arg(long)] tread_route_pattern: Option<String>,
+
+    // ── Multi-resolution noise (default-off; byte-invariant when 0) ──────
+    #[arg(long, default_value_t = 0)] multires_noise_iterations: usize,
+    #[arg(long, default_value_t = 0.3)] multires_noise_discount: f32,
+
+    // ── Timestep biasing (default `none` is byte-identity) ───────────────
+    #[arg(long, default_value = "none")] timestep_bias_strategy: String,
+    #[arg(long, default_value_t = 0.0)] timestep_bias_multiplier: f32,
+    #[arg(long, default_value_t = 0.0)] timestep_bias_range_min: f32,
+    #[arg(long, default_value_t = 1.0)] timestep_bias_range_max: f32,
+    /// Phase 1: optimizer family CLI surface (Phase 5 wires full dispatch).
+    #[arg(long, default_value = "adamw")] optimizer: String,
+
+    // ── Phase 6 multi-feature rollout (plumb-only; multi-backend wired in Klein) ──
+    #[arg(long, num_args = 0..)] multi_backend_repeats: Vec<u32>,
+    #[arg(long, default_value_t = false)] caption_tag_shuffle: bool,
+    #[arg(long, default_value_t = false)] cache_clear_each_epoch: bool,
+    #[arg(long, default_value_t = false)] cache_invalidate: bool,
+    /// Phase 5: LR scheduler family. Default `constant` is byte-equivalent to
+    /// the legacy linear-warmup-then-flat path qwenimage has used since launch.
+    /// Accepted: constant, linear, cosine, cosine_with_restarts, polynomial, rex.
+    #[arg(long, default_value = "constant")] lr_scheduler: String,
+    /// Phase 5: cosine-with-restarts cycle count. Ignored for other schedulers.
+    #[arg(long, default_value_t = 1.0)] lr_cycles: f32,
 }
 
 /// Self-adjusting shift based on image sequence length.
@@ -138,6 +208,16 @@ fn sample_timestep_logit_normal_qwenshift(rng: &mut StdRng, shift: f32) -> f32 {
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let args = Args::parse();
+    // Phase 2: Klein-only wiring of multi-backend + validation prompts library.
+    // Other trainers accept-and-warn so configs/launchers aren't broken; full
+    // wiring is a follow-up after the per-model encoder + sample paths are
+    // consolidated.
+    if !args.multi_backend_cache_dirs.is_empty() || !args.multi_backend_weights.is_empty() {
+        log::warn!("--multi-backend-* flags are Klein-only in Phase 2; ignored here");
+    }
+    if args.validation_prompts_file.is_some() {
+        log::warn!("--validation-prompts-file is Klein-only in Phase 2; ignored here");
+    }
     flame_core::config::set_default_dtype(DType::BF16);
     let device = flame_core::global_cuda_device();
 
@@ -306,7 +386,77 @@ fn main() -> anyhow::Result<()> {
     }
     log::info!("Found {} cached samples", cache_files.len());
 
+    match OptimizerKind::parse(&args.optimizer) {
+        Ok(OptimizerKind::AdamW) => {}
+        Ok(other) => log::warn!(
+            "non-AdamW optimizer selected: {} — Phase 1 falls back to AdamW (full dispatch in Phase 5)",
+            other.as_str()
+        ),
+        Err(e) => log::warn!("--optimizer parse: {} — falling back to AdamW", e),
+    }
+    if args.caption_dropout_probability > 0.0 {
+        log::warn!(
+            "caption_dropout_probability={:.3} requested but Qwen-Image trainer has no inline encoder — feature disabled",
+            args.caption_dropout_probability
+        );
+    }
     let mut optimizer = AdamW::new(args.lr, 0.9, 0.999, 1e-8, 0.01);
+
+    // EMA shadow (Phase 3 advanced). Built from current live params (post
+    // resume_lora / pre-step-0). Updated after each opt.step via
+    // `update_with_schedule`. Optional swap into live params at sample /
+    // checkpoint time when --ema-validation-swap is set.
+    let ema_cfg = EmaConfig {
+        inv_gamma: args.ema_inv_gamma,
+        power: args.ema_power,
+        update_after_step: args.ema_update_after_step,
+        min_decay: args.ema_min_decay,
+        max_decay: args.ema_max_decay,
+    };
+    let mut ema: Option<ParameterEma> = if args.ema {
+        let _g = AutogradContext::no_grad();
+        let e = ParameterEma::new(&params, args.ema_max_decay)
+            .map_err(|e| anyhow::anyhow!("EMA construction failed: {e}"))?;
+        log::info!(
+            "[ema] WIRED — {} shadow tensors, inv_gamma={} power={} update_after_step={} min_decay={} max_decay={} validation_swap={}",
+            e.len(),
+            ema_cfg.inv_gamma,
+            ema_cfg.power,
+            ema_cfg.update_after_step,
+            ema_cfg.min_decay,
+            ema_cfg.max_decay,
+            args.ema_validation_swap,
+        );
+        Some(e)
+    } else {
+        None
+    };
+
+    // Timestep bias config — defaults are byte-identical (Strategy::None).
+    // qwenimage operates in continuous-sigma space [0, 1] (logit-normal then
+    // qwen_shift remap), so we pass `total = 1.0` to apply_bias rather than
+    // the `NUM_TRAIN_TIMESTEPS = 1000` convention used by Klein/Z-Image.
+    let timestep_bias_cfg = {
+        let strategy = timestep_bias::Strategy::parse(&args.timestep_bias_strategy)
+            .map_err(|e| anyhow::anyhow!("--timestep-bias-strategy: {e}"))?;
+        let cfg = timestep_bias::BiasConfig {
+            strategy,
+            multiplier: args.timestep_bias_multiplier,
+            range_min: args.timestep_bias_range_min,
+            range_max: args.timestep_bias_range_max,
+        };
+        if strategy != timestep_bias::Strategy::None {
+            log::info!(
+                "[timestep-bias] strategy={} multiplier={} range=[{}, {}]",
+                strategy.as_str(),
+                cfg.multiplier,
+                cfg.range_min,
+                cfg.range_max
+            );
+        }
+        cfg
+    };
+
     let mut start_step = 0usize;
 
     // Resume.
@@ -336,16 +486,33 @@ fn main() -> anyhow::Result<()> {
     let clipper = GradientClipper::clip_by_norm(1.0);
     let mut rng = StdRng::seed_from_u64(args.seed);
     let mut total_loss = 0.0f32;
+    let board = BoardWriter::open(
+        &args.output_dir,
+        BoardWriter::new_session_id(),
+        if start_step > 0 { Some(start_step as u64) } else { None },
+    ).map_err(|e| log::warn!("board.db open failed: {e}")).ok();
+    if let Some(b) = &board {
+        log::info!("SerenityBoard: writing scalars to {}", b.db_path.display());
+    }
     let t_start = std::time::Instant::now();
 
     log::info!("Training {} steps from step={}", args.steps, start_step);
+    let sched: LrScheduler = args.lr_scheduler.parse().unwrap_or_else(|e: String| {
+        log::warn!("[lr_scheduler] {e} — falling back to Constant");
+        LrScheduler::Constant
+    });
     for step in start_step..args.steps {
-        // LR warmup.
-        let current_lr = if step < args.warmup_steps {
-            args.lr * (step as f32 + 1.0) / args.warmup_steps as f32
-        } else {
-            args.lr
-        };
+        // Phase 5: dispatch via LrScheduler enum. Default `Constant` is
+        // byte-equivalent to the legacy hand-rolled linear-warmup-then-flat path.
+        let current_lr = lr_schedule::dispatch_lr(
+            &sched,
+            args.lr,
+            step,
+            args.steps,
+            args.warmup_steps,
+            args.lr_min_factor,
+            args.lr_cycles,
+        );
         optimizer.set_lr(current_lr);
 
         // Load one cached sample.
@@ -363,15 +530,46 @@ fn main() -> anyhow::Result<()> {
         let _ = b;
 
         // Sample timestep with qwen_shift.
-        let sigma = sample_timestep_logit_normal_qwenshift(&mut rng, shift);
+        let raw_t = sample_timestep_logit_normal_qwenshift(&mut rng, shift);
+        // Default-off: Strategy::None → returns raw_t unchanged. qwenimage
+        // sigma is already in [0, 1], so we pass total=1.0.
+        let t_continuous = timestep_bias::apply_bias(
+            raw_t,
+            1.0,
+            &timestep_bias_cfg,
+        );
+        let sigma = t_continuous;
         let timestep = Tensor::from_vec(vec![sigma], Shape::from_dims(&[1]), device.clone())?
             .to_dtype(DType::BF16)?;
 
         // Flow-matching: x_t = (1 - sigma) * latent + sigma * noise; target = noise - latent.
         let noise = Tensor::randn(latent.shape().clone(), 0.0, 1.0, device.clone())?
             .to_dtype(DType::BF16)?;
-        let xt = latent.mul_scalar(1.0 - sigma)?.add(&noise.mul_scalar(sigma)?)?;
-        let target = noise.sub(&latent)?;
+        // Multi-resolution noise (default-off). When iterations==0 returns
+        // noise.clone() with no rng draw — byte-identical to baseline.
+        let noise = noise_modifiers::maybe_apply_multires_noise(
+            &noise,
+            args.multires_noise_iterations,
+            args.multires_noise_discount,
+            &mut rng,
+        )?;
+        // Phase 1: noise modifiers (default-off). Qwen-Image trainer doesn't
+        // load TrainConfig JSON — `offset_noise_weight` is hardcoded 0.0.
+        // Offset noise is part of the clean noise distribution; input
+        // perturbation feeds model input only.
+        let clean_noise = noise_modifiers::maybe_apply_offset_noise(
+            &noise,
+            0.0,
+            args.noise_offset_probability,
+            &mut rng,
+        )?;
+        let perturbed_noise = noise_modifiers::maybe_apply_input_perturbation(
+            &clean_noise,
+            args.gamma_input_perturbation,
+            &mut rng,
+        )?;
+        let xt = latent.mul_scalar(1.0 - sigma)?.add(&perturbed_noise.mul_scalar(sigma)?)?;
+        let target = clean_noise.sub(&latent)?;
 
         // Pack [B, 16, H, W] → [B, H/2 * W/2, 64] for forward.
         let xt_packed = qwen_model::pack_latents(&xt)?;
@@ -382,11 +580,23 @@ fn main() -> anyhow::Result<()> {
         let pred = model.forward(&xt_packed, &timestep, &txt_embed, latent_h, latent_w)?;
 
         // MSE loss in F32.
+        // Phase 1: combined loss + per-step weighting. Default-off invariant.
         let pred_f32 = pred.to_dtype(DType::F32)?;
         let target_f32 = target_packed.to_dtype(DType::F32)?;
-        let diff = pred_f32.sub(&target_f32)?;
-        let sq = diff.mul(&diff)?;
-        let loss = sq.mean()?;
+        let raw_loss = loss_weight::combined_loss(
+            &pred_f32,
+            &target_f32,
+            1.0,
+            0.0,
+            args.huber_strength,
+        )?;
+        let loss = loss_weight::apply_loss_weight(
+            &raw_loss,
+            sigma,
+            eridiffusion_core::config::LossWeight::Constant,
+            args.min_snr_gamma,
+            true,
+        )?;
 
         let loss_val: f32 = loss.to_vec()?.first().copied().unwrap_or(f32::NAN);
         if !loss_val.is_finite() {
@@ -426,32 +636,60 @@ fn main() -> anyhow::Result<()> {
             optimizer.step(&params)?;
             optimizer.zero_grad(&params);
             model.refresh_lora_cache();
+            if let Some(ref mut e) = ema {
+                e.update_with_schedule(&params, &ema_cfg, (step + 1) as u64)
+                    .map_err(|err| anyhow::anyhow!("EMA update failed at step {}: {err}", step + 1))?;
+            }
         }
         AutogradContext::clear();
         flame_core::cuda_alloc_pool::clear_pool_cache();
 
-        // Per-step log (matches the readable zimage_lora_train format the user
-        // approved, with elapsed in HH:MM:SS / HHH:MM:SS for >24h runs).
         let step_num = step + 1;
-        let avg = total_loss / (step_num - start_step) as f32;
-        let elapsed = t_start.elapsed().as_secs_f32();
-        let done = (step_num - start_step) as f32;
-        let s_per_step = elapsed / done.max(1.0);
-        let remaining = (args.steps - step_num) as f32 * s_per_step;
-        log::info!(
-            "step {}/{} | loss={:.4} avg={:.4} | grad_norm={:.4} | lr={:.2e} | {:.2}s/step | elapsed {} | ETA {}",
-            step_num, args.steps, loss_val, avg, grad_norm, current_lr,
-            s_per_step,
-            format_elapsed(elapsed),
-            format_elapsed(remaining),
+        let _ = total_loss;
+        eridiffusion_core::training::progress::log_step(
+            step, args.steps, cache_files.len(), 1,
+            loss_val, grad_norm, current_lr, t_start, board.as_ref(),
         );
 
         if args.save_every > 0 && step_num % args.save_every == 0 && step_num < args.steps {
+            // EMA swap: when `--ema --ema-validation-swap`, the periodic save
+            // captures EMA-averaged weights. Restored after save so optimizer
+            // moments stay consistent with the live tensors they were taken
+            // against.
+            let ema_backup = if args.ema_validation_swap {
+                if let Some(ref e) = ema {
+                    let _g = AutogradContext::no_grad();
+                    Some(e.swap_with_live(&params)
+                        .map_err(|err| anyhow::anyhow!("EMA swap_with_live (mid) failed: {err}"))?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let path = args.output_dir.join(format!("qwenimage_lora_step{}.safetensors", step_num));
             save_ckpt(&path, &model, &optimizer, args.rank, args.lora_alpha, args.seed, &args.save_mode, step_num)?;
+            if let (Some(backup), Some(ref e)) = (ema_backup, &ema) {
+                let _g = AutogradContext::no_grad();
+                e.restore_swapped(&params, backup)
+                    .map_err(|err| anyhow::anyhow!("EMA restore_swapped (mid) failed: {err}"))?;
+            }
         }
 
         // No in-loop sampling — see top comment.
+    }
+
+    // Final EMA swap (covers both final save and final sample below). No
+    // restore at the very end — process exits, no further training. Skipped
+    // when --ema-validation-swap is off or no EMA was constructed.
+    if args.ema_validation_swap {
+        if let Some(ref e) = ema {
+            let _g = AutogradContext::no_grad();
+            // Discard the backup: training is over, restore is unnecessary.
+            let _ = e.swap_with_live(&params)
+                .map_err(|err| anyhow::anyhow!("EMA swap_with_live (final) failed: {err}"))?;
+            log::info!("[ema] swapped EMA shadow into live params for final save + sample");
+        }
     }
 
     let final_path = args.output_dir.join(format!("qwenimage_lora_{}steps.safetensors", args.steps));
@@ -493,6 +731,7 @@ fn main() -> anyhow::Result<()> {
         total_loss / trained.max(1) as f32,
         final_path.display(),
     );
+    if let Some(b) = &board { b.set_status("completed"); }
     Ok(())
 }
 

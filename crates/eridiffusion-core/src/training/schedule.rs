@@ -16,6 +16,28 @@ pub fn cosine_lr(base_lr: f32, step: usize, total_steps: usize) -> f32 {
     base_lr * cosine
 }
 
+/// Cosine LR with a floor multiplier. Lerps the decay between
+/// `min_factor * base_lr` and `base_lr`, so the schedule never drops below
+/// `min_factor * base_lr` at the bottom of cosine decay.
+///
+/// `min_factor = 0.0` is byte-identical to [`cosine_lr`].
+pub fn cosine_lr_with_floor(
+    base_lr: f32,
+    step: usize,
+    total_steps: usize,
+    min_factor: f32,
+) -> f32 {
+    if min_factor <= 0.0 {
+        return cosine_lr(base_lr, step, total_steps);
+    }
+    if total_steps <= 1 {
+        return base_lr;
+    }
+    let progress = step as f32 / (total_steps.saturating_sub(1)) as f32;
+    let cosine = 0.5 * (1.0 + (std::f32::consts::PI * progress).cos());
+    base_lr * (min_factor + (1.0 - min_factor) * cosine)
+}
+
 /// Constant learning rate with linear warmup.
 pub fn constant_with_warmup(base_lr: f32, step: usize, warmup_steps: usize) -> f32 {
     if warmup_steps == 0 || step >= warmup_steps {

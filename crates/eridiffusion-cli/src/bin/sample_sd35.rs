@@ -309,7 +309,8 @@ fn main() -> anyhow::Result<()> {
     for (idx, (ctx_cond, pool_cond)) in conds.iter().enumerate() {
         log::info!("  [{}/{}] denoising prompt...", idx + 1, conds.len());
         let numel = VAE_LATENT_CHANNELS * h_lat * w_lat;
-        let mut rng = rand::rngs::StdRng::seed_from_u64(args.seed);
+        // Per-prompt seed offset for diverse compositions in batch sampling.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(args.seed.wrapping_add(idx as u64));
         let mut data = Vec::with_capacity(numel);
         while data.len() < numel {
             let u1 = rng.gen::<f32>().max(1e-10);

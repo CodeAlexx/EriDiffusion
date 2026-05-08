@@ -126,6 +126,28 @@ pub enum LrScheduler {
     Cosine,
     #[serde(rename = "COSINE_WITH_RESTARTS")]
     CosineWithRestarts,
+    #[serde(rename = "POLYNOMIAL")]
+    Polynomial,
+    #[serde(rename = "REX")]
+    Rex,
+}
+
+impl std::str::FromStr for LrScheduler {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_uppercase().as_str() {
+            "CONSTANT" | "CONSTANT_WITH_WARMUP" => Ok(LrScheduler::Constant),
+            "LINEAR" => Ok(LrScheduler::Linear),
+            "COSINE" => Ok(LrScheduler::Cosine),
+            "COSINE_WITH_RESTARTS" | "COSINE_RESTARTS" => Ok(LrScheduler::CosineWithRestarts),
+            "POLYNOMIAL" | "POLY" => Ok(LrScheduler::Polynomial),
+            "REX" => Ok(LrScheduler::Rex),
+            other => Err(format!(
+                "unknown LrScheduler '{other}'; expected one of: \
+                 constant, linear, cosine, cosine_with_restarts, polynomial, rex"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

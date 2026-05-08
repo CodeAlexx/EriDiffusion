@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use super::enums::*;
 
 // For serde default = "path" references — keeps the module clean.
@@ -30,6 +31,8 @@ fn default_backup_mins() -> u64 { 30 }
 fn default_save_sample10() -> u64 { 10 }
 fn default_resolution() -> String { "1024".to_string() }
 fn default_optimizer() -> String { "adamw".to_string() }
+fn default_one_f32() -> f32 { 1.0 }
+fn default_ema_power() -> f32 { 0.6667 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainConfig {
@@ -173,7 +176,84 @@ pub struct TrainConfig {
     // ── Debug ──
     #[serde(default = "default_false")]
     pub debug_mode: bool,
+
+    // ── Phase 1 (multi-feature rollout) — default-off ──
+    /// MIN-SNR-γ loss weighting. `None` = no weighting (default).
+    #[serde(default)]
+    pub min_snr_gamma: Option<f32>,
+    /// Probability of replacing caption with cached unconditional embedding
+    /// per training step. `0.0` = never drop (default).
+    #[serde(default)]
+    pub caption_dropout_probability: f32,
+    /// Bernoulli gate for the offset-noise modifier. Only takes effect if
+    /// `offset_noise_weight > 0`. Default `1.0` keeps current behavior:
+    /// when offset noise is enabled, it always fires.
+    #[serde(default = "default_one_f32")]
+    pub noise_offset_probability: f32,
+    /// γ for input-perturbation noise modifier. `0.0` = no perturbation (default).
+    #[serde(default)]
+    pub gamma_input_perturbation: f32,
+    /// Huber-loss strength (combined with `mse_strength` and `mae_strength`).
+    /// `0.0` = no Huber term (default).
+    #[serde(default)]
+    pub huber_strength: f32,
+    /// Floor multiplier on the LR schedule (e.g. `0.1` keeps LR ≥ 0.1·base_lr
+    /// at the bottom of cosine decay). `0.0` = no floor (default).
+    #[serde(default)]
+    pub lr_min_factor: f32,
+
+    // ── Phase 2 ──
+    /// Held-out validation cache directory. `None` = no validation (default).
+    #[serde(default)]
+    pub validation_dataset_dir: Option<PathBuf>,
+    /// Run validation every N training steps. `0` = disabled (default).
+    #[serde(default)]
+    pub validation_every_steps: u64,
+    /// Per-backend sampling weights for multi-concept dataset mixing.
+    /// Empty = single backend, identical to today's behavior.
+    #[serde(default)]
+    pub multi_backend_weights: Vec<f32>,
+    /// JSON file describing N validation prompts × M seeds for periodic
+    /// sample rendering. `None` = single-prompt path (default).
+    #[serde(default)]
+    pub validation_prompts_file: Option<PathBuf>,
+
+    // ── Phase 3 ──
+    /// Foreground-mask weight for masked-loss weighting. `0.0` = unmasked (default).
+    #[serde(default)]
+    pub masked_loss_weight: f32,
+    /// EMA `inv_gamma` for power-decay schedule.
+    #[serde(default = "default_one_f32")]
+    pub ema_inv_gamma: f32,
+    /// EMA `power` for power-decay schedule.
+    #[serde(default = "default_ema_power")]
+    pub ema_power: f32,
+    /// Skip EMA updates until this step.
+    #[serde(default)]
+    pub ema_update_after_step: u64,
+    /// EMA decay floor.
+    #[serde(default)]
+    pub ema_min_decay: f32,
+    /// Swap EMA shadow weights INTO the live parameters at sample/checkpoint
+    /// time so renders + saves use the EMA-averaged weights. Default `false`
+    /// preserves prior behavior (samples render against the live training
+    /// weights). Caller must also have EMA active for this to do anything.
+    #[serde(default)]
+    pub ema_validation_swap: bool,
+
+    // ── Phase 4 ──
+    /// TREAD route pattern, e.g. `"12-23"`. `None` = no token routing (default).
+    #[serde(default)]
+    pub tread_route_pattern: Option<String>,
+    /// TREAD keep ratio: fraction of tokens that route through the routed
+    /// block range. `1.0` (default) → no routing, byte-identical to
+    /// non-TREAD forward. Phase 4 ships the CLI surface; Phase 4.5 wires
+    /// it into model forward.
+    #[serde(default = "default_tread_keep_ratio")]
+    pub tread_keep_ratio: f32,
 }
+
+fn default_tread_keep_ratio() -> f32 { 1.0 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelPartConfig {
@@ -275,6 +355,28 @@ impl Default for TrainConfig {
             output_model_format: ModelFormat::Safetensors,
             train_device: String::new(),
             debug_mode: false,
+            // Phase 1 — defaults preserve existing behavior
+            min_snr_gamma: None,
+            caption_dropout_probability: 0.0,
+            noise_offset_probability: 1.0,
+            gamma_input_perturbation: 0.0,
+            huber_strength: 0.0,
+            lr_min_factor: 0.0,
+            // Phase 2
+            validation_dataset_dir: None,
+            validation_every_steps: 0,
+            multi_backend_weights: Vec::new(),
+            validation_prompts_file: None,
+            // Phase 3
+            masked_loss_weight: 0.0,
+            ema_inv_gamma: 1.0,
+            ema_power: 0.6667,
+            ema_update_after_step: 0,
+            ema_min_decay: 0.0,
+            ema_validation_swap: false,
+            // Phase 4
+            tread_route_pattern: None,
+            tread_keep_ratio: 1.0,
         }
     }
 }

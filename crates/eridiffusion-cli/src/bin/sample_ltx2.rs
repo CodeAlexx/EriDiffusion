@@ -169,7 +169,8 @@ fn main() -> anyhow::Result<()> {
     for (idx, cond) in conds.iter().enumerate() {
         log::info!("  [{}/{}] denoising prompt...", idx + 1, conds.len());
         use rand::SeedableRng;
-        let _rng = rand::rngs::StdRng::seed_from_u64(args.seed);
+        // Per-prompt seed offset for diverse compositions in batch sampling.
+        let _rng = rand::rngs::StdRng::seed_from_u64(args.seed.wrapping_add(idx as u64));
         let mut latent = Tensor::randn(
             Shape::from_dims(&[1, 128, f_lat, h_lat, w_lat]),
             0.0, 1.0, device.clone(),

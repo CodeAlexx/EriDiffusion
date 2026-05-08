@@ -29,7 +29,15 @@ use std::path::PathBuf;
 use eridiffusion_core::encoders::qwen3::Qwen3Encoder;
 use eridiffusion_core::models::zimage::ZImageModel;
 use eridiffusion_core::sampler::zimage_sampler;
+use eridiffusion_core::training::board::BoardWriter;
 use eridiffusion_core::training::checkpoint::{self, CkptHeader};
+use eridiffusion_core::config::LrScheduler;
+use eridiffusion_core::training::ema::ParameterEma;
+use eridiffusion_core::training::features::ema_advanced::EmaConfig;
+use eridiffusion_core::training::features::{
+    caption_dropout, loss_weight, lr_schedule, noise_modifiers, timestep_bias,
+};
+use eridiffusion_core::training::training_features::OptimizerKind;
 
 const ZIMAGE_TEMPLATE_PRE: &str = "<|im_start|>user\n";
 const ZIMAGE_TEMPLATE_POST: &str = "<|im_end|>\n<|im_start|>assistant\n";
@@ -101,6 +109,63 @@ struct Args {
     #[arg(long, default_value = "4.0")] sample_cfg: f32,
     #[arg(long, default_value = "3.0")] sample_shift: f32,
     #[arg(long, default_value = "42")] sample_seed: u64,
+
+    // ── Phase 0 multi-feature rollout (default-off; Phase 1+ will consume) ──
+    #[arg(long)] min_snr_gamma: Option<f32>,
+    #[arg(long, default_value_t = 0.0)] caption_dropout_probability: f32,
+    #[arg(long, default_value_t = 1.0)] noise_offset_probability: f32,
+    #[arg(long, default_value_t = 0.0)] gamma_input_perturbation: f32,
+    #[arg(long, default_value_t = 0.0)] huber_strength: f32,
+    #[arg(long, default_value_t = 0.0)] lr_min_factor: f32,
+    #[arg(long)] validation_dataset_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 0)] validation_every_steps: u64,
+    #[arg(long, num_args = 0..)] multi_backend_weights: Vec<f32>,
+    /// Phase 2: paired with --multi-backend-weights. Klein-only wiring; other
+    /// trainers accept-and-warn until per-model wiring lands.
+    #[arg(long, num_args = 0..)] multi_backend_cache_dirs: Vec<std::path::PathBuf>,
+    /// Phase 2: validation prompt library JSON (Klein-only wiring; other
+    /// trainers accept-and-warn).
+    #[arg(long)] validation_prompts_file: Option<std::path::PathBuf>,
+    #[arg(long, default_value_t = 0.0)] masked_loss_weight: f32,
+    /// Master switch for EMA shadow. See train_klein.rs for full doc.
+    /// Default off → byte-identical to pre-flag commits.
+    #[arg(long, default_value_t = false)] ema: bool,
+    #[arg(long, default_value_t = 1.0)] ema_inv_gamma: f32,
+    #[arg(long, default_value_t = 0.6667)] ema_power: f32,
+    #[arg(long, default_value_t = 0)] ema_update_after_step: u64,
+    #[arg(long, default_value_t = 0.0)] ema_min_decay: f32,
+    #[arg(long, default_value_t = 0.9999)] ema_max_decay: f32,
+    /// Swap shadow → live params at sample/save time.
+    #[arg(long, default_value_t = false)] ema_validation_swap: bool,
+    /// Pyramid / multi-resolution noise: number of additional resolution
+    /// levels to mix into the per-step training noise. `0` (default) is a
+    /// no-op — byte-identical to no-multires.
+    #[arg(long, default_value_t = 0)] multires_noise_iterations: usize,
+    /// Per-level discount factor for `--multires-noise-iterations`.
+    #[arg(long, default_value_t = 0.3)] multires_noise_discount: f32,
+    /// Multi-distribution timestep bias strategy. `none` is byte-identical.
+    #[arg(long, default_value = "none")] timestep_bias_strategy: String,
+    #[arg(long, default_value_t = 0.0)] timestep_bias_multiplier: f32,
+    #[arg(long, default_value_t = 0.0)] timestep_bias_range_min: f32,
+    #[arg(long, default_value_t = 1.0)] timestep_bias_range_max: f32,
+    #[arg(long)] tread_route_pattern: Option<String>,
+    /// Phase 1: optimizer family CLI surface; non-AdamW selection logs a
+    /// warning and falls back to AdamW (full dispatch in Phase 5).
+    #[arg(long, default_value = "adamw")] optimizer: String,
+
+    // ── Phase 6 multi-feature rollout (plumb-only; multi-backend wired in Klein) ──
+    #[arg(long, num_args = 0..)] multi_backend_repeats: Vec<u32>,
+    #[arg(long, default_value_t = false)] caption_tag_shuffle: bool,
+    #[arg(long, default_value_t = false)] cache_clear_each_epoch: bool,
+    #[arg(long, default_value_t = false)] cache_invalidate: bool,
+    /// Phase 5: LR scheduler family. Default `constant` + `warmup_steps=0` is
+    /// byte-equivalent to the prior fixed-LR behaviour.
+    /// Accepted: constant, linear, cosine, cosine_with_restarts, polynomial, rex.
+    #[arg(long, default_value = "constant")] lr_scheduler: String,
+    /// Phase 5: linear LR warmup steps. Default 0 keeps prior behaviour.
+    #[arg(long, default_value_t = 0)] warmup_steps: usize,
+    /// Phase 5: cosine-with-restarts cycle count. Ignored for other schedulers.
+    #[arg(long, default_value_t = 1.0)] lr_cycles: f32,
 }
 
 /// LOGIT_NORMAL timestep sample matching OT _get_timestep_discrete.
@@ -124,6 +189,16 @@ fn main() -> anyhow::Result<()> {
     use rand::SeedableRng;
     env_logger::init();
     let args = Args::parse();
+    // Phase 2: Klein-only wiring of multi-backend + validation prompts library.
+    // Other trainers accept-and-warn so configs/launchers aren't broken; full
+    // wiring is a follow-up after the per-model encoder + sample paths are
+    // consolidated.
+    if !args.multi_backend_cache_dirs.is_empty() || !args.multi_backend_weights.is_empty() {
+        log::warn!("--multi-backend-* flags are Klein-only in Phase 2; ignored here");
+    }
+    if args.validation_prompts_file.is_some() {
+        log::warn!("--validation-prompts-file is Klein-only in Phase 2; ignored here");
+    }
     std::fs::create_dir_all(&args.output_dir)?;
 
     flame_core::config::set_default_dtype(DType::BF16);
@@ -148,7 +223,59 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("No trainable parameters — ZImageModel produced empty param list");
     }
 
+    match OptimizerKind::parse(&args.optimizer) {
+        Ok(OptimizerKind::AdamW) => {}
+        Ok(other) => log::warn!(
+            "non-AdamW optimizer selected: {} — Phase 1 falls back to AdamW (full dispatch in Phase 5)",
+            other.as_str()
+        ),
+        Err(e) => log::warn!("--optimizer parse: {} — falling back to AdamW", e),
+    }
     let mut opt = AdamW::new(args.lr, 0.9, 0.999, 1e-8, 0.01);
+
+    // EMA shadow (Phase 3). See train_klein.rs for the same pattern.
+    let ema_cfg = EmaConfig {
+        inv_gamma: args.ema_inv_gamma,
+        power: args.ema_power,
+        update_after_step: args.ema_update_after_step,
+        min_decay: args.ema_min_decay,
+        max_decay: args.ema_max_decay,
+    };
+    let mut ema: Option<ParameterEma> = if args.ema {
+        let _g = AutogradContext::no_grad();
+        let e = ParameterEma::new(&params, args.ema_max_decay)
+            .map_err(|e| anyhow::anyhow!("EMA construction failed: {e}"))?;
+        log::info!(
+            "[ema] WIRED — {} shadow tensors, swap={}",
+            e.len(),
+            args.ema_validation_swap
+        );
+        Some(e)
+    } else {
+        None
+    };
+
+    // Timestep bias config — defaults are byte-identical (Strategy::None).
+    let timestep_bias_cfg = {
+        let strategy = timestep_bias::Strategy::parse(&args.timestep_bias_strategy)
+            .map_err(|e| anyhow::anyhow!("--timestep-bias-strategy: {e}"))?;
+        let cfg = timestep_bias::BiasConfig {
+            strategy,
+            multiplier: args.timestep_bias_multiplier,
+            range_min: args.timestep_bias_range_min,
+            range_max: args.timestep_bias_range_max,
+        };
+        if strategy != timestep_bias::Strategy::None {
+            log::info!(
+                "[timestep-bias] strategy={} multiplier={} range=[{}, {}]",
+                strategy.as_str(),
+                cfg.multiplier,
+                cfg.range_min,
+                cfg.range_max
+            );
+        }
+        cfg
+    };
 
     // ── Full resume: weights + AdamW state + step counter ────────────────
     let mut start_step: usize = 0;
@@ -188,6 +315,16 @@ fn main() -> anyhow::Result<()> {
     // ── Periodic-sample setup ────────────────────────────────────────────
     // Pre-encode cond/uncond prompts ONCE then drop Qwen3 from VRAM.
     let periodic = args.sample_every > 0;
+    // Phase 1: caption-dropout effective probability — disabled if no uncond
+    // source is available (i.e. periodic sample is off so no encoder ran).
+    let mut effective_caption_dropout_prob = args.caption_dropout_probability;
+    if effective_caption_dropout_prob > 0.0 && !periodic {
+        log::warn!(
+            "caption_dropout_probability={:.3} but --sample-every is 0 (no unconditional embedding source) — feature disabled",
+            effective_caption_dropout_prob
+        );
+        effective_caption_dropout_prob = 0.0;
+    }
     let (sample_cap, sample_cap_mask, sample_uncond, sample_uncond_mask, sample_vae_path) = if periodic {
         let qwen3_path = args.sample_qwen3.as_ref()
             .ok_or_else(|| anyhow::anyhow!("--sample-every > 0 requires --sample-qwen3"))?;
@@ -264,6 +401,14 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    let board = BoardWriter::open(
+        &args.output_dir,
+        BoardWriter::new_session_id(),
+        if start_step > 0 { Some(start_step as u64) } else { None },
+    ).map_err(|e| log::warn!("board.db open failed: {e}")).ok();
+    if let Some(b) = &board {
+        log::info!("SerenityBoard: writing scalars to {}", b.db_path.display());
+    }
     let t_start = std::time::Instant::now();
     let mut total_loss = 0f32;
     let total_steps = args.steps;
@@ -271,6 +416,10 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("start_step {} >= --steps {}", start_step, total_steps);
     }
 
+    let sched: LrScheduler = args.lr_scheduler.parse().unwrap_or_else(|e: String| {
+        log::warn!("[lr_scheduler] {e} — falling back to Constant");
+        LrScheduler::Constant
+    });
     for step in start_step..total_steps {
         // Stack `batch_size` cached samples (matches upstream Python klein9b/zimage preset = batch=2).
         let bs = args.batch_size.max(1);
@@ -303,8 +452,47 @@ fn main() -> anyhow::Result<()> {
                  else { Tensor::cat(&ms.iter().collect::<Vec<_>>(), 0)? })
         } else { None };
 
+        // Phase 1: caption dropout. Swap conditional → unconditional (cached
+        // at sample-setup) with probability `p`. No-op when p == 0.0.
+        let (cap_feats, cap_mask) = if effective_caption_dropout_prob > 0.0 {
+            if let (Some(unc), unc_mask) = (sample_uncond.as_ref(), sample_uncond_mask.as_ref()) {
+                use rand::Rng as _;
+                if rng.r#gen::<f32>() < effective_caption_dropout_prob {
+                    let unc_b = if unc.shape().dims()[0] == bs {
+                        unc.clone()
+                    } else {
+                        let mut tgt = unc.shape().dims().to_vec();
+                        tgt[0] = bs;
+                        unc.broadcast_to(&Shape::from_dims(&tgt))?
+                    };
+                    let unc_mask_b = unc_mask.map(|m| {
+                        if m.shape().dims()[0] == bs {
+                            Ok(m.clone())
+                        } else {
+                            let mut tgt = m.shape().dims().to_vec();
+                            tgt[0] = bs;
+                            m.broadcast_to(&Shape::from_dims(&tgt))
+                        }
+                    }).transpose()?;
+                    (unc_b, unc_mask_b)
+                } else {
+                    (cap_feats, cap_mask)
+                }
+            } else {
+                (cap_feats, cap_mask)
+            }
+        } else {
+            (cap_feats, cap_mask)
+        };
+
         // LOGIT_NORMAL continuous timestep ∈ [0, NUM_TRAIN_TIMESTEPS), then floor → sigma idx.
-        let t_continuous = sample_timestep_logit_normal(&mut rng);
+        let raw_t = sample_timestep_logit_normal(&mut rng);
+        // Default-off: Strategy::None → returns raw_t unchanged.
+        let t_continuous = timestep_bias::apply_bias(
+            raw_t,
+            NUM_TRAIN_TIMESTEPS as f32,
+            &timestep_bias_cfg,
+        );
         let sigma_idx = (t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
         let sigma = (sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32;
         // Z-Image's training-time `t` to the model is `1 - sigma` (per zimage_sampler).
@@ -312,12 +500,37 @@ fn main() -> anyhow::Result<()> {
 
         let noise = Tensor::randn(latent.shape().clone(), 0.0, 1.0, device.clone())?
             .to_dtype(DType::BF16)?;
-        let noisy = noise.mul_scalar(sigma)?
+        // Pyramid / multi-resolution noise (additive). Default-off when
+        // iterations == 0 → byte-identical.
+        let noise = noise_modifiers::maybe_apply_multires_noise(
+            &noise,
+            args.multires_noise_iterations,
+            args.multires_noise_discount,
+            &mut rng,
+        )?;
+        // Phase 1: noise modifiers (default-off). Z-Image trainer does not
+        // load a TrainConfig JSON, so offset_noise_weight isn't surfaced —
+        // defaults to 0.0 (off). Add a CLI flag in a follow-up if needed.
+        // Offset noise is part of the clean noise distribution; perturbation
+        // is added to the model input only. Default-off byte invariance is
+        // preserved because gamma=0 → perturbed_noise == clean_noise.
+        let clean_noise = noise_modifiers::maybe_apply_offset_noise(
+            &noise,
+            0.0,
+            args.noise_offset_probability,
+            &mut rng,
+        )?;
+        let perturbed_noise = noise_modifiers::maybe_apply_input_perturbation(
+            &clean_noise,
+            args.gamma_input_perturbation,
+            &mut rng,
+        )?;
+        let noisy = perturbed_noise.mul_scalar(sigma)?
             .add(&latent.mul_scalar(1.0 - sigma)?)?;
         // Rectified-flow target: pred ≈ -velocity where velocity = noise - clean.
         // Caller of model.forward in the sampler does `pred * -1`, so the trained
         // pred is `clean - noise`. Train against that.
-        let target = latent.sub(&noise)?;
+        let target = latent.sub(&clean_noise)?;
         let timestep = Tensor::from_vec(
             vec![t_value], Shape::from_dims(&[1]), device.clone(),
         )?.to_dtype(DType::BF16)?;
@@ -333,8 +546,26 @@ fn main() -> anyhow::Result<()> {
             anyhow::bail!("pred {:?} != target {:?}", pred.shape().dims(), target.shape().dims());
         }
 
-        let diff = pred.to_dtype(DType::F32)?.sub(&target.to_dtype(DType::F32)?)?;
-        let loss = diff.square()?.mean()?;
+        // Phase 1: combined loss + per-step weighting. Default-off invariant.
+        // Z-Image trainer does not currently load TrainConfig JSON; mse=1.0,
+        // mae=0.0, loss_weight_fn=Constant defaults are inlined here. Per-step
+        // weighting still picks up `--min-snr-gamma` from args.
+        let pred_f32 = pred.to_dtype(DType::F32)?;
+        let target_f32 = target.to_dtype(DType::F32)?;
+        let raw_loss = loss_weight::combined_loss(
+            &pred_f32,
+            &target_f32,
+            1.0,
+            0.0,
+            args.huber_strength,
+        )?;
+        let loss = loss_weight::apply_loss_weight(
+            &raw_loss,
+            sigma,
+            eridiffusion_core::config::LossWeight::Constant,
+            args.min_snr_gamma,
+            true,
+        )?;
         let loss_val = loss.to_vec()?[0];
         total_loss += loss_val;
 
@@ -355,27 +586,57 @@ fn main() -> anyhow::Result<()> {
                 param.set_grad(g_scaled)?;
             }
         }
+        // Phase 5: dispatch LR. Default sched=Constant + warmup_steps=0
+        // returns args.lr exactly → byte-equivalent to prior behaviour.
+        let cur_lr = lr_schedule::dispatch_lr(
+            &sched,
+            args.lr,
+            step,
+            args.steps,
+            args.warmup_steps,
+            args.lr_min_factor,
+            args.lr_cycles,
+        );
         {
             let _g = AutogradContext::no_grad();
+            opt.set_lr(cur_lr);
             opt.step(&params)?;
             opt.zero_grad(&params);
+            if let Some(ref mut e) = ema {
+                e.update_with_schedule(&params, &ema_cfg, (step + 1) as u64)
+                    .map_err(|err| anyhow::anyhow!("EMA update failed at step {}: {err}", step + 1))?;
+            }
         }
         AutogradContext::clear();
         model.refresh_lora_cache();
 
-        if step == 0 || (step + 1) % 10 == 0 {
-            let avg = total_loss / (step + 1) as f32;
-            let elapsed = t_start.elapsed().as_secs_f32();
-            let sps = (step + 1) as f32 / elapsed.max(0.001);
-            log::info!("step {}/{} | loss={:.4} avg={:.4} | {:.2} step/s",
-                step + 1, args.steps, loss_val, avg, sps);
-        }
+        let _ = total_loss;
+        eridiffusion_core::training::progress::log_step(
+            step, args.steps, cache_files.len(), args.batch_size.max(1),
+            loss_val, total_norm, cur_lr, t_start, board.as_ref(),
+        );
 
         // ── Periodic save (independent of sample) ──────────────────────
         let step_num = step + 1;
         let save_now = (periodic && step_num % args.sample_every == 0
             || args.save_every > 0 && step_num % args.save_every == 0)
             && step_num < args.steps;
+        // EMA swap: when --ema --ema-validation-swap, save and sample see
+        // EMA-averaged weights. Backup is restored at the end of this block.
+        let ema_backup = if (save_now
+            || (periodic && step_num % args.sample_every == 0 && step_num < args.steps))
+            && args.ema_validation_swap
+        {
+            if let Some(ref e) = ema {
+                let _g = AutogradContext::no_grad();
+                Some(e.swap_with_live(&params)
+                    .map_err(|err| anyhow::anyhow!("EMA swap_with_live (mid) failed: {err}"))?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         if save_now {
             let mid_ckpt = args.output_dir.join(format!("zimage_lora_step{step_num}.safetensors"));
             if save_mode_full {
@@ -422,11 +683,27 @@ fn main() -> anyhow::Result<()> {
                 log::warn!("[sample step={step_num}] failed: {e}");
             }
         }
+        if let (Some(backup), Some(ref e)) = (ema_backup, &ema) {
+            let _g = AutogradContext::no_grad();
+            e.restore_swapped(&params, backup)
+                .map_err(|err| anyhow::anyhow!("EMA restore_swapped (mid) failed: {err}"))?;
+        }
+    }
+
+    // Final EMA swap before final save+sample. No restore — process exits.
+    if args.ema_validation_swap {
+        if let Some(ref e) = ema {
+            let _g = AutogradContext::no_grad();
+            let _ = e.swap_with_live(&params)
+                .map_err(|err| anyhow::anyhow!("EMA swap_with_live (final) failed: {err}"))?;
+            log::info!("[ema] swapped EMA shadow into live params for final save + sample");
+        }
     }
 
     let trained = total_steps - start_step;
     let avg_loss = if trained > 0 { total_loss / trained as f32 } else { 0.0 };
     log::info!("Training complete: {trained} new steps (total step={total_steps}), avg loss={:.4}", avg_loss);
+    if let Some(b) = &board { b.set_status("completed"); }
 
     let ckpt = args.output_dir.join(format!("zimage_lora_{}steps.safetensors", args.steps));
     if save_mode_full {

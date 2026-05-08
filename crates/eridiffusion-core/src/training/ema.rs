@@ -16,6 +16,8 @@
 
 use flame_core::{parameter::Parameter, DType, Result, Tensor};
 
+use crate::training::features::ema_advanced::{decay_at_step, EmaConfig};
+
 pub struct ParameterEma {
     decay: f32,
     /// Same length as the parameter list passed at construction time;
@@ -80,5 +82,76 @@ impl ParameterEma {
     /// All shadow tensors as a slice.
     pub fn shadow_all(&self) -> &[Tensor] {
         &self.shadow
+    }
+
+    /// Apply one EMA update using the diffusers-style power-decay schedule
+    /// from [`EmaConfig`]. Decay is recomputed each call from `step`. Returns
+    /// `Ok(())` without touching the shadow when the schedule short-circuits
+    /// to 0.0 (pre-warmup or `min_decay==0` early steps with a `max_decay`
+    /// of 0).
+    ///
+    /// Uses the existing [`Self::update`] math under the hood by temporarily
+    /// swapping `self.decay` to the scheduled value.
+    pub fn update_with_schedule(
+        &mut self,
+        params: &[Parameter],
+        cfg: &EmaConfig,
+        step: u64,
+    ) -> Result<()> {
+        let scheduled = decay_at_step(cfg, step);
+        if scheduled <= 0.0 {
+            return Ok(());
+        }
+        let prev = self.decay;
+        self.decay = scheduled;
+        let res = self.update(params);
+        self.decay = prev;
+        res
+    }
+
+    /// Swap shadow ↔ live params: copy each shadow tensor INTO the matching
+    /// [`Parameter`]'s data slot, returning the previous live tensors as
+    /// a backup the caller passes to [`Self::restore_swapped`] later.
+    ///
+    /// Use this around sample renders / checkpoint saves to evaluate with the
+    /// EMA-averaged weights. Restoration is mandatory before the next
+    /// optimizer step or training continues against EMA weights instead of
+    /// the optimizer's working copy.
+    pub fn swap_with_live(&self, params: &[Parameter]) -> Result<Vec<Tensor>> {
+        if self.shadow.len() != params.len() {
+            return Err(flame_core::Error::InvalidInput(format!(
+                "EMA shadow count {} != params count {}",
+                self.shadow.len(),
+                params.len()
+            )));
+        }
+        let _no_grad = flame_core::autograd::AutogradContext::no_grad();
+        let mut backup = Vec::with_capacity(params.len());
+        for (idx, param) in params.iter().enumerate() {
+            // Save current live tensor.
+            backup.push(param.tensor()?);
+            // Cast shadow to the param's working dtype before swap-in so a
+            // BF16-storage param doesn't accidentally swap to F32.
+            let target_dtype = param.dtype()?;
+            let shadow_cast = self.shadow[idx].to_dtype(target_dtype)?;
+            param.set_data(shadow_cast)?;
+        }
+        Ok(backup)
+    }
+
+    /// Restore the live tensors captured by [`Self::swap_with_live`].
+    pub fn restore_swapped(&self, params: &[Parameter], backup: Vec<Tensor>) -> Result<()> {
+        if backup.len() != params.len() {
+            return Err(flame_core::Error::InvalidInput(format!(
+                "EMA restore backup count {} != params count {}",
+                backup.len(),
+                params.len()
+            )));
+        }
+        let _no_grad = flame_core::autograd::AutogradContext::no_grad();
+        for (param, t) in params.iter().zip(backup) {
+            param.set_data(t)?;
+        }
+        Ok(())
     }
 }

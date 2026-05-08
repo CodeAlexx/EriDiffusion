@@ -212,9 +212,13 @@ fn main() -> anyhow::Result<()> {
 
     for (idx, cond) in conds.iter().enumerate() {
         log::info!("  [{}/{}] denoising prompt...", idx + 1, conds.len());
-        // Seeded normal noise via flame's randn (CUDA Box-Muller is internal there).
-        use rand::SeedableRng;
-        let _rng = rand::rngs::StdRng::seed_from_u64(args.seed);
+        // Seed the GLOBAL flame_core RNG (which Tensor::randn reads).
+        // Previously a local StdRng was created, never used, then dropped —
+        // `Tensor::randn` ignored it entirely, so per-prompt diversity wasn't
+        // really seeded. With set_seed we get a deterministic noise stream
+        // that varies per prompt index.
+        flame_core::rng::set_seed(args.seed.wrapping_add(idx as u64))
+            .map_err(|e| anyhow::anyhow!("flame_core::rng::set_seed: {e}"))?;
         let latent_shape = Shape::from_dims(&[1, 128, h_lat, w_lat]);
         let mut latent = Tensor::randn(latent_shape, 0.0, 1.0, device.clone())?
             .to_dtype(DType::BF16)?;

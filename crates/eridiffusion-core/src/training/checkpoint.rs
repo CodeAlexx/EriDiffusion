@@ -108,7 +108,7 @@ pub fn save_full(
     let mut metadata: HashMap<String, String> = HashMap::new();
     metadata.insert(CKPT_HEADER_KEY.to_string(), header_json);
 
-    serialization::save_tensors_with_metadata(&tensors, &metadata, path)
+    crate::training::save_direct::save_tensors_with_metadata_direct(&tensors, &metadata, path)
         .map_err(|e| EriDiffusionError::Training(format!("ckpt save: {e}")))?;
 
     log::info!(
@@ -272,6 +272,157 @@ pub fn apply_lora_weights(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Diffusers/PEFT → Kohya (ComfyUI-compatible) LoRA key converter
+// ---------------------------------------------------------------------------
+//
+// Port of SimpleTuner PR #2704 `convert_diffusers_to_comfyui_sd_lora`
+// (simpletuner/helpers/training/lora_format.py). ComfyUI's stock SDXL/SD1.x
+// LoRA loader expects Kohya-style keys: `lora_unet_<underscored_path>.lora_down.weight`,
+// `.lora_up.weight`, and a per-module `.alpha` scalar.
+//
+// Original Python triggers on diffusers component prefixes (`unet.`,
+// `text_encoder.`, `text_encoder_2.`) and accepts both PEFT
+// (`.lora_A.weight` / `.lora_B.weight`) and old-style
+// (`.lora.down.weight` / `.lora.up.weight`) suffixes.
+//
+// EDv2-specific note: the SDXL trainer's `named_parameters()` already emits
+// LDM-style internal paths (`input_blocks.X.1.transformer_blocks.Y.attnZ.to_q`),
+// not diffusers paths (`unet.down_blocks.X.attentions.Y...`). To keep the
+// porter honest about the source code we're porting, the converter accepts
+// an explicit `component_prefix` argument: callers wrap their map with
+// `unet.` (or another component) before invoking, so the inner logic mirrors
+// the SimpleTuner Python verbatim. `convert_sdxl_unet_to_kohya` is the
+// SDXL-trainer-specific helper that does the wrapping.
+
+/// Map a diffusers component prefix to its Kohya prefix.
+/// Mirrors SimpleTuner `_kohya_component_prefix` (sdxl=true).
+fn kohya_component_prefix(component_prefix: &str, sdxl: bool) -> Option<&'static str> {
+    let component = component_prefix.strip_suffix('.').unwrap_or(component_prefix);
+    match component {
+        "unet" => Some("lora_unet"),
+        "text_encoder" => Some(if sdxl { "lora_te1" } else { "lora_te" }),
+        "text_encoder_2" if sdxl => Some("lora_te2"),
+        _ => None,
+    }
+}
+
+/// Build the Kohya module key for a diffusers module key.
+/// Mirrors SimpleTuner `_kohya_module_key`.
+fn kohya_module_key(module_key: &str, component_prefix: &str, sdxl: bool) -> Option<String> {
+    let kohya_prefix = kohya_component_prefix(component_prefix, sdxl)?;
+    let module_path = module_key.strip_prefix(component_prefix)?;
+    let module_path = module_path.replace(".processor.", ".");
+    Some(format!("{kohya_prefix}_{}", module_path.replace('.', "_")))
+}
+
+/// Suffix rewrite map: PEFT/old → Kohya.
+fn suffix_map_lookup(key: &str) -> Option<(&'static str, &'static str)> {
+    // (matched, kohya_replacement)
+    const MAP: &[(&str, &str)] = &[
+        (".lora.down.weight", ".lora_down.weight"),
+        (".lora.up.weight", ".lora_up.weight"),
+        (".lora_A.weight", ".lora_down.weight"),
+        (".lora_B.weight", ".lora_up.weight"),
+    ];
+    for (s, repl) in MAP {
+        if key.ends_with(s) {
+            return Some((s, repl));
+        }
+    }
+    None
+}
+
+/// Verbatim port of SimpleTuner `convert_diffusers_to_comfyui_sd_lora`.
+///
+/// Inputs whose key doesn't match a known component prefix or LoRA suffix
+/// pass through unchanged.
+///
+/// `lora_alpha` is broadcast to every unique kohya module that emitted a
+/// `.lora_down.weight`. If `None`, no `.alpha` entries are synthesized
+/// (mirrors Python's None branch from `_resolve_alpha_for_module`).
+pub fn convert_diffusers_to_comfyui_sd_lora(
+    state_dict: &HashMap<String, Tensor>,
+    lora_alpha: Option<f32>,
+    sdxl: bool,
+    device: &Arc<CudaDevice>,
+) -> Result<HashMap<String, Tensor>> {
+    use flame_core::{DType, Shape};
+    let prefixes = ["unet.", "text_encoder.", "text_encoder_2."];
+    let mut converted: HashMap<String, Tensor> = HashMap::new();
+    let mut alpha_keys: Vec<String> = Vec::new();
+    let mut alpha_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (key, weight) in state_dict {
+        let component_prefix = prefixes.iter().find(|p| key.starts_with(*p)).copied();
+        let component_prefix = match component_prefix {
+            Some(p) => p,
+            None => {
+                converted.insert(key.clone(), weight.clone());
+                continue;
+            }
+        };
+        let matched = suffix_map_lookup(key);
+        let (matched_suffix, kohya_suffix) = match matched {
+            Some(m) => m,
+            None => {
+                converted.insert(key.clone(), weight.clone());
+                continue;
+            }
+        };
+        let module_key = &key[..key.len() - matched_suffix.len()];
+        let kohya_key = match kohya_module_key(module_key, component_prefix, sdxl) {
+            Some(k) => k,
+            None => {
+                converted.insert(key.clone(), weight.clone());
+                continue;
+            }
+        };
+        let new_key = format!("{kohya_key}{kohya_suffix}");
+        converted.insert(new_key, weight.clone());
+        if kohya_suffix == ".lora_down.weight" && alpha_seen.insert(kohya_key.clone()) {
+            alpha_keys.push(kohya_key);
+        }
+    }
+
+    if let Some(alpha) = lora_alpha {
+        for k in alpha_keys {
+            let t = Tensor::from_vec(vec![alpha], Shape::from_dims(&[]), device.clone())
+                .map_err(|e| EriDiffusionError::Training(format!("alpha tensor: {e}")))?
+                .to_dtype(DType::F32)
+                .map_err(|e| EriDiffusionError::Training(format!("alpha cast: {e}")))?;
+            converted.insert(format!("{k}.alpha"), t);
+        }
+    }
+    Ok(converted)
+}
+
+/// SDXL-trainer-specific wrapper: EDv2's SDXL trainer emits LDM-style keys
+/// (`input_blocks.X.1.transformer_blocks.Y.attnZ.to_q.lora_A.weight`) with
+/// no `unet.` prefix. To run the verbatim SimpleTuner port we synthesize the
+/// `unet.` prefix on weight keys, drop the existing `.alpha` companions
+/// (the converter regenerates them), and run the converter.
+///
+/// Optimizer-state keys (anything starting with `__opt__/`) and the
+/// `__eridiffusion_ckpt__` metadata are NOT touched — those belong to the
+/// resume path, not ComfyUI. The caller passes only the LoRA-weight subset.
+pub fn convert_sdxl_unet_to_kohya(
+    lora_state: &HashMap<String, Tensor>,
+    lora_alpha: f32,
+    device: &Arc<CudaDevice>,
+) -> Result<HashMap<String, Tensor>> {
+    let mut wrapped: HashMap<String, Tensor> = HashMap::with_capacity(lora_state.len());
+    for (k, v) in lora_state {
+        // Skip per-module `.alpha` companions written by save_weights —
+        // the converter regenerates them post-suffix-rewrite.
+        if k.ends_with(".alpha") {
+            continue;
+        }
+        wrapped.insert(format!("unet.{k}"), v.clone());
+    }
+    convert_diffusers_to_comfyui_sd_lora(&wrapped, Some(lora_alpha), /*sdxl=*/ true, device)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +561,151 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&tmp);
+        Ok(())
+    }
+
+    /// Cover SimpleTuner's documented test fixture verbatim: the diffusers
+    /// PEFT key for an SDXL unet attention down weight should rewrite to
+    /// `lora_unet_..._to_k.lora_down.weight`.
+    #[test]
+    fn kohya_converter_simpletuner_fixture() -> Result<()> {
+        let device = flame_core::global_cuda_device();
+        let mut sd: HashMap<String, Tensor> = HashMap::new();
+        // SimpleTuner test: unet attention down weight (PEFT key form).
+        let down = Tensor::from_vec(vec![0.5f32; 32], Shape::from_dims(&[8, 4]), device.clone())?;
+        let up = Tensor::from_vec(vec![0.25f32; 32], Shape::from_dims(&[4, 8]), device.clone())?;
+        sd.insert(
+            "unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.to_k.lora.down.weight".into(),
+            down.clone(),
+        );
+        sd.insert(
+            "unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.to_k.lora.up.weight".into(),
+            up.clone(),
+        );
+
+        // PEFT-style keys for text encoders (sdxl=true → te1/te2).
+        let te_d = Tensor::from_vec(vec![1.0f32; 4], Shape::from_dims(&[4]), device.clone())?;
+        let te_u = Tensor::from_vec(vec![1.0f32; 4], Shape::from_dims(&[4]), device.clone())?;
+        sd.insert("text_encoder.foo.bar.lora_A.weight".into(), te_d.clone());
+        sd.insert("text_encoder.foo.bar.lora_B.weight".into(), te_u.clone());
+        sd.insert("text_encoder_2.baz.qux.lora_A.weight".into(), te_d.clone());
+        sd.insert("text_encoder_2.baz.qux.lora_B.weight".into(), te_u.clone());
+
+        // .processor. substitution.
+        sd.insert(
+            "unet.x.processor.to_k.lora_A.weight".into(),
+            down.clone(),
+        );
+
+        // Pass-through: not a known component prefix.
+        let pass = Tensor::from_vec(vec![7.0f32], Shape::from_dims(&[1]), device.clone())?;
+        sd.insert("not_a_component.thing.weight".into(), pass.clone());
+
+        // Pass-through: known component prefix but no LoRA suffix.
+        sd.insert("unet.something.bias".into(), pass.clone());
+
+        let out = convert_diffusers_to_comfyui_sd_lora(&sd, Some(8.0), true, &device)?;
+
+        // Fixture from SimpleTuner tests/test_lora_metadata.py.
+        let expect_unet_down = "lora_unet_down_blocks_1_attentions_0_transformer_blocks_0_attn1_to_k.lora_down.weight";
+        let expect_unet_up = "lora_unet_down_blocks_1_attentions_0_transformer_blocks_0_attn1_to_k.lora_up.weight";
+        let expect_unet_alpha = "lora_unet_down_blocks_1_attentions_0_transformer_blocks_0_attn1_to_k.alpha";
+        assert!(out.contains_key(expect_unet_down), "missing {expect_unet_down}");
+        assert!(out.contains_key(expect_unet_up), "missing {expect_unet_up}");
+        assert!(out.contains_key(expect_unet_alpha), "missing alpha for unet attn key");
+
+        // Text encoder rewrites (sdxl → lora_te1 / lora_te2).
+        assert!(out.contains_key("lora_te1_foo_bar.lora_down.weight"));
+        assert!(out.contains_key("lora_te1_foo_bar.lora_up.weight"));
+        assert!(out.contains_key("lora_te1_foo_bar.alpha"));
+        assert!(out.contains_key("lora_te2_baz_qux.lora_down.weight"));
+        assert!(out.contains_key("lora_te2_baz_qux.lora_up.weight"));
+        assert!(out.contains_key("lora_te2_baz_qux.alpha"));
+
+        // .processor. → . substitution: no underscore-stranded `processor`.
+        assert!(out.contains_key("lora_unet_x_to_k.lora_down.weight"));
+        assert!(!out.keys().any(|k| k.contains("processor")));
+
+        // Pass-through preserved unchanged.
+        assert!(out.contains_key("not_a_component.thing.weight"));
+        assert!(out.contains_key("unet.something.bias"));
+
+        // Alpha is the requested value, F32, scalar.
+        let alpha_t = &out[expect_unet_alpha];
+        assert_eq!(alpha_t.shape().dims(), &[] as &[usize]);
+        assert_eq!(alpha_t.dtype(), DType::F32);
+        let alpha_v: Vec<f32> = alpha_t.to_vec1::<f32>()?;
+        assert_eq!(alpha_v.len(), 1);
+        assert!((alpha_v[0] - 8.0).abs() < 1e-6);
+
+        // No alpha when None passed.
+        let out_no_alpha = convert_diffusers_to_comfyui_sd_lora(&sd, None, true, &device)?;
+        assert!(!out_no_alpha.keys().any(|k| k.ends_with(".alpha")));
+
+        Ok(())
+    }
+
+    /// EDv2 SDXL trainer wrapper: real saved key like
+    ///   input_blocks.4.1.transformer_blocks.0.attn1.to_q.lora_A.weight
+    ///   input_blocks.4.1.transformer_blocks.0.attn1.to_q.alpha
+    /// must convert to
+    ///   lora_unet_input_blocks_4_1_transformer_blocks_0_attn1_to_q.lora_down.weight
+    ///   lora_unet_input_blocks_4_1_transformer_blocks_0_attn1_to_q.lora_up.weight
+    ///   lora_unet_input_blocks_4_1_transformer_blocks_0_attn1_to_q.alpha
+    /// and the original `.alpha` companion (already-LDM scalar) must be dropped.
+    #[test]
+    fn kohya_converter_sdxl_trainer_keys() -> Result<()> {
+        let device = flame_core::global_cuda_device();
+        let mut sd: HashMap<String, Tensor> = HashMap::new();
+
+        let down = Tensor::from_vec(vec![0.1f32; 16], Shape::from_dims(&[4, 4]), device.clone())?;
+        let up = Tensor::from_vec(vec![0.2f32; 16], Shape::from_dims(&[4, 4]), device.clone())?;
+        let pre_alpha = Tensor::from_vec(vec![1.0f32], Shape::from_dims(&[]), device.clone())?;
+
+        sd.insert(
+            "input_blocks.4.1.transformer_blocks.0.attn1.to_q.lora_A.weight".into(),
+            down.clone(),
+        );
+        sd.insert(
+            "input_blocks.4.1.transformer_blocks.0.attn1.to_q.lora_B.weight".into(),
+            up.clone(),
+        );
+        // SDXL trainer also writes `<prefix>.alpha` — converter must drop it.
+        sd.insert(
+            "input_blocks.4.1.transformer_blocks.0.attn1.to_q.alpha".into(),
+            pre_alpha,
+        );
+        // Multiple modules to verify alpha is per-unique-kohya-key.
+        sd.insert(
+            "middle_block.1.transformer_blocks.0.ff.net.2.lora_A.weight".into(),
+            down.clone(),
+        );
+        sd.insert(
+            "middle_block.1.transformer_blocks.0.ff.net.2.lora_B.weight".into(),
+            up.clone(),
+        );
+
+        let out = convert_sdxl_unet_to_kohya(&sd, 16.0, &device)?;
+
+        let attn_down = "lora_unet_input_blocks_4_1_transformer_blocks_0_attn1_to_q.lora_down.weight";
+        let attn_up = "lora_unet_input_blocks_4_1_transformer_blocks_0_attn1_to_q.lora_up.weight";
+        let attn_alpha = "lora_unet_input_blocks_4_1_transformer_blocks_0_attn1_to_q.alpha";
+        let ff_down = "lora_unet_middle_block_1_transformer_blocks_0_ff_net_2.lora_down.weight";
+        let ff_up = "lora_unet_middle_block_1_transformer_blocks_0_ff_net_2.lora_up.weight";
+        let ff_alpha = "lora_unet_middle_block_1_transformer_blocks_0_ff_net_2.alpha";
+
+        for k in [attn_down, attn_up, attn_alpha, ff_down, ff_up, ff_alpha] {
+            assert!(out.contains_key(k), "missing {k}; got keys: {:?}", out.keys().collect::<Vec<_>>());
+        }
+        // The pre-rewrite `.alpha` companion (LDM-style) must be gone.
+        assert!(!out.contains_key("input_blocks.4.1.transformer_blocks.0.attn1.to_q.alpha"));
+        // Old PEFT keys must be gone.
+        assert!(!out.keys().any(|k| k.ends_with(".lora_A.weight") || k.ends_with(".lora_B.weight")));
+
+        // Alpha value matches what the trainer passes (lora_alpha).
+        let v: Vec<f32> = out[attn_alpha].to_vec1::<f32>()?;
+        assert!((v[0] - 16.0).abs() < 1e-6);
+
         Ok(())
     }
 }

@@ -74,6 +74,11 @@ struct Args {
     #[arg(long, default_value = "20")] steps: usize,
     #[arg(long, default_value = "4.0")] cfg: f32,
     #[arg(long, default_value = "42")] seed: u64,
+    /// Sampler: `euler` (default, FlowMatch flux convention) or
+    /// `dpmpp_2m` (DPM++ 2M multistep, tighter prompt adherence per step).
+    /// chroma1-HD's creator-recommended config is cfg=3.6 steps=26 with
+    /// either sampler.
+    #[arg(long, default_value = "euler")] sampler: String,
     /// Use BlockOffloader (recommended for 24 GB cards — keeps ~3 GB free).
     #[arg(long)] offload: bool,
 }
@@ -233,7 +238,11 @@ fn main() -> anyhow::Result<()> {
         let numel = AE_IN_CHANNELS * latent_h * latent_w;
         let noise_data: Vec<f32> = {
             use rand::{rngs::StdRng, Rng, SeedableRng};
-            let mut rng = StdRng::seed_from_u64(args.seed);
+            // Per-prompt seed offset so each prompt gets different initial
+            // noise — same `--seed` produces a deterministic but DIVERSE
+            // batch instead of N near-identical compositions sharing the
+            // same noise init.
+            let mut rng = StdRng::seed_from_u64(args.seed.wrapping_add(idx as u64));
             let mut v = Vec::with_capacity(numel);
             while v.len() < numel {
                 let u1: f32 = rng.gen::<f32>().max(1e-10);
@@ -256,6 +265,9 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("noise tensor: {e}"))?;
 
         let t_step = std::time::Instant::now();
+        // DPM++ 2M needs a 1-entry history of prior `denoised`. Capacity
+        // 1 is enough — the 2nd-order step only looks back one entry.
+        let mut history = flux_sampler::MultistepHistory::new(1);
         for step in 0..args.steps {
             let t_curr = timesteps[step];
             let t_next = timesteps[step + 1];
@@ -288,10 +300,24 @@ fn main() -> anyhow::Result<()> {
                 .add(&scaled)
                 .map_err(|e| anyhow::anyhow!("cfg add: {e}"))?;
 
-            // Euler step: x_next = x + dt * pred
-            x = x
-                .add(&pred.mul_scalar(dt).map_err(|e| anyhow::anyhow!("dt mul: {e}"))?)
-                .map_err(|e| anyhow::anyhow!("euler step: {e}"))?;
+            x = match args.sampler.as_str() {
+                "euler" => {
+                    // Euler step: x_next = x + dt * pred  (dt < 0)
+                    x.add(&pred.mul_scalar(dt).map_err(|e| anyhow::anyhow!("dt mul: {e}"))?)
+                        .map_err(|e| anyhow::anyhow!("euler step: {e}"))?
+                }
+                "dpmpp_2m" => {
+                    // Data-prediction form for flow-match velocity model:
+                    // denoised = x - σ * v
+                    let denoised = x.sub(&pred.mul_scalar(t_curr)?).map_err(|e| anyhow::anyhow!("denoised: {e}"))?;
+                    let lambda = flux_sampler::lambda_from_sigma(t_curr);
+                    let x_next = flux_sampler::dpmpp_2m_step(&x, &denoised, t_curr, t_next, &history)
+                        .map_err(|e| anyhow::anyhow!("dpmpp_2m_step: {e}"))?;
+                    history.push(denoised, lambda);
+                    x_next
+                }
+                other => anyhow::bail!("unknown --sampler '{other}': use 'euler' or 'dpmpp_2m'"),
+            };
 
             if (step + 1) % 5 == 0 || step == 0 || step + 1 == args.steps {
                 log::info!(

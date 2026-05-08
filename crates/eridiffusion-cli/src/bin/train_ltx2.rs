@@ -28,16 +28,23 @@
 use clap::Parser;
 use std::path::PathBuf;
 
-use eridiffusion_core::config::{TrainConfig, TrainingMethod};
+use eridiffusion_core::config::{LrScheduler, TrainConfig, TrainingMethod};
+use eridiffusion_core::training::features::{
+    ema_advanced::EmaConfig, loss_weight, lr_schedule, noise_modifiers, timestep_bias,
+};
+use eridiffusion_core::training::ema::ParameterEma;
+use eridiffusion_core::training::training_features::OptimizerKind;
 use eridiffusion_core::debug as dbg;
 use eridiffusion_core::encoders::ltx2_vae::Ltx2Vae;
 use eridiffusion_core::models::{Ltx2Model, TrainableModel};
 use eridiffusion_core::sampler::ltx2_sampler;
+use eridiffusion_core::training::board::BoardWriter;
 use flame_core::adam::AdamW;
 use flame_core::autograd::AutogradContext;
 use flame_core::{DType, Shape, Tensor};
 
 const SEED: u64 = 42;
+const NUM_TRAIN_TIMESTEPS: usize = 1000;
 
 #[derive(Parser)]
 struct Args {
@@ -65,6 +72,65 @@ struct Args {
 
     /// Frames per second (RoPE temporal axis scaling). Default 24.
     #[arg(long, default_value = "24.0")] fps: f32,
+
+    // ── Phase 0 multi-feature rollout (default-off; Phase 1+ will consume) ──
+    #[arg(long)] min_snr_gamma: Option<f32>,
+    #[arg(long, default_value_t = 0.0)] caption_dropout_probability: f32,
+    #[arg(long, default_value_t = 1.0)] noise_offset_probability: f32,
+    #[arg(long, default_value_t = 0.0)] gamma_input_perturbation: f32,
+    #[arg(long, default_value_t = 0.0)] huber_strength: f32,
+    #[arg(long, default_value_t = 0.0)] lr_min_factor: f32,
+    #[arg(long)] validation_dataset_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 0)] validation_every_steps: u64,
+    #[arg(long, num_args = 0..)] multi_backend_weights: Vec<f32>,
+    /// Phase 2: paired with --multi-backend-weights. Klein-only wiring; other
+    /// trainers accept-and-warn until per-model wiring lands.
+    #[arg(long, num_args = 0..)] multi_backend_cache_dirs: Vec<std::path::PathBuf>,
+    /// Phase 2: validation prompt library JSON (Klein-only wiring; other
+    /// trainers accept-and-warn).
+    #[arg(long)] validation_prompts_file: Option<std::path::PathBuf>,
+    #[arg(long, default_value_t = 0.0)] masked_loss_weight: f32,
+    /// Master EMA switch. Default-off → byte-identical to no-EMA.
+    #[arg(long, default_value_t = false)] ema: bool,
+    #[arg(long, default_value_t = 1.0)] ema_inv_gamma: f32,
+    #[arg(long, default_value_t = 0.6667)] ema_power: f32,
+    #[arg(long, default_value_t = 0)] ema_update_after_step: u64,
+    #[arg(long, default_value_t = 0.0)] ema_min_decay: f32,
+    #[arg(long, default_value_t = 0.9999)] ema_max_decay: f32,
+    /// Swap EMA shadow into live params at sample/checkpoint time, then
+    /// restore. Default-off keeps live params untouched.
+    #[arg(long, default_value_t = false)] ema_validation_swap: bool,
+
+    /// Multi-resolution noise iterations. NOTE: helper is 4D-only; LTX-2 uses
+    /// 5D video latents [B, 128, F, H, W] so this flag emits a warn-and-skip.
+    /// Kept for CLI uniformity with other trainers.
+    #[arg(long, default_value_t = 0)] multires_noise_iterations: usize,
+    /// Per-level discount factor for `--multires-noise-iterations`.
+    #[arg(long, default_value_t = 0.3)] multires_noise_discount: f32,
+
+    /// Timestep biasing strategy: `none|earlier|later|range`. Default `none`
+    /// is byte-identical to no biasing.
+    #[arg(long, default_value = "none")] timestep_bias_strategy: String,
+    #[arg(long, default_value_t = 0.0)] timestep_bias_multiplier: f32,
+    #[arg(long, default_value_t = 0.0)] timestep_bias_range_min: f32,
+    #[arg(long, default_value_t = 1.0)] timestep_bias_range_max: f32,
+
+    #[arg(long)] tread_route_pattern: Option<String>,
+    /// Phase 1: optimizer family CLI surface (Phase 5 wires full dispatch).
+    #[arg(long, default_value = "adamw")] optimizer: String,
+
+    // ── Phase 6 multi-feature rollout (plumb-only; multi-backend wired in Klein) ──
+    #[arg(long, num_args = 0..)] multi_backend_repeats: Vec<u32>,
+    #[arg(long, default_value_t = false)] caption_tag_shuffle: bool,
+    #[arg(long, default_value_t = false)] cache_clear_each_epoch: bool,
+    #[arg(long, default_value_t = false)] cache_invalidate: bool,
+    /// Phase 5: LR scheduler family. Default `constant` + `warmup_steps=0` is
+    /// byte-equivalent to prior fixed-LR behaviour.
+    #[arg(long, default_value = "constant")] lr_scheduler: String,
+    /// Phase 5: linear LR warmup steps. Default 0 keeps prior behaviour.
+    #[arg(long, default_value_t = 0)] warmup_steps: usize,
+    /// Phase 5: cosine-with-restarts cycle count.
+    #[arg(long, default_value_t = 1.0)] lr_cycles: f32,
 }
 
 fn debug_enabled() -> bool {
@@ -76,6 +142,16 @@ fn main() -> anyhow::Result<()> {
     use rand::SeedableRng;
     env_logger::init();
     let args = Args::parse();
+    // Phase 2: Klein-only wiring of multi-backend + validation prompts library.
+    // Other trainers accept-and-warn so configs/launchers aren't broken; full
+    // wiring is a follow-up after the per-model encoder + sample paths are
+    // consolidated.
+    if !args.multi_backend_cache_dirs.is_empty() || !args.multi_backend_weights.is_empty() {
+        log::warn!("--multi-backend-* flags are Klein-only in Phase 2; ignored here");
+    }
+    if args.validation_prompts_file.is_some() {
+        log::warn!("--validation-prompts-file is Klein-only in Phase 2; ignored here");
+    }
     std::fs::create_dir_all(&args.output_dir)?;
 
     flame_core::config::set_default_dtype(DType::BF16);
@@ -86,6 +162,25 @@ fn main() -> anyhow::Result<()> {
     config.lora_rank = args.rank as u64;
     config.lora_alpha = args.lora_alpha;
     config.learning_rate = args.lr as f64;
+
+    // Phase 0 multi-feature rollout — plumb CLI args into config (default-off, unused yet).
+    config.min_snr_gamma = args.min_snr_gamma;
+    config.caption_dropout_probability = args.caption_dropout_probability;
+    config.noise_offset_probability = args.noise_offset_probability;
+    config.gamma_input_perturbation = args.gamma_input_perturbation;
+    config.huber_strength = args.huber_strength;
+    config.lr_min_factor = args.lr_min_factor;
+    config.validation_dataset_dir = args.validation_dataset_dir.clone();
+    config.validation_every_steps = args.validation_every_steps;
+    config.multi_backend_weights = args.multi_backend_weights.clone();
+    config.validation_prompts_file = args.validation_prompts_file.clone();
+    config.masked_loss_weight = args.masked_loss_weight;
+    config.ema_inv_gamma = args.ema_inv_gamma;
+    config.ema_power = args.ema_power;
+    config.ema_update_after_step = args.ema_update_after_step;
+    config.ema_min_decay = args.ema_min_decay;
+    config.ema_validation_swap = args.ema_validation_swap;
+    config.tread_route_pattern = args.tread_route_pattern.clone();
 
     // Load the LTX-2 transformer shards.
     let model_base = std::path::Path::new(&config.base_model_name);
@@ -118,7 +213,82 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("No trainable parameters — TrainingMethod::Lora produced empty param list");
     }
 
+    match OptimizerKind::parse(&args.optimizer) {
+        Ok(OptimizerKind::AdamW) => {}
+        Ok(other) => log::warn!(
+            "non-AdamW optimizer selected: {} — Phase 1 falls back to AdamW (full dispatch in Phase 5)",
+            other.as_str()
+        ),
+        Err(e) => log::warn!("--optimizer parse: {} — falling back to AdamW", e),
+    }
+    if args.caption_dropout_probability > 0.0 {
+        log::warn!(
+            "caption_dropout_probability={:.3} requested but LTX2 trainer has no inline encoder — feature disabled",
+            args.caption_dropout_probability
+        );
+    }
     let mut opt = AdamW::new(args.lr, 0.9, 0.999, 1e-8, 0.01);
+
+    // EMA shadow (Phase 3 advanced). Default-off → byte-identical to no-EMA.
+    // Updated under no_grad after each opt.step via `update_with_schedule`.
+    // Optional swap into live params at sample/checkpoint time when
+    // `--ema-validation-swap` is set.
+    let ema_cfg = EmaConfig {
+        inv_gamma: args.ema_inv_gamma,
+        power: args.ema_power,
+        update_after_step: args.ema_update_after_step,
+        min_decay: args.ema_min_decay,
+        max_decay: args.ema_max_decay,
+    };
+    let mut ema: Option<ParameterEma> = if args.ema {
+        let _g = AutogradContext::no_grad();
+        let e = ParameterEma::new(&params, args.ema_max_decay)
+            .map_err(|e| anyhow::anyhow!("EMA construction failed: {e}"))?;
+        log::info!(
+            "[ema] WIRED — {} shadow tensors, inv_gamma={} power={} update_after_step={} min_decay={} max_decay={} validation_swap={}",
+            e.len(),
+            ema_cfg.inv_gamma,
+            ema_cfg.power,
+            ema_cfg.update_after_step,
+            ema_cfg.min_decay,
+            ema_cfg.max_decay,
+            args.ema_validation_swap,
+        );
+        Some(e)
+    } else {
+        None
+    };
+
+    // Multi-resolution noise: helper expects 4D [B, C, H, W]. LTX-2 latents
+    // are 5D [B, 128, F, H, W] (video), so the helper would no-op silently.
+    // Warn explicitly so the user knows the flag has no effect here.
+    if args.multires_noise_iterations > 0 {
+        log::warn!(
+            "[multires-noise] LTX-2 uses 5D video latents; multires noise (4D-only helper) is skipped. Pass 0 to silence."
+        );
+    }
+
+    // Timestep bias config — defaults are byte-identical (Strategy::None).
+    let timestep_bias_cfg = {
+        let strategy = timestep_bias::Strategy::parse(&args.timestep_bias_strategy)
+            .map_err(|e| anyhow::anyhow!("--timestep-bias-strategy: {e}"))?;
+        let cfg = timestep_bias::BiasConfig {
+            strategy,
+            multiplier: args.timestep_bias_multiplier,
+            range_min: args.timestep_bias_range_min,
+            range_max: args.timestep_bias_range_max,
+        };
+        if strategy != timestep_bias::Strategy::None {
+            log::info!(
+                "[timestep-bias] strategy={} multiplier={} range=[{}, {}]",
+                strategy.as_str(),
+                cfg.multiplier,
+                cfg.range_min,
+                cfg.range_max
+            );
+        }
+        cfg
+    };
 
     let mut cache_files: Vec<PathBuf> = std::fs::read_dir(&args.cache_dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -132,10 +302,19 @@ fn main() -> anyhow::Result<()> {
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
 
+    let board = BoardWriter::open(
+        &args.output_dir,
+        BoardWriter::new_session_id(),
+        None,
+    ).map_err(|e| log::warn!("board.db open failed: {e}")).ok();
+    if let Some(b) = &board {
+        log::info!("SerenityBoard: writing scalars to {}", b.db_path.display());
+    }
     let t_start = std::time::Instant::now();
     let mut total_loss = 0f32;
     let mut first_save_done = false;
 
+    let sched: LrScheduler = lr_schedule::parse_cli_scheduler(&args.lr_scheduler);
     for step in 0..args.steps {
         // ── Build a batch by stacking `batch_size` cached samples along dim 0 ──
         let mut batch_latents: Vec<Tensor> = Vec::with_capacity(args.batch_size);
@@ -177,7 +356,14 @@ fn main() -> anyhow::Result<()> {
         let mu = ltx2_sampler::shift_for_token_count(n_tokens);
         let mut t_continuous = Vec::with_capacity(args.batch_size);
         for _ in 0..args.batch_size {
-            t_continuous.push(ltx2_sampler::sample_timestep_logit_normal(&mut rng, mu));
+            let raw_t = ltx2_sampler::sample_timestep_logit_normal(&mut rng, mu);
+            // Default-off: Strategy::None returns raw_t unchanged.
+            let t = timestep_bias::apply_bias(
+                raw_t,
+                NUM_TRAIN_TIMESTEPS as f32,
+                &timestep_bias_cfg,
+            );
+            t_continuous.push(t);
         }
         // Cap-and-floor to integer index for sigma lookup; LTX-2 uses 1000-step
         // discretization same as ERNIE/Z-Image.
@@ -189,13 +375,26 @@ fn main() -> anyhow::Result<()> {
         // ── Build noisy + target ──
         let noise = Tensor::randn(latent.shape().clone(), 0.0, 1.0, device.clone())?
             .to_dtype(DType::BF16)?;
+        // Phase 1: noise modifiers (default-off). Offset noise is part of the
+        // clean noise distribution; input perturbation feeds model input only.
+        let clean_noise = noise_modifiers::maybe_apply_offset_noise(
+            &noise,
+            config.offset_noise_weight as f32,
+            args.noise_offset_probability,
+            &mut rng,
+        )?;
+        let perturbed_noise = noise_modifiers::maybe_apply_input_perturbation(
+            &clean_noise,
+            args.gamma_input_perturbation,
+            &mut rng,
+        )?;
         // For batch_size > 1 with per-sample sigmas, noise scaling needs
         // per-sample broadcast. For batch_size == 1 (the bootstrap default) it's
         // a scalar; for >1 we expand a [B,1,1,1,1] tensor.
         let (noisy, target) = if args.batch_size == 1 {
             let s = sigmas[0];
-            let noisy = noise.mul_scalar(s)?.add(&latent.mul_scalar(1.0 - s)?)?;
-            let target = noise.sub(&latent)?;
+            let noisy = perturbed_noise.mul_scalar(s)?.add(&latent.mul_scalar(1.0 - s)?)?;
+            let target = clean_noise.sub(&latent)?;
             (noisy, target)
         } else {
             // Build [B, 1, 1, 1, 1] sigma tensor.
@@ -205,8 +404,8 @@ fn main() -> anyhow::Result<()> {
                 device.clone(),
             )?.to_dtype(DType::BF16)?;
             let one_minus_s = s_tensor.mul_scalar(-1.0)?.add_scalar(1.0)?;
-            let noisy = noise.mul(&s_tensor)?.add(&latent.mul(&one_minus_s)?)?;
-            let target = noise.sub(&latent)?;
+            let noisy = perturbed_noise.mul(&s_tensor)?.add(&latent.mul(&one_minus_s)?)?;
+            let target = clean_noise.sub(&latent)?;
             (noisy, target)
         };
 
@@ -235,8 +434,23 @@ fn main() -> anyhow::Result<()> {
         }
 
         // ── Loss = mean MSE in F32 ──
-        let diff = pred.to_dtype(DType::F32)?.sub(&target.to_dtype(DType::F32)?)?;
-        let loss = diff.square()?.mean()?;
+        // Phase 1: combined loss + per-step weighting. Default-off invariant.
+        let pred_f32 = pred.to_dtype(DType::F32)?;
+        let target_f32 = target.to_dtype(DType::F32)?;
+        let raw_loss = loss_weight::combined_loss(
+            &pred_f32,
+            &target_f32,
+            config.mse_strength as f32,
+            config.mae_strength as f32,
+            args.huber_strength,
+        )?;
+        let loss = loss_weight::apply_loss_weight(
+            &raw_loss,
+            sigmas[0],
+            config.loss_weight_fn,
+            args.min_snr_gamma,
+            true,
+        )?;
         let loss_val = loss.to_vec()?[0];
         total_loss += loss_val;
 
@@ -270,24 +484,56 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        // Phase 5: dispatch LR per scheduler. Default Constant + warmup_steps=0
+        // is byte-equivalent to prior fixed-LR behaviour.
+        let cur_lr = lr_schedule::dispatch_lr(
+            &sched,
+            args.lr,
+            step,
+            args.steps,
+            args.warmup_steps,
+            args.lr_min_factor,
+            args.lr_cycles,
+        );
         {
             let _g = AutogradContext::no_grad();
+            opt.set_lr(cur_lr);
             opt.step(&params)?;
             opt.zero_grad(&params);
+            if let Some(ref mut e) = ema {
+                e.update_with_schedule(&params, &ema_cfg, (step + 1) as u64)
+                    .map_err(|err| anyhow::anyhow!("EMA update failed at step {}: {err}", step + 1))?;
+            }
         }
         AutogradContext::clear();
 
-        if step == 0 || (step + 1) % 10 == 0 {
-            let avg = total_loss / (step + 1) as f32;
-            let elapsed = t_start.elapsed().as_secs_f32();
-            let sps = (step + 1) as f32 / elapsed.max(0.001);
-            log::info!("step {}/{} | loss={:.4} avg={:.4} | {:.2} step/s",
-                step + 1, args.steps, loss_val, avg, sps);
-        }
+        let _ = total_loss;
+        eridiffusion_core::training::progress::log_step(
+            step, args.steps, cache_files.len(), args.batch_size.max(1),
+            loss_val, total_norm, cur_lr, t_start, board.as_ref(),
+        );
 
-        // ── Periodic save ──
+        // ── Periodic save + sample ──
+        // EMA swap: when `--ema --ema-validation-swap`, save and sample see
+        // EMA-averaged weights. Backup is restored at the end of this block
+        // so the optimizer's accumulated moments stay consistent with the
+        // tensors they were taken against.
         let step_num = step + 1;
-        if args.save_every > 0 && step_num % args.save_every == 0 && step_num < args.steps {
+        let save_fires = args.save_every > 0 && step_num % args.save_every == 0 && step_num < args.steps;
+        let sample_fires = args.sample_every > 0 && step_num % args.sample_every == 0 && step_num < args.steps;
+        let ema_backup = if args.ema_validation_swap && (save_fires || sample_fires) {
+            if let Some(ref e) = ema {
+                let _g = AutogradContext::no_grad();
+                Some(e.swap_with_live(&params)
+                    .map_err(|err| anyhow::anyhow!("EMA swap_with_live (mid) failed: {err}"))?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if save_fires {
             let mid_ckpt = args.output_dir.join(format!("ltx2_lora_step{step_num}.safetensors"));
             if let Err(e) = model.save_weights(&mid_ckpt.to_string_lossy()) {
                 log::warn!("[mid-save step {step_num}] save_weights failed: {e}");
@@ -300,8 +546,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        // ── Periodic sample ──
-        if args.sample_every > 0 && step_num % args.sample_every == 0 && step_num < args.steps {
+        if sample_fires {
             let out = args.output_dir.join(format!("sample_step{step_num}.png"));
             if let Err(e) = inline_sample(
                 &mut model,
@@ -315,10 +560,29 @@ fn main() -> anyhow::Result<()> {
                 log::warn!("[sample step={step_num}] failed: {e}");
             }
         }
+
+        if let (Some(backup), Some(ref e)) = (ema_backup, &ema) {
+            let _g = AutogradContext::no_grad();
+            e.restore_swapped(&params, backup)
+                .map_err(|err| anyhow::anyhow!("EMA restore_swapped (mid) failed: {err}"))?;
+        }
     }
 
     let avg_loss = total_loss / args.steps as f32;
     log::info!("Training complete: {} steps, avg loss={:.4}", args.steps, avg_loss);
+    if let Some(b) = &board { b.set_status("completed"); }
+
+    // Final EMA swap (covers final save and final sample). No restore — the
+    // process exits, no further training. Skipped when --ema-validation-swap
+    // is off or no EMA was constructed.
+    if args.ema_validation_swap {
+        if let Some(ref e) = ema {
+            let _g = AutogradContext::no_grad();
+            let _ = e.swap_with_live(&params)
+                .map_err(|err| anyhow::anyhow!("EMA swap_with_live (final) failed: {err}"))?;
+            log::info!("[ema] swapped EMA shadow into live params for final save + sample");
+        }
+    }
 
     let ckpt = args.output_dir.join(format!("ltx2_lora_{}steps.safetensors", args.steps));
     if let Err(e) = model.save_weights(&ckpt.to_string_lossy()) {

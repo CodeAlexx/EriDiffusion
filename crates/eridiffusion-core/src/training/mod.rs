@@ -1,8 +1,12 @@
 pub mod block_offload;
+pub mod board;
 pub mod checkpoint;
 pub mod ema;
+pub mod features;
 pub mod logging;
 pub mod offload;
+pub mod progress;
+pub mod save_direct;
 pub mod schedule;
 pub mod training_features;
 pub mod training_offload;

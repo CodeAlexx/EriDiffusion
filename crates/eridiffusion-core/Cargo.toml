@@ -19,3 +19,15 @@ safetensors = { workspace = true }
 parking_lot = { workspace = true }
 lazy_static = { workspace = true }
 memmap2 = "0.9"
+rusqlite = { version = "0.31", features = ["bundled"] }
+# Phase 7: GPU health monitoring (NVML) + webhook notifications (sync HTTP).
+# `nvml-wrapper` is a thin libnvidia-ml binding, no transitive bloat.
+# `ureq` is a sync HTTP client — chosen over `reqwest` to avoid pulling tokio.
+nvml-wrapper = "0.10"
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

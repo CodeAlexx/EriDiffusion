@@ -314,8 +314,9 @@ fn main() -> anyhow::Result<()> {
 
     for (idx, (ctx_cond, y_cond)) in conds.iter().enumerate() {
         log::info!("  [{}/{}] denoising prompt...", idx + 1, conds.len());
-        // Reset RNG for each prompt so seed semantics match per-invocation.
-        rng = rand::rngs::StdRng::seed_from_u64(args.seed);
+        // Per-prompt seed offset → diverse noise/initial scheduling
+        // across the batch (same `--seed` reproducible).
+        rng = rand::rngs::StdRng::seed_from_u64(args.seed.wrapping_add(idx as u64));
 
         let n_lat = 1 * 4 * h_lat * w_lat;
         let mut latent = Tensor::from_vec(

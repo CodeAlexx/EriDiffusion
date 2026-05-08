@@ -40,6 +40,137 @@ struct Args {
     #[arg(long, default_value = "512")] resolution: u32,
     #[arg(long, default_value_t = true)] skip_existing: bool,
     #[arg(long, default_value_t = 0)] max_samples: usize,
+    /// Aspect-ratio bucketing. When true, image is resized + center-cropped
+    /// to the closest 64-aligned bucket whose total pixel count is
+    /// ≈ resolution² and whose aspect ratio is closest to the source. This
+    /// matches OneTrainer Flux2BaseDataLoader (`aspect_bucketing_quantization=64`)
+    /// and avoids the ~20% vertical compression that forced-square does on
+    /// 4:5 portrait datasets like Alina. Set to false to keep legacy
+    /// `resize_exact(R, R)` behavior.
+    #[arg(long, default_value_t = true)] bucketing: bool,
+
+    // ── Phase 6 multi-feature rollout ────────────────────────────────────
+    /// Per-crop style: `center` (default), `random`, `top_left`, `top_right`,
+    /// `bottom_left`, `bottom_right`. `random` chooses uniformly within the
+    /// loose-axis margin and adds variation for subject training. Default
+    /// `center` preserves byte-invariant prep output.
+    #[arg(long, default_value = "center")] crop_style: String,
+    /// Aspect-bucket alignment in pixels. Default `64` matches OT
+    /// `aspect_bucketing_quantization=64`. Smaller values (`32`, `16`) give
+    /// finer aspect control at the cost of more buckets. Must be a positive
+    /// multiple of 8 (VAE patch size constraint).
+    #[arg(long, default_value_t = 64)] bucket_alignment: u32,
+    /// Optional caption blocklist file. One substring per line; lines
+    /// starting with `#` are comments. Any caption containing any pattern
+    /// is dropped (the image is not encoded). Default: no filtering.
+    #[arg(long)] caption_filter_list: Option<PathBuf>,
+    /// Re-encode every sample even if `<hash>.safetensors` already exists.
+    /// Equivalent to `--skip-existing=false`; provided as an explicit flag
+    /// for cache-rebuild workflows. Default `false` (skip existing).
+    #[arg(long, default_value_t = false)] cache_invalidate: bool,
+    /// Phase 6 plumbing: `--caption-tag-shuffle` records intent to randomize
+    /// tag order per training step. Cache files store ENCODED text, not raw
+    /// captions, so per-step shuffle requires either pre-encoded variants or
+    /// runtime re-encoding. Phase 6 ships infrastructure only — this flag is
+    /// recorded in the prep log for forward-compat and otherwise unused.
+    #[arg(long, default_value_t = false)] caption_tag_shuffle: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CropStyle {
+    Center,
+    Random,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl CropStyle {
+    fn parse(s: &str) -> anyhow::Result<Self> {
+        Ok(match s.to_ascii_lowercase().as_str() {
+            "center" => Self::Center,
+            "random" => Self::Random,
+            "top_left" => Self::TopLeft,
+            "top_right" => Self::TopRight,
+            "bottom_left" => Self::BottomLeft,
+            "bottom_right" => Self::BottomRight,
+            other => anyhow::bail!(
+                "--crop-style must be one of center|random|top_left|top_right|bottom_left|bottom_right, got `{other}`"
+            ),
+        })
+    }
+
+    /// (xoff, yoff) given the resized (rw, rh) dimensions and the target
+    /// (tw, th) bucket. `rng` is consumed only for `Random`. For `Center`
+    /// this is bit-exact identical to the previous `(rw - tw)/2`,
+    /// `(rh - th)/2` math — preserves byte invariance for the default path.
+    fn pick_offset<R: rand::Rng>(
+        self,
+        rw: u32,
+        rh: u32,
+        tw: u32,
+        th: u32,
+        rng: &mut R,
+    ) -> (u32, u32) {
+        let max_x = rw.saturating_sub(tw);
+        let max_y = rh.saturating_sub(th);
+        match self {
+            CropStyle::Center => (max_x / 2, max_y / 2),
+            CropStyle::Random => {
+                let xo = if max_x > 0 { rng.gen_range(0..=max_x) } else { 0 };
+                let yo = if max_y > 0 { rng.gen_range(0..=max_y) } else { 0 };
+                (xo, yo)
+            }
+            CropStyle::TopLeft => (0, 0),
+            CropStyle::TopRight => (max_x, 0),
+            CropStyle::BottomLeft => (0, max_y),
+            CropStyle::BottomRight => (max_x, max_y),
+        }
+    }
+}
+
+/// 64-aligned aspect-ratio buckets. Pick the bucket whose aspect is closest
+/// to `(src_w / src_h)` AND whose pixel count is closest to `target_pix`.
+///
+/// Buckets are derived once from a fixed list of common ratios. For
+/// `target_pix = R²` and `R = 512`, this gives ~7 candidate (W,H) pairs at
+/// 64-pixel grid resolution.
+fn pick_bucket(src_w: u32, src_h: u32, target_res: u32, alignment: u32) -> (u32, u32) {
+    let align = alignment.max(8) as f32;
+    // Common aspect ratios (W/H) covering portrait + landscape + square.
+    // Order doesn't matter; we pick by (aspect distance, pixel-count distance).
+    const RATIOS: &[(u32, u32)] = &[
+        (1, 1),
+        (4, 5), (5, 4),
+        (3, 4), (4, 3),
+        (9, 16), (16, 9),
+        (2, 3), (3, 2),
+    ];
+    let target_pix = (target_res as f32) * (target_res as f32);
+    let src_aspect = src_w as f32 / src_h as f32;
+
+    let mut best: Option<(f32, f32, u32, u32)> = None;
+    for &(rw, rh) in RATIOS {
+        let r = rw as f32 / rh as f32;
+        // For aspect r and target pixels P: w * h = P, w = r * h ⇒ h = sqrt(P / r).
+        let h_f = (target_pix / r).sqrt();
+        let w_f = r * h_f;
+        // Snap to alignment grid. Don't go below `alignment` on either axis.
+        let h = (((h_f / align).round() as u32) * (align as u32)).max(align as u32);
+        let w = (((w_f / align).round() as u32) * (align as u32)).max(align as u32);
+        let aspect_dist = (r - src_aspect).abs();
+        let pix_dist = ((w * h) as f32 - target_pix).abs() / target_pix;
+        // Aspect distance dominates (×100 weight); pixel-count breaks ties.
+        let score = aspect_dist * 100.0 + pix_dist;
+        match best {
+            None => best = Some((score, aspect_dist, w, h)),
+            Some((bs, _, _, _)) if score < bs => best = Some((score, aspect_dist, w, h)),
+            _ => {}
+        }
+    }
+    let (_, _, w, h) = best.expect("RATIOS is non-empty");
+    (w, h)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -58,6 +189,49 @@ fn main() -> anyhow::Result<()> {
     env_logger::init();
     let args = Args::parse();
     std::fs::create_dir_all(&args.output_dir)?;
+
+    // ── Phase 6: validate flag values up front ────────────────────────────
+    if args.bucket_alignment == 0 || args.bucket_alignment % 8 != 0 {
+        anyhow::bail!(
+            "--bucket-alignment must be a positive multiple of 8 (VAE patch size), got {}",
+            args.bucket_alignment
+        );
+    }
+    let crop_style = CropStyle::parse(&args.crop_style)?;
+    if !matches!(crop_style, CropStyle::Center) {
+        log::info!("[crop-style] {:?} (default-off path; output bytes will differ from `center`)", crop_style);
+    }
+    if args.bucket_alignment != 64 {
+        log::info!("[bucket-alignment] {} (default 64)", args.bucket_alignment);
+    }
+    if args.caption_tag_shuffle {
+        log::warn!(
+            "[caption-tag-shuffle] enabled — Phase 6 records intent only. Cache files store encoded text; per-step shuffle requires Phase 7+ runtime re-encoder."
+        );
+    }
+    let filter_patterns: Vec<String> =
+        if let Some(p) = args.caption_filter_list.as_ref() {
+            let pats =
+                eridiffusion_core::training::features::caption_aug::load_filter_list(p)?;
+            log::info!(
+                "[caption-filter-list] loaded {} pattern(s) from {}",
+                pats.len(),
+                p.display()
+            );
+            pats
+        } else {
+            Vec::new()
+        };
+    // Effective skip-existing: --cache-invalidate forces re-encode.
+    let skip_existing = args.skip_existing && !args.cache_invalidate;
+    if args.cache_invalidate {
+        log::info!("[cache-invalidate] re-encoding all samples (skip_existing forced false)");
+    }
+    // RNG for `--crop-style random`. Seeded fixed so prep is reproducible.
+    let mut crop_rng = {
+        use rand::SeedableRng;
+        rand::rngs::StdRng::seed_from_u64(0xC0DEFACE)
+    };
     flame_core::config::set_default_dtype(DType::BF16);
     let _no_grad = flame_core::autograd::AutogradContext::no_grad();
     let device = flame_core::global_cuda_device();
@@ -102,10 +276,56 @@ fn main() -> anyhow::Result<()> {
         if args.max_samples > 0 && written + skipped >= args.max_samples { break; }
         let hash = format!("{:x}", md5::compute(img_path.to_string_lossy().as_bytes()));
         let out_path = args.output_dir.join(format!("{hash}.safetensors"));
-        if args.skip_existing && out_path.exists() { skipped += 1; continue; }
+        if skip_existing && out_path.exists() { skipped += 1; continue; }
+
+        // Phase 6: caption-filter-list — drop captions matching any pattern.
+        // Read caption EARLY so we don't waste a VAE encode + Qwen3 forward
+        // on a sample we'll discard. Empty caption (file missing) passes the
+        // filter (no substrings to match against).
+        let caption = std::fs::read_to_string(txt_path).unwrap_or_default();
+        if !filter_patterns.is_empty()
+            && !eridiffusion_core::training::features::caption_aug::caption_passes(
+                &caption, &filter_patterns,
+            )
+        {
+            log::debug!("[filter] dropped {}: caption matched blocklist", img_path.display());
+            skipped += 1;
+            continue;
+        }
 
         let img = match image::open(img_path) {
-            Ok(i) => i.resize_exact(args.resolution, args.resolution, image::imageops::FilterType::Lanczos3).to_rgb32f(),
+            Ok(src) => {
+                let (sw, sh) = (src.width(), src.height());
+                let (tw, th) = if args.bucketing {
+                    pick_bucket(sw, sh, args.resolution, args.bucket_alignment)
+                } else {
+                    (args.resolution, args.resolution)
+                };
+                // Resize-and-center-crop: scale so the source covers the
+                // bucket on its tight axis, then center-crop the loose axis.
+                // This preserves source aspect (no anisotropic squishing).
+                // Matches OT's RandomCrop+AspectBucketing at center, modulo
+                // `aspect_bucketing_quantization=64`.
+                let src_aspect = sw as f32 / sh as f32;
+                let bucket_aspect = tw as f32 / th as f32;
+                let resized = if src_aspect > bucket_aspect {
+                    let scaled_w = ((th as f32) * src_aspect).round() as u32;
+                    src.resize_exact(scaled_w, th, image::imageops::FilterType::Lanczos3)
+                } else {
+                    let scaled_h = ((tw as f32) / src_aspect).round() as u32;
+                    src.resize_exact(tw, scaled_h, image::imageops::FilterType::Lanczos3)
+                };
+                let resized_rgb = resized.to_rgb8();
+                let (rw, rh) = resized_rgb.dimensions();
+                let (xoff, yoff) = crop_style.pick_offset(rw, rh, tw, th, &mut crop_rng);
+                if idx == 0 {
+                    log::info!(
+                        "[bucket] src={sw}x{sh} → bucket={tw}x{th} (resized={rw}x{rh}, crop_off=({xoff},{yoff}))"
+                    );
+                }
+                let cropped = image::imageops::crop_imm(&resized_rgb, xoff, yoff, tw, th).to_image();
+                image::DynamicImage::ImageRgb8(cropped).to_rgb32f()
+            }
             Err(e) => { log::warn!("[{idx}] skipping {}: {e}", img_path.display()); continue; }
         };
         let (w, h) = img.dimensions();
@@ -129,7 +349,6 @@ fn main() -> anyhow::Result<()> {
         // KleinVaeEncoder.encode handles posterior.mode + patchify + BN → [B, 128, H/16, W/16].
         let latent = vae.encode(&img_t)?;
 
-        let caption = std::fs::read_to_string(txt_path).unwrap_or_default();
         let prompt = format!("{KLEIN_TEMPLATE_PRE}{}{KLEIN_TEMPLATE_POST}", caption.trim());
         let enc = tokenizer.encode(prompt.as_str(), false)
             .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;

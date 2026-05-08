@@ -317,10 +317,10 @@ fn main() -> anyhow::Result<()> {
 
     for (idx, (cond_t5, cond_clip)) in conds.iter().enumerate() {
         log::info!("  [{}/{}] denoising prompt...", idx + 1, conds.len());
-        // Re-seed per prompt so noise is reproducible per-prompt with the
-        // same `--seed`. Single-prompt back-compat: when there's one
-        // prompt the behavior matches the original code.
-        flame_core::rng::set_seed(args.seed)
+        // Per-prompt seed offset → each prompt gets a different noise
+        // initial. Same `--seed` is deterministic across runs but yields
+        // a diverse batch (idx 0 uses seed, idx 1 uses seed+1, ...).
+        flame_core::rng::set_seed(args.seed.wrapping_add(idx as u64))
             .map_err(|e| anyhow::anyhow!("flame_core set_seed: {e}"))?;
         let mut latent = Tensor::randn(Shape::from_dims(&[1, n_img, 64]), 0.0, 1.0, device.clone())?
             .to_dtype(DType::BF16)?;
