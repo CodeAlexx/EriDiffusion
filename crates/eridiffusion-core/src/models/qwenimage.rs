@@ -1395,15 +1395,50 @@ fn dual_stream_block_standalone(
         }
     };
 
+    // DIAG: dump temb at block entry to compare with iflame.
+    if block_idx <= 1 && std::env::var("QWEN_DIAG_BISECT").ok().as_deref() == Some("1") {
+        let v = temb.to_dtype(DType::F32)?.to_vec()?;
+        let max_abs = v.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let mean_abs: f32 = v.iter().map(|x| x.abs()).sum::<f32>() / v.len() as f32;
+        log::warn!("[DIAG-STD b{block_idx}] temb: max={max_abs:.2} mean={mean_abs:.4}");
+    }
+
     // Image modulation
     let img_mod = temb.silu()?;
     let img_mod = matmul_bias(&img_mod, bw("img_mod.1.weight")?, Some(bw("img_mod.1.bias")?))?;
+
+    // DIAG-STD: dump img_mod (post-projection, pre-chunk).
+    if block_idx <= 1 && std::env::var("QWEN_DIAG_BISECT").ok().as_deref() == Some("1") {
+        let v = img_mod.to_dtype(DType::F32)?.to_vec()?;
+        let max_abs = v.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let mean_abs: f32 = v.iter().map(|x| x.abs()).sum::<f32>() / v.len() as f32;
+        log::warn!("[DIAG-STD b{block_idx}] img_mod (post-proj): max={max_abs:.2} mean={mean_abs:.4}");
+    }
+
     let img_chunks = img_mod.unsqueeze(1)?.chunk(6, 2)?;
 
     // Text modulation
     let txt_mod = temb.silu()?;
     let txt_mod = matmul_bias(&txt_mod, bw("txt_mod.1.weight")?, Some(bw("txt_mod.1.bias")?))?;
     let txt_chunks = txt_mod.unsqueeze(1)?.chunk(6, 2)?;
+
+    // Side-by-side: also call dual_stream_block_iflame in no_grad mode at
+    // the same inputs (block 0 only — limit cost) so its DIAG-IFLAME
+    // prints land in the same log for direct comparison.
+    if block_idx == 0 && std::env::var("QWEN_DIAG_BISECT").ok().as_deref() == Some("1") {
+        // Build joint pe_cos/pe_sin from per-stream tables (txt-first cat).
+        let pe_cos = flame_core::tensor::Tensor::cat(&[txt_cos, img_cos], 0)?
+            .unsqueeze(0)?.unsqueeze(0)?;
+        let pe_sin = flame_core::tensor::Tensor::cat(&[txt_sin, img_sin], 0)?
+            .unsqueeze(0)?.unsqueeze(0)?;
+        let _guard = flame_core::autograd::AutogradContext::no_grad();
+        // Discard outputs — we only care about the dump_iflame side-effects.
+        let _ = dual_stream_block_iflame(
+            img, txt, temb, block_idx,
+            &pe_cos, &pe_sin, img_cos, img_sin, txt_cos, txt_sin,
+            weights, bundle,
+        );
+    }
 
     // Pre-norm + modulate
     let img_norm1 = flame_core::layer_norm::layer_norm(img, &[DIM], None, None, NORM_EPS)?;
@@ -1673,6 +1708,20 @@ fn dual_stream_block_iflame(
         .squeeze(Some(1))?;
     let txt_mods = lin_lora(&temb_silu.unsqueeze(1)?, "txt_mod.1.weight", "txt_mod.1.bias")?
         .squeeze(Some(1))?;
+
+    // Side-by-side bisect with standalone path. Set QWEN_DIAG_BISECT=1.
+    let diag_iflame = block_idx <= 1 && std::env::var("QWEN_DIAG_BISECT").ok().as_deref() == Some("1");
+    let dump_iflame = |name: &str, t: &Tensor| -> Result<()> {
+        if !diag_iflame { return Ok(()); }
+        let v = t.to_dtype(DType::F32)?.to_vec()?;
+        let max_abs = v.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let mean_abs: f32 = v.iter().map(|x| x.abs()).sum::<f32>() / v.len() as f32;
+        log::warn!("[DIAG-IFLAME b{block_idx}] {name}: max={max_abs:.2} mean={mean_abs:.4}");
+        Ok(())
+    };
+    dump_iflame("temb", temb)?;
+    dump_iflame("temb_silu", &temb_silu)?;
+    dump_iflame("img_mods (post-proj)", &img_mods)?;
     // Split each into two halves (norm1, norm2), each 3*dim:
     //   [shift, scale, gate] for norm1 and then [shift, scale, gate] for norm2.
     let img_mod1 = img_mods.narrow(1, 0, 3 * dim)?;
