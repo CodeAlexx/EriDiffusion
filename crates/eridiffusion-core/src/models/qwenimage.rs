@@ -1588,29 +1588,42 @@ fn dual_stream_block_iflame(
         Ok(base)
     };
 
-    // RMS norm matching inference-flame's `Self::rms_norm`: reshape to 2D,
-    // call `cuda_ops_bf16::rms_norm_bf16(x_2d, Some(scale), eps)`, reshape
-    // back. Used for QK head-norm.
+    // RMS norm — autograd-aware via `flame_core::norm::rms_norm`.
+    // 2026-05-09 fix: `cuda_ops_bf16::rms_norm_bf16` is inference-only
+    // (no `requires_grad` propagation, no autograd op recording), so its
+    // output reads `requires_grad=false` and the gradient chain dies at
+    // every Q/K head-norm in this trainer's per-block forward. That's the
+    // chroma-pattern bug (project_chroma_lora_broken_2026-05-09); identical
+    // shape — fixed identically here. Klein's `head_rms_norm_local`
+    // (klein.rs:491-497) is the canonical pattern.
     let rms_norm_iflame = |x: &Tensor, scale: &Tensor, eps: f32| -> Result<Tensor> {
         let dims = x.shape().dims().to_vec();
         let hidden = *dims.last().unwrap();
         let batch: usize = dims[..dims.len() - 1].iter().product();
         let x_2d = x.reshape(&[batch, hidden])?;
-        let out = flame_core::cuda_ops_bf16::rms_norm_bf16(&x_2d, Some(scale), eps)?;
+        let out = flame_core::norm::rms_norm(&x_2d, &[hidden], Some(scale), eps)?;
         out.reshape(&dims)
     };
 
-    // LayerNorm without affine, matching inference-flame's
-    // `Self::layer_norm_no_affine`. Used for the per-stream pre-attn /
-    // pre-FFN norm; the gain+bias comes from the adaptive modulation
-    // (img_scale1/shift1, etc).
+    // LayerNorm without affine — F32 manual path for autograd correctness.
+    // 2026-05-09 fix: same chroma-pattern as rms_norm above. Was using
+    // `cuda_ops_bf16::layer_norm_bf16` (inference-only); switched to a
+    // hand-rolled F32 mean/var/rstd path that uses only autograd-aware
+    // primitives. Mirrors `wan22_fwd/block.rs::layer_norm_no_affine` exactly.
     let layer_norm_no_affine = |x: &Tensor, eps: f32| -> Result<Tensor> {
-        let dims = x.shape().dims().to_vec();
+        let x_f32 = x.to_dtype(DType::F32)?;
+        let dims = x_f32.shape().dims().to_vec();
         let hidden = *dims.last().unwrap();
         let batch: usize = dims[..dims.len() - 1].iter().product();
-        let x_2d = x.reshape(&[batch, hidden])?;
-        let out = flame_core::cuda_ops_bf16::layer_norm_bf16(&x_2d, None, None, eps)?;
-        out.reshape(&dims)
+        let x_flat = x_f32.reshape(&[batch, hidden])?;
+        let mean = x_flat.sum_dim_keepdim(1)?.mul_scalar(1.0 / hidden as f32)?;
+        let centered = x_flat.sub(&mean)?;
+        let var = centered.mul(&centered)?
+            .sum_dim_keepdim(1)?
+            .mul_scalar(1.0 / hidden as f32)?;
+        let rstd = var.add_scalar(eps)?.sqrt()?.reciprocal()?;
+        let normed = centered.mul(&rstd)?;
+        normed.reshape(&dims)?.to_dtype(DType::BF16)
     };
 
     let b = img.shape().dims()[0];
