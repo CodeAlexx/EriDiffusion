@@ -323,9 +323,13 @@ impl AdapterModule for LycorisLinear {
     }
 
     fn parameters(&self) -> Vec<Tensor> {
-        // Borrow leaves from `LycorisAdapter::parameters()` and clone each
-        // (cheap — `TensorStorage` is `Arc`-shared).
-        let mut p: Vec<Tensor> = self.adapter.parameters().into_iter().cloned().collect();
+        // `LycorisAdapter::parameters()` already returns owned tensor clones
+        // sourced from the live `Parameter` storage (see
+        // `LycorisModule::parameters` contract in `lycoris-rs/src/lib.rs`).
+        // Each clone preserves `TensorId` and `requires_grad`, so autograd
+        // grads route back to the live handle returned by
+        // `to_parameters` / `parameters_handles`.
+        let mut p: Vec<Tensor> = self.adapter.parameters();
         if let Some(ref m) = self.dora_magnitude {
             p.push(m.clone());
         }
@@ -333,7 +337,23 @@ impl AdapterModule for LycorisLinear {
     }
 
     fn to_parameters(&self) -> Vec<Parameter> {
-        self.parameters().into_iter().map(Parameter::new).collect()
+        // Return live `Parameter` handles rather than wrapping plain tensor
+        // clones. `Parameter::new(tensor)` would create a fresh
+        // `Arc<Mutex<Tensor>>` whose `set_data` mutations are invisible to
+        // the algorithm's internal `Parameter` storage (the gradient-
+        // isolation bug). Cloning the existing handle is cheap (one Arc
+        // bump) and the optimizer's mutations land directly on the
+        // adapter's internal leaves, which `forward` reads via
+        // `param.tensor()?`.
+        let mut out: Vec<Parameter> = self.adapter.parameters_handles();
+        if let Some(ref m) = self.dora_magnitude {
+            // DoRA magnitude is currently a bare `Tensor`. If/when it
+            // becomes a trainable leaf with optimizer updates, switch the
+            // field to `Parameter` and clone the handle here. For now wrap
+            // a fresh Parameter — current code paths don't optimize this.
+            out.push(Parameter::new(m.clone()));
+        }
+        out
     }
 
     fn kind(&self) -> &'static str {
@@ -347,61 +367,67 @@ impl AdapterModule for LycorisLinear {
     }
 
     fn named_tensors(&self) -> Vec<(&'static str, Tensor)> {
+        // Helper: read the live tensor out of a `Parameter`, surfacing the
+        // mutex-poisoned case as a panic (the only way it fires is a
+        // previously-poisoned trainer state, which is a hard bug anyway).
+        fn pt(p: &Parameter) -> Tensor {
+            p.tensor().expect("LycorisLinear::named_tensors: parameter mutex poisoned")
+        }
         let mut out: Vec<(&'static str, Tensor)> = Vec::new();
         match &self.adapter {
             LycorisAdapter::LoCon(m) => {
                 // Suffix convention matches `lycoris-upstream` `locon.py`:
                 // `lora_down.weight` / `lora_up.weight` (+ `lora_mid.weight`
                 // when Tucker is on for conv variants).
-                out.push(("lora_down.weight", m.down.clone()));
-                out.push(("lora_up.weight", m.up.clone()));
+                out.push(("lora_down.weight", pt(&m.down)));
+                out.push(("lora_up.weight", pt(&m.up)));
                 if let Some(ref mid) = m.mid {
-                    out.push(("lora_mid.weight", mid.clone()));
+                    out.push(("lora_mid.weight", pt(mid)));
                 }
             }
             LycorisAdapter::LoHa(m) => {
-                out.push(("hada_w1_a", m.w1a.clone()));
-                out.push(("hada_w1_b", m.w1b.clone()));
-                out.push(("hada_w2_a", m.w2a.clone()));
-                out.push(("hada_w2_b", m.w2b.clone()));
+                out.push(("hada_w1_a", pt(&m.w1a)));
+                out.push(("hada_w1_b", pt(&m.w1b)));
+                out.push(("hada_w2_a", pt(&m.w2a)));
+                out.push(("hada_w2_b", pt(&m.w2b)));
                 if let Some(ref t) = m.t1 {
-                    out.push(("hada_t1", t.clone()));
+                    out.push(("hada_t1", pt(t)));
                 }
                 if let Some(ref t) = m.t2 {
-                    out.push(("hada_t2", t.clone()));
+                    out.push(("hada_t2", pt(t)));
                 }
             }
             LycorisAdapter::LoKr(m) => {
                 if let Some(ref w) = m.w1 {
-                    out.push(("lokr_w1", w.clone()));
+                    out.push(("lokr_w1", pt(w)));
                 }
                 if let Some(ref w) = m.w1a {
-                    out.push(("lokr_w1_a", w.clone()));
+                    out.push(("lokr_w1_a", pt(w)));
                 }
                 if let Some(ref w) = m.w1b {
-                    out.push(("lokr_w1_b", w.clone()));
+                    out.push(("lokr_w1_b", pt(w)));
                 }
                 if let Some(ref w) = m.w2 {
-                    out.push(("lokr_w2", w.clone()));
+                    out.push(("lokr_w2", pt(w)));
                 }
                 if let Some(ref w) = m.w2a {
-                    out.push(("lokr_w2_a", w.clone()));
+                    out.push(("lokr_w2_a", pt(w)));
                 }
                 if let Some(ref w) = m.w2b {
-                    out.push(("lokr_w2_b", w.clone()));
+                    out.push(("lokr_w2_b", pt(w)));
                 }
                 if let Some(ref t) = m.t2 {
-                    out.push(("lokr_t2", t.clone()));
+                    out.push(("lokr_t2", pt(t)));
                 }
             }
             LycorisAdapter::Full(m) => {
-                out.push(("diff.weight", m.diff.clone()));
+                out.push(("diff.weight", pt(&m.diff)));
                 if let Some(ref b) = m.diff_b {
-                    out.push(("diff_b", b.clone()));
+                    out.push(("diff_b", pt(b)));
                 }
             }
             LycorisAdapter::OFT(m) => {
-                out.push(("oft_blocks", m.blocks.clone()));
+                out.push(("oft_blocks", pt(&m.blocks)));
             }
         }
         if let Some(ref m) = self.dora_magnitude {

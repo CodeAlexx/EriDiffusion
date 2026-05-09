@@ -459,27 +459,44 @@ impl LycorisBundle {
         *self.name_index.lock() = None;
     }
 
-    /// Flat list of leaf tensors for the optimizer (adapter parameters +
+    /// Flat list of leaf tensors for autograd lookup (adapter parameters +
     /// DoRA magnitudes, in `adapter[0].params... adapter[0].dora_scale,
     /// adapter[1].params... adapter[1].dora_scale, ...` order).
-    pub fn parameters(&self) -> Vec<&Tensor> {
-        let mut out = Vec::with_capacity(self.adapters.len() * 4);
+    ///
+    /// Each `Tensor` is a clone of the live `Parameter` storage with the
+    /// same `TensorId`. Use [`to_parameters`](Self::to_parameters) when the
+    /// caller needs to apply optimizer updates — the `Tensor` clones here
+    /// are read-only views.
+    pub fn parameters(&self) -> Vec<Tensor> {
+        let mut out: Vec<Tensor> = Vec::with_capacity(self.adapters.len() * 4);
         for (i, a) in self.adapters.iter().enumerate() {
             out.extend(a.parameters());
             if let Some(ref m) = self.dora_magnitudes[i] {
-                out.push(m);
+                out.push(m.clone());
             }
         }
         out
     }
 
-    /// Wrap each leaf in `flame_core::parameter::Parameter`. Use this to
-    /// hand the optimizer a flat parameter list.
+    /// Live `Parameter` handles for the optimizer. The handles share the
+    /// same `Arc<Mutex<Tensor>>` storage that the algorithm's forward path
+    /// reads, so optimizer mutations are visible without any sync step.
+    /// This is the path that fixes the gradient-isolation bug — wrapping
+    /// `parameters().into_iter().map(Parameter::new)` would create FRESH
+    /// `Arc<Mutex<Tensor>>` wrappers that the adapter can't see.
     pub fn to_parameters(&self) -> Vec<Parameter> {
-        self.parameters()
-            .into_iter()
-            .map(|t| Parameter::new(t.clone()))
-            .collect()
+        let mut out: Vec<Parameter> = Vec::with_capacity(self.adapters.len() * 4);
+        for (i, a) in self.adapters.iter().enumerate() {
+            out.extend(a.parameters_handles());
+            if let Some(ref m) = self.dora_magnitudes[i] {
+                // DoRA magnitude is currently a bare `Tensor`. Wrap it
+                // (creates a fresh handle, matching prior behavior). If
+                // DoRA gets in-place updates wired up, switch the field
+                // type to `Parameter` and clone the handle here.
+                out.push(Parameter::new(m.clone()));
+            }
+        }
+        out
     }
 
     /// O(1) lookup by adapter name. Builds the index lazily on first call.
@@ -612,57 +629,63 @@ impl LycorisBundle {
         full_prefix: &str,
         out: &mut HashMap<String, Tensor>,
     ) -> anyhow::Result<()> {
+        // Helper: pull the live tensor out of a `Parameter`. The clone
+        // preserves `TensorId` so it stays paired with autograd state.
+        let pt = |p: &flame_core::parameter::Parameter| -> anyhow::Result<Tensor> {
+            p.tensor()
+                .map_err(|e| anyhow::anyhow!("collect_adapter_tensors: parameter mutex poisoned: {e}"))
+        };
         match adapter {
             LycorisAdapter::LoCon(m) => {
-                out.insert(format!("{full_prefix}.lora_A.weight"), m.down.clone());
-                out.insert(format!("{full_prefix}.lora_B.weight"), m.up.clone());
+                out.insert(format!("{full_prefix}.lora_A.weight"), pt(&m.down)?);
+                out.insert(format!("{full_prefix}.lora_B.weight"), pt(&m.up)?);
                 if let Some(ref mid) = m.mid {
-                    out.insert(format!("{full_prefix}.lora_mid.weight"), mid.clone());
+                    out.insert(format!("{full_prefix}.lora_mid.weight"), pt(mid)?);
                 }
             }
             LycorisAdapter::LoHa(m) => {
-                out.insert(format!("{full_prefix}.hada_w1_a.weight"), m.w1a.clone());
-                out.insert(format!("{full_prefix}.hada_w1_b.weight"), m.w1b.clone());
-                out.insert(format!("{full_prefix}.hada_w2_a.weight"), m.w2a.clone());
-                out.insert(format!("{full_prefix}.hada_w2_b.weight"), m.w2b.clone());
+                out.insert(format!("{full_prefix}.hada_w1_a.weight"), pt(&m.w1a)?);
+                out.insert(format!("{full_prefix}.hada_w1_b.weight"), pt(&m.w1b)?);
+                out.insert(format!("{full_prefix}.hada_w2_a.weight"), pt(&m.w2a)?);
+                out.insert(format!("{full_prefix}.hada_w2_b.weight"), pt(&m.w2b)?);
                 if let Some(ref t) = m.t1 {
-                    out.insert(format!("{full_prefix}.hada_t1.weight"), t.clone());
+                    out.insert(format!("{full_prefix}.hada_t1.weight"), pt(t)?);
                 }
                 if let Some(ref t) = m.t2 {
-                    out.insert(format!("{full_prefix}.hada_t2.weight"), t.clone());
+                    out.insert(format!("{full_prefix}.hada_t2.weight"), pt(t)?);
                 }
             }
             LycorisAdapter::LoKr(m) => {
                 if let Some(ref w) = m.w1 {
-                    out.insert(format!("{full_prefix}.lokr_w1.weight"), w.clone());
+                    out.insert(format!("{full_prefix}.lokr_w1.weight"), pt(w)?);
                 }
                 if let Some(ref w) = m.w1a {
-                    out.insert(format!("{full_prefix}.lokr_w1_a.weight"), w.clone());
+                    out.insert(format!("{full_prefix}.lokr_w1_a.weight"), pt(w)?);
                 }
                 if let Some(ref w) = m.w1b {
-                    out.insert(format!("{full_prefix}.lokr_w1_b.weight"), w.clone());
+                    out.insert(format!("{full_prefix}.lokr_w1_b.weight"), pt(w)?);
                 }
                 if let Some(ref w) = m.w2 {
-                    out.insert(format!("{full_prefix}.lokr_w2.weight"), w.clone());
+                    out.insert(format!("{full_prefix}.lokr_w2.weight"), pt(w)?);
                 }
                 if let Some(ref w) = m.w2a {
-                    out.insert(format!("{full_prefix}.lokr_w2_a.weight"), w.clone());
+                    out.insert(format!("{full_prefix}.lokr_w2_a.weight"), pt(w)?);
                 }
                 if let Some(ref w) = m.w2b {
-                    out.insert(format!("{full_prefix}.lokr_w2_b.weight"), w.clone());
+                    out.insert(format!("{full_prefix}.lokr_w2_b.weight"), pt(w)?);
                 }
                 if let Some(ref t) = m.t2 {
-                    out.insert(format!("{full_prefix}.lokr_t2.weight"), t.clone());
+                    out.insert(format!("{full_prefix}.lokr_t2.weight"), pt(t)?);
                 }
             }
             LycorisAdapter::Full(m) => {
-                out.insert(format!("{full_prefix}.diff.weight"), m.diff.clone());
+                out.insert(format!("{full_prefix}.diff.weight"), pt(&m.diff)?);
                 if let Some(ref b) = m.diff_b {
-                    out.insert(format!("{full_prefix}.diff_b"), b.clone());
+                    out.insert(format!("{full_prefix}.diff_b"), pt(b)?);
                 }
             }
             LycorisAdapter::OFT(m) => {
-                out.insert(format!("{full_prefix}.oft_blocks.weight"), m.blocks.clone());
+                out.insert(format!("{full_prefix}.oft_blocks.weight"), pt(&m.blocks)?);
             }
         }
         Ok(())
