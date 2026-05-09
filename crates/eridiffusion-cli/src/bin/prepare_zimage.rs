@@ -40,6 +40,14 @@ struct Args {
     #[arg(long, default_value = "512")] resolution: u32,
     #[arg(long, default_value_t = true)] skip_existing: bool,
     #[arg(long, default_value_t = 0)] max_samples: usize,
+    /// Image augmentations at prep time. All default-off → byte-identical
+    /// caches. Set `--aug-flip` for 50% horizontal flip; `--aug-brightness`
+    /// and `--aug-contrast` jitter pixel values uniformly. `--aug-seed`
+    /// seeds the per-sample RNG.
+    #[arg(long, default_value_t = false)] aug_flip: bool,
+    #[arg(long, default_value_t = 0.0)] aug_brightness: f32,
+    #[arg(long, default_value_t = 0.0)] aug_contrast: f32,
+    #[arg(long, default_value_t = 0)] aug_seed: u64,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -101,6 +109,18 @@ fn main() -> anyhow::Result<()> {
     }
     log::info!("Found {} (image, caption) pairs", pairs.len());
 
+    let aug_cfg = eridiffusion_core::training::features::image_aug::AugConfig {
+        flip: args.aug_flip,
+        brightness: args.aug_brightness,
+        contrast: args.aug_contrast,
+    };
+    if aug_cfg.is_active() {
+        log::info!(
+            "[image-aug] flip={} brightness={} contrast={} seed={}",
+            aug_cfg.flip, aug_cfg.brightness, aug_cfg.contrast, args.aug_seed
+        );
+    }
+
     let mut written = 0usize;
     let mut skipped = 0usize;
     let t_start = std::time::Instant::now();
@@ -114,6 +134,17 @@ fn main() -> anyhow::Result<()> {
             Ok(i) => i.resize_exact(args.resolution, args.resolution, image::imageops::FilterType::Lanczos3).to_rgb32f(),
             Err(e) => { log::warn!("[{idx}] skipping {}: {e}", img_path.display()); continue; }
         };
+        let mut img = img;
+        if aug_cfg.is_active() {
+            use rand::SeedableRng;
+            let mut aug_rng = rand::rngs::StdRng::seed_from_u64(args.aug_seed ^ idx as u64);
+            eridiffusion_core::training::features::image_aug::apply_augs(
+                &mut img,
+                None,
+                &aug_cfg,
+                &mut aug_rng,
+            );
+        }
         let (w, h) = img.dimensions();
         // CHW transpose — see prepare_klein.rs for full bug writeup. Without
         // this, image::pixels() (HWC interleaved) reshaped to [1, 3, H, W]

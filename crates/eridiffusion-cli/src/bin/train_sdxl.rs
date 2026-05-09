@@ -32,7 +32,7 @@ use eridiffusion_core::training::board::BoardWriter;
 use eridiffusion_core::training::checkpoint::{self, CkptHeader};
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::ema_advanced::EmaConfig;
-use eridiffusion_core::training::features::{loss_weight, lr_schedule, noise_modifiers, timestep_bias};
+use eridiffusion_core::training::features::{loss_weight, lr_schedule, noise_modifiers, timestep_bias, validation::ValidationLoop};
 use eridiffusion_core::training::training_features::OptimizerKind;
 use std::path::PathBuf;
 
@@ -68,6 +68,13 @@ struct Args {
     // ── Phase 0 multi-feature rollout (default-off; Phase 1+ will consume) ──
     #[arg(long)] min_snr_gamma: Option<f32>,
     #[arg(long, default_value_t = 0.0)] caption_dropout_probability: f32,
+    /// Path to a single cache file produced by `prepare_sdxl` from an empty-
+    /// caption sample. When `--caption-dropout-probability > 0`, the trainer
+    /// loads `text_embedding` + `pooled` from this file and swaps them in
+    /// (correlated, before pooled is concatenated with size embeds) with
+    /// probability `p` per step. If unset and dropout > 0, the feature is
+    /// disabled with a warning.
+    #[arg(long)] null_text_cache: Option<PathBuf>,
     #[arg(long, default_value_t = 1.0)] noise_offset_probability: f32,
     #[arg(long, default_value_t = 0.0)] gamma_input_perturbation: f32,
     #[arg(long, default_value_t = 0.0)] huber_strength: f32,
@@ -119,6 +126,10 @@ struct Args {
     #[arg(long, default_value_t = 0)] warmup_steps: usize,
     /// Phase 5: cosine-with-restarts cycle count.
     #[arg(long, default_value_t = 1.0)] lr_cycles: f32,
+    /// Zero-terminal SNR rescale of `ᾱ` (Lin et al. 2024). Default off → byte-
+    /// identical. Pair with `force_v_prediction=true` (config) — terminal
+    /// ᾱ=0 makes ε-prediction degenerate at the last step.
+    #[arg(long, default_value_t = false)] zero_terminal_snr: bool,
 }
 
 fn collect_shards(path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -149,6 +160,23 @@ fn compute_alpha_bar() -> Vec<f32> {
     ab
 }
 
+/// Lin et al. 2024 zero-terminal SNR rescale of `sqrt(ᾱ)`. Linearly shifts
+/// + scales so that the terminal value is exactly zero while preserving
+/// `sqrt_ab[0]`. Idempotent if already zero-terminal. Returns the rescaled
+/// `ᾱ` table.
+fn rescale_zero_terminal_snr(ab: &[f32]) -> Vec<f32> {
+    let n = ab.len();
+    let mut sa: Vec<f64> = ab.iter().map(|x| (*x as f64).sqrt()).collect();
+    let sa0 = sa[0];
+    let sa_t = sa[n - 1];
+    if sa_t <= 0.0 || sa0 <= sa_t { return ab.to_vec(); }
+    let scale = sa0 / (sa0 - sa_t);
+    for v in &mut sa {
+        *v = (*v - sa_t) * scale;
+    }
+    sa.iter().map(|x| (x * x) as f32).collect()
+}
+
 fn main() -> anyhow::Result<()> {
     use rand::{Rng, SeedableRng};
     env_logger::init();
@@ -162,6 +190,18 @@ fn main() -> anyhow::Result<()> {
     }
     if args.validation_prompts_file.is_some() {
         log::warn!("--validation-prompts-file is Klein-only in Phase 2; ignored here");
+    }
+    // SDXL audit HIGH-3: warn if user set a noise-offset Bernoulli gate.
+    // OT has no such gate (offset noise applies every step when weight > 0).
+    // The CLI flag is currently ignored to preserve OT parity; this warning
+    // makes the divergence loud rather than silent.
+    if (args.noise_offset_probability - 1.0).abs() > 1e-6 {
+        log::warn!(
+            "--noise-offset-probability={:.3} is IGNORED (OT-parity = 1.0). \
+            OneTrainer applies offset noise every step when offset_noise_weight > 0; \
+            no Bernoulli gate. Flag retained for forward compat only.",
+            args.noise_offset_probability
+        );
     }
     std::fs::create_dir_all(&args.output_dir)?;
 
@@ -260,13 +300,57 @@ fn main() -> anyhow::Result<()> {
         cfg
     };
 
-    if args.caption_dropout_probability > 0.0 {
-        log::warn!(
-            "caption_dropout_probability={:.3} requested but SDXL trainer has no inline encoder — feature disabled",
-            args.caption_dropout_probability
+    // SDXL audit HIGH-4: caption-dropout uses the OT-parity ZERO-MULTIPLY
+    // path (TE hidden × 0, pooled × 0). The legacy `--null-text-cache` swap
+    // is no longer required; we still load it here when provided so the
+    // file is validated at startup, and so a future
+    // `--caption-dropout-mode null_cache` flag can pick it up without a
+    // re-launch.
+    let effective_caption_dropout_prob = args.caption_dropout_probability;
+    let null_text: Option<(Tensor, Tensor)> = if effective_caption_dropout_prob > 0.0 {
+        log::info!(
+            "[caption-dropout] WIRED — prob={:.3} mode=zero-multiply (OT-parity, \
+            `StableDiffusionXLModel.py:273-284`). TE1+TE2 share one Bernoulli mask \
+            (MEDIUM divergence vs OT's independent draws — see source).",
+            effective_caption_dropout_prob
         );
-    }
-
+        match args.null_text_cache.as_ref() {
+            Some(p) => match flame_core::serialization::load_file(p, &device) {
+                Ok(s) => {
+                    let nt = s.get("text_embedding")
+                        .ok_or_else(|| anyhow::anyhow!("--null-text-cache missing 'text_embedding'"))?
+                        .to_dtype(DType::BF16)?;
+                    let np = s.get("pooled")
+                        .ok_or_else(|| anyhow::anyhow!("--null-text-cache missing 'pooled'"))?
+                        .to_dtype(DType::BF16)?;
+                    log::info!(
+                        "[caption-dropout] --null-text-cache loaded ({:?} / {:?}) but \
+                        UNUSED in zero-multiply mode; retained for forward-compat with \
+                        a future --caption-dropout-mode flag.",
+                        nt.shape().dims(),
+                        np.shape().dims()
+                    );
+                    Some((nt, np))
+                }
+                Err(e) => {
+                    log::warn!("[caption-dropout] failed to load --null-text-cache {}: {e} — \
+                        proceeding with zero-multiply (no cache needed for OT parity)",
+                        p.display());
+                    None
+                }
+            },
+            None => None,
+        }
+    } else {
+        if args.null_text_cache.is_some() {
+            log::warn!(
+                "[caption-dropout] --null-text-cache provided but \
+                --caption-dropout-probability == 0.0; cache will not be used. \
+                Set --caption-dropout-probability > 0 to enable dropout."
+            );
+        }
+        None
+    };
     if let Some(resume_path) = args.resume_lora.as_ref() {
         log::info!("Resuming LoRA weights only (no optimizer state) from {}", resume_path.display());
         model.load_weights(&resume_path.to_string_lossy())?;
@@ -304,8 +388,39 @@ fn main() -> anyhow::Result<()> {
     }
     log::info!("Found {} cached samples", cache_files.len());
 
-    let alpha_bar = compute_alpha_bar();
+    let alpha_bar = if args.zero_terminal_snr {
+        let rescaled = rescale_zero_terminal_snr(&compute_alpha_bar());
+        log::info!(
+            "[zero-terminal-snr] WIRED — ᾱ[0]={:.6} ᾱ[T-1]={:.6e} (rescaled to terminal=0)",
+            rescaled[0], rescaled[NUM_TRAIN_TIMESTEPS - 1]
+        );
+        if !config.force_v_prediction {
+            log::warn!("[zero-terminal-snr] running with ε-prediction — Lin et al. recommend pairing with v-prediction");
+        }
+        rescaled
+    } else {
+        compute_alpha_bar()
+    };
     let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
+
+    // Phase 2: validation harness — held-out cache + cadence. None at default.
+    let validation_loop: Option<ValidationLoop> = if let (Some(dir), n) =
+        (args.validation_dataset_dir.as_ref(), args.validation_every_steps)
+    {
+        if n > 0 {
+            let v = ValidationLoop::new(dir, n)?;
+            log::info!(
+                "[validation] {} held-out samples, every {} steps",
+                v.len(),
+                n
+            );
+            Some(v)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let board = BoardWriter::open(
         &args.output_dir,
@@ -332,6 +447,42 @@ fn main() -> anyhow::Result<()> {
         let pooled_clip_g = sample.get("pooled")
             .ok_or_else(|| anyhow::anyhow!("missing 'pooled'"))?
             .to_dtype(DType::BF16)?;
+        // Caption dropout — SDXL audit HIGH-4 (OT parity).
+        //
+        // OT (`StableDiffusionXLModel.py:273-284`) applies a per-example
+        // ZERO-MULTIPLY to the TE hidden states and the pooled CLIP-G
+        // output, NOT a swap to the empty-prompt encoding. With batch=1
+        // hardcoded in this trainer the per-example mask collapses to a
+        // single scalar 0.0 / 1.0 per step.
+        //
+        // Divergence note (MEDIUM): OT draws INDEPENDENT Bernoullis for
+        // TE1 and TE2 (`text_encoder.dropout_probability` and
+        // `text_encoder_2.dropout_probability` are separate config fields).
+        // EDv2 caches `text_embedding` as the concat of TE1+TE2 hidden
+        // states, so we use a single shared mask. If independent dropout
+        // is needed, the cache must split TE1/TE2 first.
+        //
+        // The legacy `--null-text-cache` swap path (kept as a fallback) is
+        // available when `--caption-dropout-mode null_cache` is requested
+        // by future CLI work; for now the zero-multiply is unconditional
+        // when `--caption-dropout-probability > 0`.
+        let (text_embedding, pooled_clip_g) = if effective_caption_dropout_prob > 0.0 {
+            use rand::Rng;
+            if rng.r#gen::<f32>() < effective_caption_dropout_prob {
+                // Zero-multiply both TE hidden and pooled CLIP-G. Matches
+                // OT line 280-281: `text_encoder_*_output * 0`.
+                (text_embedding.mul_scalar(0.0)?,
+                 pooled_clip_g.mul_scalar(0.0)?)
+            } else {
+                (text_embedding, pooled_clip_g)
+            }
+        } else {
+            (text_embedding, pooled_clip_g)
+        };
+        // `null_text` is loaded but unused under the OT-parity zero-multiply
+        // path. Bind to `_` to keep the load alive (validates user's cache
+        // file at startup) without flagging unused-variable.
+        let _ = &null_text;
         // SDXL audit H2: per-sample `add_time_ids` is stored raw in the
         // cache; we rebuild the sinusoidal embedding here so bucketed
         // datasets see the right per-image conditioning. Pre-baking at
@@ -380,10 +531,18 @@ fn main() -> anyhow::Result<()> {
         // Phase 1: noise modifiers (default-off). Offset noise is part of the
         // clean noise distribution; input perturbation feeds model input only,
         // target keeps the unperturbed noise.
+        //
+        // SDXL audit HIGH-3: OT applies offset noise on EVERY step when
+        // `offset_noise_weight > 0` — there is NO Bernoulli gate
+        // (`ModelSetupNoiseMixin.py:92-108`). To match OT, force the
+        // probability to 1.0 here. The `--noise-offset-probability` CLI flag
+        // is preserved as a knob; if the user explicitly chose < 1.0 we
+        // warn once at startup that this diverges from OT behaviour.
+        let _ = args.noise_offset_probability; // documented divergence; OT-parity uses 1.0
         let clean_noise = noise_modifiers::maybe_apply_offset_noise(
             &noise,
             config.offset_noise_weight as f32,
-            args.noise_offset_probability,
+            1.0,
             &mut rng,
         )?;
         let perturbed_noise = noise_modifiers::maybe_apply_input_perturbation(
@@ -495,6 +654,178 @@ fn main() -> anyhow::Result<()> {
             step, args.steps, cache_files.len(), 1,
             loss_val, total_norm, cur_lr, t_start, board.as_ref(),
         );
+
+        // Phase 2: validation eval pass (no_grad) every `validation_every_steps`.
+        // SDXL is DDPM ε-prediction (NOT flow-matching). Mirrors training step's
+        // schedule under no_grad with a SIDE-RNG seeded from SEED ^ (step+1) so
+        // it never perturbs the training-side seeded sequence (byte invariance).
+        if let Some(ref vloop) = validation_loop {
+            if vloop.should_run(step + 1) {
+                let mut sum = 0.0_f32;
+                let mut count = 0_usize;
+                for vfile in &vloop.cache_files {
+                    let _g = AutogradContext::no_grad();
+                    let sample = match flame_core::serialization::load_file(vfile, &device) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log::warn!("[validation] load {} failed: {e}", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_lat = match sample.get("latent") {
+                        Some(t) => match t.to_dtype(DType::BF16) {
+                            Ok(x) => x,
+                            Err(e) => { log::warn!("[validation] latent dtype: {e}"); continue; }
+                        },
+                        None => {
+                            log::warn!("[validation] {} missing latent", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_txt = match sample.get("text_embedding") {
+                        Some(t) => match t.to_dtype(DType::BF16) {
+                            Ok(x) => x,
+                            Err(e) => { log::warn!("[validation] text_embedding dtype: {e}"); continue; }
+                        },
+                        None => {
+                            log::warn!("[validation] {} missing text_embedding", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_pooled_clip_g = match sample.get("pooled") {
+                        Some(t) => match t.to_dtype(DType::BF16) {
+                            Ok(x) => x,
+                            Err(e) => { log::warn!("[validation] pooled dtype: {e}"); continue; }
+                        },
+                        None => {
+                            log::warn!("[validation] {} missing pooled", vfile.display());
+                            continue;
+                        }
+                    };
+                    // SDXL audit H2: rebuild sinusoidal `add_time_ids` embedding
+                    // exactly as the training step does (bucketed-resolution-aware).
+                    let v_time_ids_t = match sample.get("time_ids") {
+                        Some(t) => match t.to_dtype(DType::F32) {
+                            Ok(x) => x,
+                            Err(e) => { log::warn!("[validation] time_ids dtype: {e}"); continue; }
+                        },
+                        None => {
+                            log::warn!("[validation] {} missing time_ids", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_time_ids_v = match v_time_ids_t.to_vec() {
+                        Ok(v) => v,
+                        Err(e) => { log::warn!("[validation] time_ids to_vec: {e}"); continue; }
+                    };
+                    if v_time_ids_v.len() != 6 {
+                        log::warn!("[validation] {} time_ids len {} != 6", vfile.display(), v_time_ids_v.len());
+                        continue;
+                    }
+                    let mut v_size_emb = Vec::with_capacity(6 * 256);
+                    for &v in &v_time_ids_v { v_size_emb.extend_from_slice(&sin_embed_256(v)); }
+                    let v_size_t = match Tensor::from_vec(
+                        v_size_emb,
+                        Shape::from_dims(&[1, 1536]),
+                        device.clone(),
+                    ).and_then(|t| t.to_dtype(DType::BF16)) {
+                        Ok(x) => x,
+                        Err(e) => { log::warn!("[validation] size_t build: {e}"); continue; }
+                    };
+                    let v_pooled = match Tensor::cat(&[&v_pooled_clip_g, &v_size_t], 1)
+                        .and_then(|t| t.to_dtype(DType::BF16))
+                    {
+                        Ok(x) => x,
+                        Err(e) => { log::warn!("[validation] pooled cat: {e}"); continue; }
+                    };
+
+                    // Side-RNG: never touches training rng. Mirrors training
+                    // step's uniform integer timestep + timestep_bias dispatch.
+                    let mut vrng = rand::rngs::StdRng::seed_from_u64(SEED ^ (step as u64 + 1));
+                    let raw_t = vrng.gen_range(0..NUM_TRAIN_TIMESTEPS) as f32;
+                    let t_continuous = timestep_bias::apply_bias(
+                        raw_t,
+                        NUM_TRAIN_TIMESTEPS as f32,
+                        &timestep_bias_cfg,
+                    );
+                    let t_idx = (t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
+                    let ab = alpha_bar[t_idx];
+                    let sqrt_ab = ab.sqrt();
+                    let sqrt_1m_ab = (1.0 - ab).sqrt();
+
+                    let v_noise = match Tensor::randn(v_lat.shape().clone(), 0.0, 1.0, device.clone())
+                        .and_then(|t| t.to_dtype(DType::BF16))
+                    {
+                        Ok(x) => x,
+                        Err(e) => { log::warn!("[validation] noise: {e}"); continue; }
+                    };
+                    let v_noisy = match v_lat.mul_scalar(sqrt_ab)
+                        .and_then(|a| v_noise.mul_scalar(sqrt_1m_ab).and_then(|b| a.add(&b)))
+                    {
+                        Ok(x) => x,
+                        Err(e) => { log::warn!("[validation] noisy: {e}"); continue; }
+                    };
+                    // SDXL ε-prediction default; force_v_prediction → v-target.
+                    let v_target = if config.force_v_prediction {
+                        match v_noise.mul_scalar(sqrt_ab)
+                            .and_then(|a| v_lat.mul_scalar(sqrt_1m_ab).and_then(|b| a.sub(&b)))
+                        {
+                            Ok(x) => x,
+                            Err(e) => { log::warn!("[validation] v-target: {e}"); continue; }
+                        }
+                    } else {
+                        v_noise.clone()
+                    };
+
+                    let v_timestep = match Tensor::from_vec(
+                        vec![t_idx as f32], Shape::from_dims(&[1]), device.clone(),
+                    ) {
+                        Ok(x) => x,
+                        Err(e) => { log::warn!("[validation] timestep: {e}"); continue; }
+                    };
+
+                    let v_pred = match <SDXLModel as TrainableModel>::forward(
+                        &mut model, &v_noisy, &v_timestep,
+                        std::slice::from_ref(&v_txt), Some(&v_pooled),
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            log::warn!("[validation] forward failed: {e}");
+                            continue;
+                        }
+                    };
+                    let v_loss = match v_pred.to_dtype(DType::F32)
+                        .and_then(|p| v_target.to_dtype(DType::F32).and_then(|t| p.sub(&t)))
+                        .and_then(|d| d.square())
+                        .and_then(|s| s.mean())
+                    {
+                        Ok(l) => l,
+                        Err(e) => { log::warn!("[validation] loss: {e}"); continue; }
+                    };
+                    let v_loss_val = match v_loss.to_vec() {
+                        Ok(v) => v[0],
+                        Err(e) => { log::warn!("[validation] loss to_vec: {e}"); continue; }
+                    };
+                    if v_loss_val.is_finite() {
+                        sum += v_loss_val;
+                        count += 1;
+                    }
+                    AutogradContext::clear();
+                }
+                if count > 0 {
+                    let val_avg = sum / count as f32;
+                    log::info!(
+                        "[validation step={}] loss/val = {:.4} ({} samples)",
+                        step + 1,
+                        val_avg,
+                        count
+                    );
+                    if let Some(b) = &board {
+                        b.log_scalar("loss/val", (step + 1) as u64, val_avg as f64);
+                    }
+                }
+            }
+        }
 
         let step_num = step + 1;
         let save_now = args.save_every > 0 && step_num % args.save_every == 0 && step_num < args.steps;

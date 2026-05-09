@@ -41,6 +41,14 @@ pub const NORM_EPS: f32 = 1e-6;
 // matrix when `linear2` is actually `5*DIM→DIM` (silent shape add over `attn`
 // only — MLP-up half got no LoRA correction). This module now matches the
 // canonical layout exactly.
+//
+// DEFERRED (Wave-2 BUG-3): OT's permissive `attn-mlp` regex *also* matches a
+// few extra `nn.Linear`s that this module does not adapt — the per-block
+// modulation linears (`img_mod.lin`, `txt_mod.lin`, single-block `modulation.lin`),
+// the time/vector/text embedders (`time_in`, `vector_in`, `txt_in`,
+// `guidance_in`), `img_in`, and `final_layer.linear`. Adding them widens
+// the bundle by ~150 adapters but is rarely user-visible at standard LoRA
+// rank. Decide convention-vs-completeness in a future session.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DoubleLoraTarget {

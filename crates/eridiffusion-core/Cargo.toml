@@ -6,6 +6,8 @@ description = "EriDiffusion Rust port — core training framework"
 
 [dependencies]
 flame-core = { workspace = true }
+lycoris-rs = { workspace = true }
+clap = { workspace = true }
 cudarc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

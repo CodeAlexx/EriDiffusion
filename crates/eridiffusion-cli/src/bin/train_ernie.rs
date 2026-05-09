@@ -16,7 +16,7 @@ use flame_core::adam::AdamW;
 use eridiffusion_core::config::{LrScheduler, TrainConfig, TrainingMethod};
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::ema_advanced::EmaConfig;
-use eridiffusion_core::training::features::{loss_weight, lr_schedule, noise_modifiers, timestep_bias};
+use eridiffusion_core::training::features::{loss_weight, lr_schedule, noise_modifiers, timestep_bias, validation::ValidationLoop};
 use eridiffusion_core::training::training_features::OptimizerKind;
 use eridiffusion_core::debug as dbg;
 use eridiffusion_core::encoders::{mistral3b::Mistral3bEncoder, vae::KleinVaeDecoder};
@@ -75,6 +75,12 @@ struct Args {
     // ── Phase 0 multi-feature rollout (default-off; Phase 1+ will consume) ──
     #[arg(long)] min_snr_gamma: Option<f32>,
     #[arg(long, default_value_t = 0.0)] caption_dropout_probability: f32,
+    /// Path to a single cache file produced by `prepare_ernie` from an empty-
+    /// caption sample. When `--caption-dropout-probability > 0`, the trainer
+    /// loads `text_embedding` + `text_real_len` from this file and swaps them
+    /// in with probability `p` per step. If unset and dropout > 0, the feature
+    /// is disabled with a warning (preserves prior behaviour).
+    #[arg(long)] null_text_cache: Option<PathBuf>,
     #[arg(long, default_value_t = 1.0)] noise_offset_probability: f32,
     #[arg(long, default_value_t = 0.0)] gamma_input_perturbation: f32,
     #[arg(long, default_value_t = 0.0)] huber_strength: f32,
@@ -210,12 +216,51 @@ fn main() -> anyhow::Result<()> {
         ),
         Err(e) => log::warn!("--optimizer parse: {} — falling back to AdamW", e),
     }
-    if args.caption_dropout_probability > 0.0 {
-        log::warn!(
-            "caption_dropout_probability={:.3} requested but ERNIE trainer has no inline encoder — feature disabled",
-            args.caption_dropout_probability
-        );
-    }
+    // Phase 1: caption_dropout. ERNIE has no inline encoder, so the user
+    // supplies a `--null-text-cache` produced by `prepare_ernie` on a single
+    // empty-caption sample. We load `text_embedding` + `text_real_len` once
+    // and swap them in per-step with the configured probability. Without
+    // `--null-text-cache`, the feature is disabled with a warning.
+    let mut effective_caption_dropout_prob = args.caption_dropout_probability;
+    let null_text: Option<(Tensor, Option<usize>)> = if effective_caption_dropout_prob > 0.0 {
+        match args.null_text_cache.as_ref() {
+            Some(p) => match flame_core::serialization::load_file(p, &device) {
+                Ok(s) => {
+                    let nt = s.get("text_embedding")
+                        .ok_or_else(|| anyhow::anyhow!("--null-text-cache missing 'text_embedding'"))?
+                        .to_dtype(DType::BF16)?;
+                    let nrl: Option<usize> = if let Some(rl_t) = s.get("text_real_len") {
+                        let rl = rl_t.to_dtype(DType::F32)?.to_vec()?[0] as usize;
+                        Some(rl)
+                    } else {
+                        None
+                    };
+                    log::info!(
+                        "[caption-dropout] WIRED — prob={:.3} (null_text_embedding={:?}, null_text_real_len={:?})",
+                        effective_caption_dropout_prob,
+                        nt.shape().dims(),
+                        nrl
+                    );
+                    Some((nt, nrl))
+                }
+                Err(e) => {
+                    log::warn!("[caption-dropout] failed to load --null-text-cache {}: {e} — feature disabled", p.display());
+                    effective_caption_dropout_prob = 0.0;
+                    None
+                }
+            },
+            None => {
+                log::warn!(
+                    "caption_dropout_probability={:.3} requested but --null-text-cache not provided — feature disabled",
+                    effective_caption_dropout_prob
+                );
+                effective_caption_dropout_prob = 0.0;
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut opt = AdamW::new(args.lr, 0.9, 0.999, 1e-8, 0.01);
 
     // EMA shadow (Phase 3). See train_klein.rs for the same pattern.
@@ -299,6 +344,26 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("No cached samples in {:?}", args.cache_dir);
     }
     log::info!("Found {} cached samples", cache_files.len());
+
+    // Phase 2: validation harness — held-out cache + cadence. None at default
+    // (validation_every_steps == 0) → no harness, no branch, byte-identical.
+    let validation_loop: Option<ValidationLoop> = if let (Some(dir), n) =
+        (args.validation_dataset_dir.as_ref(), args.validation_every_steps)
+    {
+        if n > 0 {
+            let v = ValidationLoop::new(dir, n)?;
+            log::info!(
+                "[validation] {} held-out samples, every {} steps",
+                v.len(),
+                n
+            );
+            Some(v)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Single seeded RNG drives both timestep + per-step noise (memory: feedback_default_seed_42).
     let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
@@ -389,13 +454,33 @@ fn main() -> anyhow::Result<()> {
             .get("text_embedding")
             .ok_or_else(|| anyhow::anyhow!("cached sample missing 'text_embedding'"))?
             .to_dtype(DType::BF16)?;
+        // Read real_len from sample (None → full pad length).
+        let sample_rl: Option<usize> = if let Some(rl_t) = sample.get("text_real_len") {
+            let rl = rl_t.to_dtype(DType::F32)?.to_vec()?[0] as usize;
+            Some(rl)
+        } else {
+            None
+        };
+        // Caption dropout: single Bernoulli per step swaps both the text
+        // embedding AND the real-length together (correlated, matching CFG
+        // training convention). Default-off (prob == 0.0 OR null_text == None)
+        // draws no rng.
+        let (txt_full, real_len_opt) = if let Some((ref nt, nrl)) = null_text {
+            use rand::Rng;
+            if rng.r#gen::<f32>() < effective_caption_dropout_prob {
+                (nt.clone(), nrl)
+            } else {
+                (txt_full, sample_rl)
+            }
+        } else {
+            (txt_full, sample_rl)
+        };
         // Trim padded text positions before feeding the DiT — matches upstream Python
         // ErnieModel.py:153-154 `text_encoder_output[:, :text_lengths.max(), :]`.
         // With batch_size=1 cache, real_len IS the trim length. If the cache was
         // produced by an older prepare_ernie that didn't write text_real_len,
         // fall back to the full padded length (legacy 77-pad behaviour).
-        let txt = if let Some(rl_t) = sample.get("text_real_len") {
-            let rl = rl_t.to_dtype(DType::F32)?.to_vec()?[0] as usize;
+        let txt = if let Some(rl) = real_len_opt {
             let tdims = txt_full.shape().dims().to_vec();
             let max_len = tdims[1];
             let real = rl.min(max_len).max(1);
@@ -571,6 +656,103 @@ fn main() -> anyhow::Result<()> {
             step, args.steps, cache_files.len(), 1,
             loss_val, total_norm, cur_lr, t_start, board.as_ref(),
         );
+
+        // Phase 2: validation eval pass (no_grad) every `validation_every_steps`.
+        // step+1 because `step` here is 0-based; ValidationLoop::should_run
+        // expects the 1-based completed-step number.
+        //
+        // ERNIE divergence from Klein: we honour `text_real_len` if present in
+        // the eval cache, mirroring the training-step trim path above (ErnieModel
+        // forward expects `text_encoder_output[:, :real_len, :]`). Older eval
+        // caches without that field fall back to the full padded length, which
+        // is the same legacy behaviour as the training path.
+        if let Some(ref vloop) = validation_loop {
+            if vloop.should_run(step + 1) {
+                let mut sum = 0.0_f32;
+                let mut count = 0_usize;
+                for vfile in &vloop.cache_files {
+                    let _g = AutogradContext::no_grad();
+                    let sample = match flame_core::serialization::load_file(vfile, &device) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log::warn!("[validation] load {} failed: {e}", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_lat = match sample.get("latent") {
+                        Some(t) => t.to_dtype(DType::BF16)?,
+                        None => {
+                            log::warn!("[validation] {} missing latent", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_txt_full = match sample.get("text_embedding") {
+                        Some(t) => t.to_dtype(DType::BF16)?,
+                        None => {
+                            log::warn!("[validation] {} missing text_embedding", vfile.display());
+                            continue;
+                        }
+                    };
+                    // Mirror training-step text_real_len trim. Required so the
+                    // val forward sees the same shape distribution as training.
+                    let v_txt = if let Some(rl_t) = sample.get("text_real_len") {
+                        let rl = rl_t.to_dtype(DType::F32)?.to_vec()?[0] as usize;
+                        let tdims = v_txt_full.shape().dims().to_vec();
+                        let max_len = tdims[1];
+                        let real = rl.min(max_len).max(1);
+                        v_txt_full.narrow(1, 0, real)?.contiguous()?
+                    } else {
+                        v_txt_full
+                    };
+                    // Sample timestep + noise identically to training. Validation
+                    // uses its OWN run-side RNG so it does not perturb the
+                    // training-side seeded sequence (byte invariance).
+                    let mut vrng = rand::rngs::StdRng::seed_from_u64(SEED ^ (step as u64 + 1));
+                    let t_continuous = sample_timestep_logit_normal(&mut vrng);
+                    let sigma_idx = (t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
+                    let sigma = (sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32;
+                    let v_noise = Tensor::randn(v_lat.shape().clone(), 0.0, 1.0, device.clone())?
+                        .to_dtype(DType::BF16)?;
+                    let v_noisy = v_noise.mul_scalar(sigma)?
+                        .add(&v_lat.mul_scalar(1.0 - sigma)?)?;
+                    let v_target = v_noise.sub(&v_lat)?;
+                    let v_timestep = Tensor::from_vec(
+                        vec![t_continuous],
+                        Shape::from_dims(&[1]),
+                        device.clone(),
+                    )?;
+                    let v_pred = match model.forward(&v_noisy, &v_txt, &v_timestep) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            log::warn!("[validation] forward failed: {e}");
+                            continue;
+                        }
+                    };
+                    let v_loss = v_pred.to_dtype(DType::F32)?
+                        .sub(&v_target.to_dtype(DType::F32)?)?
+                        .square()?
+                        .mean()?;
+                    let v_loss_val = v_loss.to_vec()?[0];
+                    if v_loss_val.is_finite() {
+                        sum += v_loss_val;
+                        count += 1;
+                    }
+                    AutogradContext::clear();
+                }
+                if count > 0 {
+                    let val_avg = sum / count as f32;
+                    log::info!(
+                        "[validation step={}] loss/val = {:.4} ({} samples)",
+                        step + 1,
+                        val_avg,
+                        count
+                    );
+                    if let Some(b) = &board {
+                        b.log_scalar("loss/val", (step + 1) as u64, val_avg as f64);
+                    }
+                }
+            }
+        }
 
         // ── Periodic save + inline sample (every N steps) ───────────────
         let step_num = step + 1;

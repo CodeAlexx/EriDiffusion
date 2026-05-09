@@ -19,11 +19,10 @@
 //!   - Default seed = 42; --resume-full + --save-mode wired.
 //!
 //! ## STATUS
-//! Compiles + runs through scaffolding + pre/post-step bookkeeping. The forward
-//! pass goes via `AnimaModel::forward` which currently returns NotImplemented
-//! (see crates/eridiffusion-core/src/models/anima.rs). The training loop will
-//! error out at the first step; the structure is in place for when the model
-//! port lands.
+//! Forward is wired against the ported `AnimaModel` (see
+//! `crates/eridiffusion-core/src/models/anima.rs:703-767`, ported from
+//! `inference-flame::anima`). End-to-end loss-curve parity vs kohya
+//! `anima_train_network.py` not yet validated.
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -41,12 +40,15 @@ use eridiffusion_core::training::features::{
 };
 use eridiffusion_core::training::training_features::OptimizerKind;
 
-/// Slot class names for the 10 LoRA modules per Anima block. Used by debug
+/// Slot class names for the 16 LoRA modules per Anima block. Used by debug
 /// gradient summaries. MUST match `anima::LORA_SLOT_KEYS` order.
 const ANIMA_LORA_CLASSES: [&str; anima_mod::LORA_SLOTS_PER_BLOCK] = [
     "self_attn.q", "self_attn.k", "self_attn.v", "self_attn.out",
     "cross_attn.q", "cross_attn.k", "cross_attn.v", "cross_attn.out",
     "mlp.layer1", "mlp.layer2",
+    "adaln_sa.1", "adaln_sa.2",
+    "adaln_ca.1", "adaln_ca.2",
+    "adaln_mlp.1", "adaln_mlp.2",
 ];
 
 const NUM_TRAIN_TIMESTEPS: usize = 1000;
@@ -62,14 +64,22 @@ struct Args {
     #[arg(long, default_value = "100")] steps: usize,
     #[arg(long, default_value = "16")] rank: usize,
     #[arg(long, default_value = "1.0")] lora_alpha: f64,
-    #[arg(long, default_value = "3e-4")] lr: f32,
+    /// Learning rate. Default `5e-5` matches `Anima_lora_configs.toml:23`
+    /// (canonical recipe). The previous default of 3e-4 was 6× higher and
+    /// in the "blow up early, stabilize ugly" regime for 28-block DiTs.
+    #[arg(long, default_value = "5e-5")] lr: f32,
 
     /// Timestep sampling: "sigmoid" (kohya default), "uniform", "shift".
     #[arg(long, default_value = "sigmoid")] timestep_sampling: String,
     /// Sigmoid scale used by `sigmoid` sampling (kohya default 1.0).
     #[arg(long, default_value = "1.0")] sigmoid_scale: f32,
-    /// Rectified-flow timestep shift (kohya `--discrete_flow_shift`, default 1.0).
-    #[arg(long, default_value = "1.0")] discrete_flow_shift: f32,
+    /// Rectified-flow timestep shift (kohya `--discrete_flow_shift`).
+    /// Default 3.0 matches `Anima_lora_configs.toml:37` (canonical Anima
+    /// recipe; reference Python's CLI default is 1.0 but the shipped TOML
+    /// always overrides it). Mid-sigma loss mass is the principal hyper-
+    /// parameter for Anima rect-flow training; shift=1.0 trains a
+    /// fundamentally different distribution from reference checkpoints.
+    #[arg(long, default_value = "3.0")] discrete_flow_shift: f32,
     /// Loss weighting scheme: "none" (default), "sigma_sqrt", "cosmap".
     #[arg(long, default_value = "none")] weighting_scheme: String,
 
@@ -82,12 +92,17 @@ struct Args {
     #[arg(long, default_value = "full")] save_mode: String,
     #[arg(long, default_value = "output")] output_dir: PathBuf,
 
-    // ── Periodic save (sample-image rendering deferred until model forward lands) ──
+    // ── Periodic save (in-trainer sample rendering not yet wired; use sample_anima.rs) ──
     #[arg(long, default_value = "0")] save_every: usize,
 
     // ── Phase 0 multi-feature rollout (default-off; Phase 1+ will consume) ──
     #[arg(long)] min_snr_gamma: Option<f32>,
     #[arg(long, default_value_t = 0.0)] caption_dropout_probability: f32,
+    /// Path to a single cache file produced by `prepare_anima` from an empty-
+    /// caption sample. When `--caption-dropout-probability > 0`, the trainer
+    /// loads `text_embedding` from this file and swaps it in (along with the
+    /// optional `text_mask`) with probability `p` per step.
+    #[arg(long)] null_text_cache: Option<PathBuf>,
     #[arg(long, default_value_t = 1.0)] noise_offset_probability: f32,
     #[arg(long, default_value_t = 0.0)] gamma_input_perturbation: f32,
     #[arg(long, default_value_t = 0.0)] huber_strength: f32,
@@ -130,11 +145,12 @@ struct Args {
     #[arg(long, default_value_t = false)] caption_tag_shuffle: bool,
     #[arg(long, default_value_t = false)] cache_clear_each_epoch: bool,
     #[arg(long, default_value_t = false)] cache_invalidate: bool,
-    /// Phase 5: LR scheduler family. Default `constant` + `warmup_steps=0` is
-    /// byte-equivalent to the prior fixed-LR behaviour.
-    #[arg(long, default_value = "constant")] lr_scheduler: String,
-    /// Phase 5: linear LR warmup steps. Default 0 keeps prior behaviour.
-    #[arg(long, default_value_t = 0)] warmup_steps: usize,
+    /// Phase 5: LR scheduler family. Default `cosine` matches
+    /// `Anima_lora_configs.toml:lr_scheduler = "cosine"` (canonical recipe).
+    #[arg(long, default_value = "cosine")] lr_scheduler: String,
+    /// Phase 5: linear LR warmup steps. Default 100 matches
+    /// `Anima_lora_configs.toml:lr_warmup_steps = 100`.
+    #[arg(long, default_value_t = 100)] warmup_steps: usize,
     /// Phase 5: cosine-with-restarts cycle count.
     #[arg(long, default_value_t = 1.0)] lr_cycles: f32,
 }
@@ -195,6 +211,14 @@ fn main() -> anyhow::Result<()> {
     flame_core::config::set_default_dtype(DType::BF16);
     let device = flame_core::global_cuda_device();
 
+    // NB: `--config` is JSON-only. The kohya `Anima_lora_configs.toml` format
+    // (with `[anima_arguments]` / `[training_arguments]` sections, e.g.
+    // `discrete_flow_shift = 3.0`, `learning_rate = 5e-5`, `lr_scheduler =
+    // "cosine"`, `lr_warmup_steps = 100`) is NOT consumed here — the EDv2
+    // CLI defaults reflect those canonical TOML values directly, so the
+    // launcher should pass them as flags or rely on defaults rather than
+    // through the TOML. If a user passes `--config foo.toml`, the JSON
+    // parser will fail with a clear error, which surfaces the mismatch.
     let mut config = TrainConfig::from_json_path(&args.config.to_string_lossy())?;
     config.training_method = TrainingMethod::Lora;
     config.lora_rank = args.rank as u64;
@@ -231,18 +255,65 @@ fn main() -> anyhow::Result<()> {
 
     match OptimizerKind::parse(&args.optimizer) {
         Ok(OptimizerKind::AdamW) => {}
-        Ok(other) => log::warn!(
-            "non-AdamW optimizer selected: {} — Phase 1 falls back to AdamW (full dispatch in Phase 5)",
+        Ok(OptimizerKind::AdamW8bit) => anyhow::bail!(
+            "AdamW8bit is forbidden in EDv2 (no-quantization rule per CLAUDE.md \
+             — applies to Anima as well as Z-Image / Klein). Use `--optimizer adamw` \
+             (BF16 stochastic-round AdamW)."
+        ),
+        Ok(other) => anyhow::bail!(
+            "--optimizer {} is not yet wired for Anima (only `adamw` is supported \
+             today; full Adafactor/Prodigy/Lion dispatch lands with the Phase 5 \
+             registry). Failing loud rather than silently falling back.",
             other.as_str()
         ),
-        Err(e) => log::warn!("--optimizer parse: {} — falling back to AdamW", e),
+        Err(e) => anyhow::bail!("--optimizer parse: {}", e),
     }
-    if args.caption_dropout_probability > 0.0 {
-        log::warn!(
-            "caption_dropout_probability={:.3} requested but Anima trainer has no inline encoder — feature disabled",
-            args.caption_dropout_probability
-        );
-    }
+    let effective_caption_dropout_prob = args.caption_dropout_probability;
+    // Anima caption signal is FOUR fields: text_embedding (Qwen3 cap_feats),
+    // text_mask (Qwen3 mask), t5_input_ids (LLM Adapter input), t5_attn_mask.
+    // ALL four are caption-dependent (the LLM Adapter combines T5 IDs with
+    // cap_feats inside the model), so a correct CFG-style dropout must swap
+    // every field together under one Bernoulli draw — otherwise the
+    // unconditional path leaks the conditional T5 token sequence.
+    let null_text: Option<(Tensor, Option<Tensor>, Option<Tensor>, Option<Tensor>)> =
+        if effective_caption_dropout_prob > 0.0 {
+        match args.null_text_cache.as_ref() {
+            Some(p) => match flame_core::serialization::load_file(p, &device) {
+                Ok(s) => {
+                    let nt = s.get("text_embedding")
+                        .ok_or_else(|| anyhow::anyhow!("--null-text-cache missing 'text_embedding'"))?
+                        .to_dtype(DType::BF16)?;
+                    let nm = s.get("text_mask").cloned();
+                    let nt5_ids = s.get("t5_input_ids").cloned();
+                    let nt5_mask = s.get("t5_attn_mask").cloned();
+                    log::info!(
+                        "[caption-dropout] WIRED — prob={:.3} (null text={:?}, mask={}, t5_ids={}, t5_mask={})",
+                        effective_caption_dropout_prob,
+                        nt.shape().dims(),
+                        nm.is_some(),
+                        nt5_ids.is_some(),
+                        nt5_mask.is_some(),
+                    );
+                    Some((nt, nm, nt5_ids, nt5_mask))
+                }
+                Err(e) => anyhow::bail!(
+                    "[caption-dropout] failed to load --null-text-cache {}: {e}. \
+                     Either provide a valid null-text cache or set \
+                     --caption-dropout-probability 0 to disable.",
+                    p.display()
+                ),
+            },
+            None => anyhow::bail!(
+                "--caption-dropout-probability={:.3} requires --null-text-cache. \
+                 Run prepare_anima on an empty caption first, then pass that \
+                 cache path. Failing loud rather than silently disabling CFG \
+                 conditioning training.",
+                effective_caption_dropout_prob
+            ),
+        }
+    } else {
+        None
+    };
     let mut opt = AdamW::new(args.lr, 0.9, 0.999, 1e-8, 0.01);
 
     // EMA shadow (Phase 3). See train_klein.rs for the same pattern.
@@ -325,6 +396,31 @@ fn main() -> anyhow::Result<()> {
     }
     log::info!("Found {} cached samples", cache_files.len());
 
+    // Cache-version sentinel. prepare_anima writes `_meta.json` with
+    // `version >= 2` once T5 pad rows are zeroed in `text_embedding`. Pre-fix
+    // caches (no sentinel, or version 1) had non-zero activations at pad
+    // positions that leaked through all 28 cross-attn layers — silent quality
+    // degradation. Bail loudly so users re-run prepare_anima.
+    let meta_path = args.cache_dir.join("_meta.json");
+    if !meta_path.exists() {
+        anyhow::bail!(
+            "Cache at {} has no `_meta.json` sentinel — likely a pre-fix cache that trains on non-zeroed T5 pad rows. \
+             Re-run `prepare_anima` to regenerate the cache with the mask-zeroing fix.",
+            args.cache_dir.display()
+        );
+    }
+    let meta_str = std::fs::read_to_string(&meta_path)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", meta_path.display()))?;
+    if !meta_str.contains("\"version\": 2") && !meta_str.contains("\"version\":2") {
+        anyhow::bail!(
+            "Cache `_meta.json` at {} reports an unsupported version: {}. \
+             Expected version 2 (T5 mask-zeroed). Re-run `prepare_anima`.",
+            meta_path.display(),
+            meta_str.trim()
+        );
+    }
+    log::info!("[cache-meta] {}", meta_str.trim());
+
     let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
     let debug_grads_enabled = dbg::enabled("ANIMA_DEBUG_GRADS");
     if debug_grads_enabled {
@@ -356,6 +452,28 @@ fn main() -> anyhow::Result<()> {
         let cap_mask = sample.get("text_mask").cloned();
         let t5_ids = sample.get("t5_input_ids").cloned();
         let t5_mask = sample.get("t5_attn_mask").cloned();
+        // Caption dropout: single Bernoulli swaps ALL four caption-dependent
+        // fields together (cap_feats, cap_mask, t5_ids, t5_mask). The LLM
+        // Adapter inside `AnimaModel::forward` re-encodes T5 ids alongside
+        // cap_feats — leaving t5_ids conditional while zeroing cap_feats
+        // would still leak the prompt, defeating CFG training.
+        // Default-off (prob == 0.0 OR null_text == None) draws no rng.
+        let (cap_feats, cap_mask, t5_ids, t5_mask) =
+            if let Some((ref nt, ref nm, ref nt5_ids, ref nt5_mask)) = null_text {
+            use rand::Rng;
+            if rng.r#gen::<f32>() < effective_caption_dropout_prob {
+                (
+                    nt.clone(),
+                    nm.clone(),
+                    nt5_ids.clone(),
+                    nt5_mask.clone(),
+                )
+            } else {
+                (cap_feats, cap_mask, t5_ids, t5_mask)
+            }
+        } else {
+            (cap_feats, cap_mask, t5_ids, t5_mask)
+        };
 
         // Timestep sampling.
         let raw_t = match args.timestep_sampling.as_str() {
@@ -519,7 +637,7 @@ fn main() -> anyhow::Result<()> {
             loss_val, total_norm, cur_lr, t_start, board.as_ref(),
         );
 
-        // Periodic save (sample-rendering deferred — model.forward stub).
+        // Periodic save (in-trainer sample rendering not yet wired).
         let step_num = step + 1;
         let do_periodic_save =
             args.save_every > 0 && step_num % args.save_every == 0 && step_num < args.steps;

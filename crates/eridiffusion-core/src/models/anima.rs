@@ -16,9 +16,9 @@
 //!   inference port's "x_f32" pattern: at this scale BF16 residuals saturate
 //!   and forward output collapses).
 //! - `padding_mask` is hard-zero per kohya `anima_train_network.py:303`
-//!   (`torch.zeros(bs, 1, h_lat, w_lat)`), built inside `forward`. Since it is
-//!   constant zero we skip the cat at the patchifier and instead pad by
-//!   prepending the 1-channel zero band before linearising — matches numerics.
+//!   (`torch.zeros(bs, 1, h_lat, w_lat)`). We construct it inline in
+//!   `patchify` and concatenate on the channel dim before patchifying —
+//!   matches reference numerics.
 //!
 //! ## Data layout
 //!
@@ -90,10 +90,15 @@ pub const QWEN_VAE_LATENT_STD: [f32; 16] = [
 ];
 
 /// LoRA target slots per Anima Block.
-///   0..3 self-attn:  q_proj, k_proj, v_proj, output_proj  (HIDDEN→HIDDEN)
-///   4..7 cross-attn: q_proj (HIDDEN→HIDDEN), k_proj/v_proj (1024→HIDDEN), output_proj (HIDDEN→HIDDEN)
-///   8..9 mlp:        layer1 (HIDDEN→FFN), layer2 (FFN→HIDDEN)
-pub const LORA_SLOTS_PER_BLOCK: usize = 10;
+///   0..3   self-attn:  q_proj, k_proj, v_proj, output_proj  (HIDDEN→HIDDEN)
+///   4..7   cross-attn: q_proj (HIDDEN→HIDDEN), k_proj/v_proj (1024→HIDDEN), output_proj (HIDDEN→HIDDEN)
+///   8..9   mlp:        layer1 (HIDDEN→FFN), layer2 (FFN→HIDDEN)
+///   10..15 adaln_modulation (kohya `lora_anima.py` covers all `nn.Linear` in
+///          a Block; AdaLN modulation linears carry the conditioning signal):
+///          - self_attn.{1,2}:  HIDDEN→ADALN_LORA_DIM, ADALN_LORA_DIM→3*HIDDEN
+///          - cross_attn.{1,2}: HIDDEN→ADALN_LORA_DIM, ADALN_LORA_DIM→3*HIDDEN
+///          - mlp.{1,2}:        HIDDEN→ADALN_LORA_DIM, ADALN_LORA_DIM→3*HIDDEN
+pub const LORA_SLOTS_PER_BLOCK: usize = 16;
 pub const LORA_SLOT_KEYS: [&str; LORA_SLOTS_PER_BLOCK] = [
     "self_attn.q_proj",
     "self_attn.k_proj",
@@ -105,7 +110,14 @@ pub const LORA_SLOT_KEYS: [&str; LORA_SLOTS_PER_BLOCK] = [
     "cross_attn.output_proj",
     "mlp.layer1",
     "mlp.layer2",
+    "adaln_modulation_self_attn.1",
+    "adaln_modulation_self_attn.2",
+    "adaln_modulation_cross_attn.1",
+    "adaln_modulation_cross_attn.2",
+    "adaln_modulation_mlp.1",
+    "adaln_modulation_mlp.2",
 ];
+const ADALN_OUT: usize = 3 * HIDDEN; // 6144 — chunk-3 (shift, scale, gate)
 const LORA_SHAPES: [(usize, usize); LORA_SLOTS_PER_BLOCK] = [
     (HIDDEN, HIDDEN),
     (HIDDEN, HIDDEN),
@@ -117,6 +129,12 @@ const LORA_SHAPES: [(usize, usize); LORA_SLOTS_PER_BLOCK] = [
     (HIDDEN, HIDDEN),
     (HIDDEN, FFN),
     (FFN, HIDDEN),
+    (HIDDEN, ADALN_LORA_DIM),
+    (ADALN_LORA_DIM, ADALN_OUT),
+    (HIDDEN, ADALN_LORA_DIM),
+    (ADALN_LORA_DIM, ADALN_OUT),
+    (HIDDEN, ADALN_LORA_DIM),
+    (ADALN_LORA_DIM, ADALN_OUT),
 ];
 
 /// Indexable enum for LoRA target lookup; mirrors the `LoraTarget` pattern in
@@ -126,6 +144,9 @@ pub enum AnimaLoraTarget {
     SaQ, SaK, SaV, SaOut,
     CaQ, CaK, CaV, CaOut,
     MlpL1, MlpL2,
+    AdalnSa1, AdalnSa2,
+    AdalnCa1, AdalnCa2,
+    AdalnMlp1, AdalnMlp2,
 }
 impl AnimaLoraTarget {
     pub fn slot(self) -> usize {
@@ -133,6 +154,9 @@ impl AnimaLoraTarget {
             Self::SaQ => 0, Self::SaK => 1, Self::SaV => 2, Self::SaOut => 3,
             Self::CaQ => 4, Self::CaK => 5, Self::CaV => 6, Self::CaOut => 7,
             Self::MlpL1 => 8, Self::MlpL2 => 9,
+            Self::AdalnSa1 => 10, Self::AdalnSa2 => 11,
+            Self::AdalnCa1 => 12, Self::AdalnCa2 => 13,
+            Self::AdalnMlp1 => 14, Self::AdalnMlp2 => 15,
         }
     }
 }
@@ -375,10 +399,15 @@ impl AnimaModel {
         t_cond: &Tensor,
         base_adaln: &Tensor,
         prefix: &str,
+        slot_pair: Option<(usize, AnimaLoraTarget, AnimaLoraTarget)>,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let t_silu = t_cond.silu()?;
-        let h = self.linear_no_bias(&t_silu, &format!("{prefix}.1.weight"))?;
-        let mod_out = self.linear_no_bias(&h, &format!("{prefix}.2.weight"))?;
+        let (slot1, slot2) = match slot_pair {
+            Some((b, s1, s2)) => (Some((b, s1)), Some((b, s2))),
+            None => (None, None),
+        };
+        let h = self.linear_lora(&t_silu, &format!("{prefix}.1.weight"), slot1)?;
+        let mod_out = self.linear_lora(&h, &format!("{prefix}.2.weight"), slot2)?;
         let mod_out = mod_out.add(base_adaln)?;
         let dim = HIDDEN;
         let shift = mod_out.narrow(1, 0, dim)?;
@@ -515,6 +544,7 @@ impl AnimaModel {
         let (shift_sa, scale_sa, gate_sa) = self.adaln_modulation(
             t_cond, base_adaln,
             &format!("blocks.{block}.adaln_modulation_self_attn"),
+            Some((block, AnimaLoraTarget::AdalnSa1, AnimaLoraTarget::AdalnSa2)),
         )?;
         let x_mod = self.apply_adaln(&x, &shift_sa, &scale_sa)?;
         let attn_out = self.self_attention(&x_mod, rope_cos, rope_sin, block)?;
@@ -525,6 +555,7 @@ impl AnimaModel {
         let (shift_ca, scale_ca, gate_ca) = self.adaln_modulation(
             t_cond, base_adaln,
             &format!("blocks.{block}.adaln_modulation_cross_attn"),
+            Some((block, AnimaLoraTarget::AdalnCa1, AnimaLoraTarget::AdalnCa2)),
         )?;
         let x_mod = self.apply_adaln(&x, &shift_ca, &scale_ca)?;
         let cross_out = self.cross_attention(&x_mod, context, block)?;
@@ -535,6 +566,7 @@ impl AnimaModel {
         let (shift_mlp, scale_mlp, gate_mlp) = self.adaln_modulation(
             t_cond, base_adaln,
             &format!("blocks.{block}.adaln_modulation_mlp"),
+            Some((block, AnimaLoraTarget::AdalnMlp1, AnimaLoraTarget::AdalnMlp2)),
         )?;
         let x_mod = self.apply_adaln(&x, &shift_mlp, &scale_mlp)?;
         let mlp_out = self.mlp(&x_mod, block)?;
@@ -697,7 +729,10 @@ impl AnimaModel {
     /// `cap_mask`:     `[B, seq]` 1.0 at valid tokens (currently unused; kohya
     ///                 doesn't apply a mask at the cross-attn input either)
     /// `t5_input_ids`: `[B, t5_seq]` F32 (i32 cast to F32 for safetensors I/O)
-    /// `t5_attn_mask`: `[B, t5_seq]` (currently unused at this layer)
+    /// `t5_attn_mask`: `[B, t5_seq]` 1.0 at valid T5 tokens. Used to zero
+    ///                 pad positions of the LLM-Adapter output before the
+    ///                 transformer-block cross-attn (matches reference
+    ///                 `anima_train_utils.py:723-729`).
     ///
     /// Returns `[B, 16, H, W]` predicted velocity (rectified-flow target = `noise - clean`).
     pub fn forward(
@@ -707,7 +742,7 @@ impl AnimaModel {
         cap_feats: &Tensor,
         _cap_mask: Option<&Tensor>,
         t5_input_ids: Option<&Tensor>,
-        _t5_attn_mask: Option<&Tensor>,
+        t5_attn_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let in_dims = noisy.shape().dims().to_vec();
         if in_dims.len() != 4 {
@@ -746,6 +781,23 @@ impl AnimaModel {
             // but lets us forward when the cache lacks T5 ids — used only by the
             // placeholder smoke path).
             cap_feats.clone()
+        };
+        // Zero pad positions of the cross-attn embedding using t5_attn_mask.
+        // Reference: `library/anima_train_utils.py:723-729`
+        //     crossattn_emb[~t5_attn_mask.bool()] = 0
+        // Without this, pad positions of the LLM-adapter output (which has
+        // no internal masking on its T5-side cross-attn) carry junk values
+        // that leak into every transformer-block cross-attn key/value.
+        let context = if let Some(mask) = t5_attn_mask {
+            let ctx_dims = context.shape().dims().to_vec();
+            // Mask shape `[B, T5_seq]`; broadcast to `[B, T5_seq, ctx_dim]`.
+            let mask_3d = mask
+                .reshape(&[ctx_dims[0], ctx_dims[1], 1])?
+                .to_dtype(context.dtype())?
+                .broadcast_to(&Shape::from_dims(&ctx_dims))?;
+            context.mul(&mask_3d)?
+        } else {
+            context
         };
 
         // 5. 28 transformer blocks.
@@ -936,6 +988,25 @@ fn apply_rope_cossin(
     result.reshape(&[b, s, h, d])
 }
 
+/// 3D RoPE NTK extrapolation ratios per Anima variant.
+/// Reference: `library/anima_models.py:1117-1119` defaults +
+/// `anima_utils.get_dit_config` overrides per-variant (selected by
+/// `(in_channels, model_channels)`):
+///   - (16, 1280) → 4.0/4.0/1.0 over 20 blocks (Anima 1B-ish)
+///   - (16, 2048) → 4.0/4.0/1.0 over 28 blocks (Anima preview, current EDv2)
+///   - (16, 5120) → 4.0/4.0/1.0 over 36 blocks (Anima full)
+///   - (17, *)    → 3.0/3.0/1.0 (i2v / video-conditioned variants)
+/// EDv2 currently compiles only the (16, 2048) preview, so this returns
+/// `(4.0, 4.0, 1.0)` for HIDDEN=2048; future multi-variant support extends
+/// the match.
+const fn rope_ntk_ratios_for(in_channels: usize, hidden: usize) -> (f64, f64, f64) {
+    match (in_channels, hidden) {
+        (17, _) => (3.0, 3.0, 1.0),
+        (16, _) => (4.0, 4.0, 1.0),
+        _ => (1.0, 1.0, 1.0),
+    }
+}
+
 /// Build 3D RoPE cos/sin tables for the fused kernel.
 /// Returns `(cos, sin)` each `[1, 1, S, D/2]` where `S = T*nH*nW`.
 fn build_3d_rope_cossin(
@@ -956,9 +1027,10 @@ fn build_3d_rope_cossin(
     let bins_w = dim_w / 2;
 
     let base_theta: f64 = 10000.0;
-    let h_ntk = 4.0f64.powf(dim_h as f64 / (dim_h as f64 - 2.0));
-    let w_ntk = 4.0f64.powf(dim_w as f64 / (dim_w as f64 - 2.0));
-    let t_ntk = 1.0f64.powf(dim_t as f64 / (dim_t as f64 - 2.0));
+    let (h_ratio, w_ratio, t_ratio) = rope_ntk_ratios_for(IN_CHANNELS, HIDDEN);
+    let h_ntk = h_ratio.powf(dim_h as f64 / (dim_h as f64 - 2.0));
+    let w_ntk = w_ratio.powf(dim_w as f64 / (dim_w as f64 - 2.0));
+    let t_ntk = t_ratio.powf(dim_t as f64 / (dim_t as f64 - 2.0));
     let theta_h = (base_theta * h_ntk) as f32;
     let theta_w = (base_theta * w_ntk) as f32;
     let theta_t = (base_theta * t_ntk) as f32;
@@ -1014,10 +1086,11 @@ fn build_3d_rope_cossin(
 }
 
 // ─── TODO (Phase B) ─────────────────────────────────────────────────────────
-// 1. Add LoRA targets for AdaLN modulation linears (3 × 2 per block = 168 modules)
-//    plus PatchEmbed (1) + TimestepEmbedding (2) + FinalLayer (3) — full kohya
-//    list is ~454 modules, we currently train 280. Per-target slot/in_features
-//    differ; would extend `LORA_SHAPES` and the bundle indexing.
+// 1. (DONE 2026-05-08) AdaLN modulation linears — 6 per block × 28 blocks = 168
+//    extra LoRA modules now wired via `LORA_SHAPES[10..16]`. Total per-block
+//    LoRA count: 16 × 28 = 448 modules (matches kohya `lora_anima.py` Block
+//    coverage). Outer linears (`final_layer.linear`, `final_layer.adaln_*`,
+//    `t_embedder.1.linear_{1,2}`, `x_embedder.proj.1`) are still TODO.
 // 2. LLM-Adapter LoRA targets (when `train_llm_adapter=True`) — 6 blocks ×
 //    (3 self_attn + 3 cross_attn + 2 mlp) = 48 modules.
 // 3. Validate end-to-end loss-curve parity vs kohya `anima_train_network.py`

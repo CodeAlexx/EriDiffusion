@@ -25,10 +25,11 @@ use eridiffusion_core::training::checkpoint::{self, CkptHeader};
 use eridiffusion_core::config::LrScheduler;
 use eridiffusion_core::training::features::{
     ema_advanced::EmaConfig, loss_weight, lr_schedule, noise_modifiers, timestep_bias,
+    validation::ValidationLoop,
 };
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::training_features::OptimizerKind;
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, SeedableRng};
 use std::path::PathBuf;
 
 const SEED_DEFAULT: u64 = 42;
@@ -57,11 +58,19 @@ struct Args {
     #[arg(long, default_value = "16.0")] lora_alpha: f32,
     /// OneTrainer "qwen LoRA 24GB" preset default = 3e-4.
     #[arg(long, default_value = "3e-4")] lr: f32,
-    /// Resolution at which the cache was prepared (used for qwen_shift).
+    /// Resolution at which the cache was prepared (used for qwen_shift when
+    /// `--dynamic-timestep-shifting` is set).
     #[arg(long, default_value = "512")] resolution: usize,
     #[arg(long, default_value = "200")] warmup_steps: usize,
-    /// Optional fixed shift (overrides resolution-based qwen_shift).
-    #[arg(long)] qwen_shift: Option<f32>,
+    /// Fixed timestep shift. OneTrainer's `#qwen LoRA 24GB.json` preset
+    /// defaults to `1.0` (no shift) at training time; the diffusers/musubi
+    /// inference path uses a resolution-dependent shift via
+    /// `--dynamic-timestep-shifting`. Default `1.0` matches OT.
+    #[arg(long, default_value_t = 1.0)] qwen_shift: f32,
+    /// When set, override `--qwen-shift` with a resolution-dependent shift
+    /// derived from `shift_for_resolution([w, h])` (matches musubi/diffusers
+    /// inference). Default off → byte-identical shift=1.0 (OT preset).
+    #[arg(long, default_value_t = false)] dynamic_timestep_shifting: bool,
     /// Resume LoRA weights only (no optimizer state).
     #[arg(long, conflicts_with = "resume_full")] resume_lora: Option<PathBuf>,
     /// Full resume: LoRA + AdamW + step.
@@ -104,6 +113,12 @@ struct Args {
     // ── Phase 0 multi-feature rollout (default-off; Phase 1+ will consume) ──
     #[arg(long)] min_snr_gamma: Option<f32>,
     #[arg(long, default_value_t = 0.0)] caption_dropout_probability: f32,
+    /// Path to a single cache file produced by `prepare_qwenimage` from an
+    /// empty-caption sample. When `--caption-dropout-probability > 0`, the
+    /// trainer loads `text_embedding` from this file and swaps it in with
+    /// probability `p` per step. If unset and dropout > 0, the feature is
+    /// disabled with a warning (preserves prior behaviour).
+    #[arg(long)] null_text_cache: Option<PathBuf>,
     #[arg(long, default_value_t = 1.0)] noise_offset_probability: f32,
     #[arg(long, default_value_t = 0.0)] gamma_input_perturbation: f32,
     #[arg(long, default_value_t = 0.0)] huber_strength: f32,
@@ -202,7 +217,12 @@ fn sample_timestep_logit_normal_qwenshift(rng: &mut StdRng, shift: f32) -> f32 {
     let normal = Normal::new(0.0f32, 1.0f32).unwrap();
     let z = normal.sample(rng);
     let t = 1.0 / (1.0 + (-z).exp());
-    shift * t / (1.0 + (shift - 1.0) * t)
+    let shifted = shift * t / (1.0 + (shift - 1.0) * t);
+    // Clamp to OT's discrete grid {1/1000, ..., 1.0}. OT samples a discrete
+    // integer in [0, 1000) then divides by 1000, so sigma == 0 never occurs.
+    // Continuous sampling here can hit sigma == 0 (degenerate clean input)
+    // → clamp to the OT minimum.
+    shifted.clamp(1.0 / 1000.0, 1.0)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -221,9 +241,11 @@ fn main() -> anyhow::Result<()> {
     flame_core::config::set_default_dtype(DType::BF16);
     let device = flame_core::global_cuda_device();
 
-    let shift = args.qwen_shift.unwrap_or_else(|| {
+    let shift = if args.dynamic_timestep_shifting {
         shift_for_resolution([args.resolution, args.resolution])
-    });
+    } else {
+        args.qwen_shift
+    };
     log::info!(
         "[train_qwenimage] model={}, cache={}, steps={}, rank={}, alpha={}, lr={}, res={}², shift={:.3}",
         args.model.display(), args.cache_dir.display(),
@@ -386,6 +408,45 @@ fn main() -> anyhow::Result<()> {
     }
     log::info!("Found {} cached samples", cache_files.len());
 
+    // Sentinel check: prepare_qwenimage writes `_meta.json` with the prep
+    // resolution + max_text_len. Warn loud if the cache was produced at a
+    // different resolution than `--resolution`. Legacy caches without the
+    // sentinel proceed silently (user is on their own for cross-resolution
+    // contamination).
+    let meta_path = args.cache_dir.join("_meta.json");
+    if meta_path.exists() {
+        if let Ok(s) = std::fs::read_to_string(&meta_path) {
+            let res_match = s.contains(&format!("\"resolution\": {}", args.resolution));
+            if !res_match {
+                log::warn!(
+                    "[cache-meta] {} prep settings = {} — but trainer --resolution = {}. Possible OOD cache reuse.",
+                    meta_path.display(), s.trim(), args.resolution
+                );
+            }
+        }
+    } else {
+        log::debug!("[cache-meta] no _meta.json sentinel — legacy cache or hand-managed");
+    }
+
+    // Validation harness — held-out cache + cadence. None at default (byte-identity).
+    let validation_loop: Option<ValidationLoop> = if let (Some(dir), n) =
+        (args.validation_dataset_dir.as_ref(), args.validation_every_steps)
+    {
+        if n > 0 {
+            let v = ValidationLoop::new(dir, n)?;
+            log::info!(
+                "[validation] {} held-out samples, every {} steps",
+                v.len(),
+                n
+            );
+            Some(v)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     match OptimizerKind::parse(&args.optimizer) {
         Ok(OptimizerKind::AdamW) => {}
         Ok(other) => log::warn!(
@@ -394,12 +455,44 @@ fn main() -> anyhow::Result<()> {
         ),
         Err(e) => log::warn!("--optimizer parse: {} — falling back to AdamW", e),
     }
-    if args.caption_dropout_probability > 0.0 {
-        log::warn!(
-            "caption_dropout_probability={:.3} requested but Qwen-Image trainer has no inline encoder — feature disabled",
-            args.caption_dropout_probability
-        );
-    }
+    // Phase 1: caption_dropout. Qwen-Image has no inline encoder, so the user
+    // supplies a `--null-text-cache` produced by `prepare_qwenimage` on a
+    // single empty-caption sample. We load `text_embedding` once and swap it
+    // in per-step with the configured probability. Without `--null-text-cache`,
+    // the feature is disabled with a warning.
+    let mut effective_caption_dropout_prob = args.caption_dropout_probability;
+    let null_text: Option<Tensor> = if effective_caption_dropout_prob > 0.0 {
+        match args.null_text_cache.as_ref() {
+            Some(p) => match flame_core::serialization::load_file(p, &device) {
+                Ok(s) => {
+                    let nt = s.get("text_embedding")
+                        .ok_or_else(|| anyhow::anyhow!("--null-text-cache missing 'text_embedding'"))?
+                        .to_dtype(DType::BF16)?;
+                    log::info!(
+                        "[caption-dropout] WIRED — prob={:.3} (null_text_embedding={:?})",
+                        effective_caption_dropout_prob,
+                        nt.shape().dims()
+                    );
+                    Some(nt)
+                }
+                Err(e) => {
+                    log::warn!("[caption-dropout] failed to load --null-text-cache {}: {e} — feature disabled", p.display());
+                    effective_caption_dropout_prob = 0.0;
+                    None
+                }
+            },
+            None => {
+                log::warn!(
+                    "caption_dropout_probability={:.3} requested but --null-text-cache not provided — feature disabled",
+                    effective_caption_dropout_prob
+                );
+                effective_caption_dropout_prob = 0.0;
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut optimizer = AdamW::new(args.lr, 0.9, 0.999, 1e-8, 0.01);
 
     // EMA shadow (Phase 3 advanced). Built from current live params (post
@@ -524,6 +617,19 @@ fn main() -> anyhow::Result<()> {
         let txt_embed = tensors.get("text_embedding")
             .ok_or_else(|| anyhow::anyhow!("cache missing 'text_embedding'"))?
             .to_dtype(DType::BF16)?;
+        // Caption dropout: single Bernoulli per step swaps text_embedding
+        // with null cache. Default-off (prob == 0.0 OR null_text == None)
+        // draws no rng.
+        let txt_embed = if let Some(ref nt) = null_text {
+            use rand::Rng;
+            if rng.r#gen::<f32>() < effective_caption_dropout_prob {
+                nt.clone()
+            } else {
+                txt_embed
+            }
+        } else {
+            txt_embed
+        };
 
         let lat_dims = latent.shape().dims().to_vec();
         let (b, _c, latent_h, latent_w) = (lat_dims[0], lat_dims[1], lat_dims[2], lat_dims[3]);
@@ -650,6 +756,108 @@ fn main() -> anyhow::Result<()> {
             step, args.steps, cache_files.len(), 1,
             loss_val, grad_norm, current_lr, t_start, board.as_ref(),
         );
+
+        // Validation eval pass (no_grad) every `validation_every_steps`.
+        // step+1 because `step` here is 0-based; ValidationLoop::should_run
+        // expects the 1-based completed-step number.
+        //
+        // Mirrors the training step's math:
+        //   - logit-normal then qwen_shift remap (same `shift` as training)
+        //   - sigma == t_continuous (Qwen-Image works in continuous [0,1])
+        //   - flow-matching x_t = (1-sigma)*lat + sigma*noise; tgt = noise-lat
+        //   - pack [B,16,H,W]→[B,H/2*W/2,64]; forward(xt_packed, ts, txt, H, W)
+        // Side-RNG is `args.seed ^ (step+1)` so this never perturbs the
+        // training-side rng draws (byte invariance for default-off).
+        if let Some(ref vloop) = validation_loop {
+            if vloop.should_run(step + 1) {
+                let mut sum = 0.0_f32;
+                let mut count = 0_usize;
+                for vfile in &vloop.cache_files {
+                    let _g = AutogradContext::no_grad();
+                    let sample = match flame_core::serialization::load_file(vfile, &device) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log::warn!("[validation] load {} failed: {e}", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_lat = match sample.get("latent") {
+                        Some(t) => t.to_dtype(DType::BF16)?,
+                        None => {
+                            log::warn!("[validation] {} missing latent", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_txt = match sample.get("text_embedding") {
+                        Some(t) => t.to_dtype(DType::BF16)?,
+                        None => {
+                            log::warn!("[validation] {} missing text_embedding", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_dims = v_lat.shape().dims().to_vec();
+                    let (v_lat_h, v_lat_w) = (v_dims[2], v_dims[3]);
+
+                    let mut vrng = rand::rngs::StdRng::seed_from_u64(args.seed ^ (step as u64 + 1));
+                    let v_sigma = sample_timestep_logit_normal_qwenshift(&mut vrng, shift);
+                    let v_timestep = Tensor::from_vec(
+                        vec![v_sigma],
+                        Shape::from_dims(&[1]),
+                        device.clone(),
+                    )?
+                    .to_dtype(DType::BF16)?;
+                    let v_noise = Tensor::randn(v_lat.shape().clone(), 0.0, 1.0, device.clone())?
+                        .to_dtype(DType::BF16)?;
+                    let v_xt = v_lat.mul_scalar(1.0 - v_sigma)?
+                        .add(&v_noise.mul_scalar(v_sigma)?)?;
+                    let v_target = v_noise.sub(&v_lat)?;
+
+                    let v_xt_packed = match qwen_model::pack_latents(&v_xt) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            log::warn!("[validation] pack_latents failed: {e}");
+                            continue;
+                        }
+                    };
+                    let v_target_packed = match qwen_model::pack_latents(&v_target) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            log::warn!("[validation] pack_latents (target) failed: {e}");
+                            continue;
+                        }
+                    };
+                    let v_pred = match model.forward(&v_xt_packed, &v_timestep, &v_txt, v_lat_h, v_lat_w) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            log::warn!("[validation] forward failed: {e}");
+                            continue;
+                        }
+                    };
+                    let v_loss = v_pred.to_dtype(DType::F32)?
+                        .sub(&v_target_packed.to_dtype(DType::F32)?)?
+                        .square()?
+                        .mean()?;
+                    let v_loss_val = v_loss.to_vec()?[0];
+                    if v_loss_val.is_finite() {
+                        sum += v_loss_val;
+                        count += 1;
+                    }
+                    AutogradContext::clear();
+                }
+                if count > 0 {
+                    let val_avg = sum / count as f32;
+                    log::info!(
+                        "[validation step={}] loss/val = {:.4} ({} samples)",
+                        step + 1,
+                        val_avg,
+                        count
+                    );
+                    if let Some(b) = &board {
+                        b.log_scalar("loss/val", (step + 1) as u64, val_avg as f64);
+                    }
+                }
+            }
+        }
 
         if args.save_every > 0 && step_num % args.save_every == 0 && step_num < args.steps {
             // EMA swap: when `--ema --ema-validation-swap`, the periodic save

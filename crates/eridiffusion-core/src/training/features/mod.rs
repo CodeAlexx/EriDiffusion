@@ -23,6 +23,7 @@ pub mod caption_dropout;
 pub mod disk_check;
 pub mod ema_advanced;
 pub mod health;
+pub mod image_aug;
 pub mod loss_weight;
 pub mod lr_schedule;
 pub mod masked_loss;

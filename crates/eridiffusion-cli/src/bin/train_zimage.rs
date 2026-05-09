@@ -36,6 +36,7 @@ use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::ema_advanced::EmaConfig;
 use eridiffusion_core::training::features::{
     caption_dropout, loss_weight, lr_schedule, noise_modifiers, timestep_bias,
+    validation::ValidationLoop,
 };
 use eridiffusion_core::training::training_features::OptimizerKind;
 
@@ -420,6 +421,29 @@ fn main() -> anyhow::Result<()> {
         log::warn!("[lr_scheduler] {e} — falling back to Constant");
         LrScheduler::Constant
     });
+
+    // Phase 2: validation harness — held-out cache + cadence. None at default.
+    // When `validation_every_steps == 0` or `--validation-dataset-dir` is unset,
+    // the harness is not constructed and the per-step val branch never executes
+    // (byte invariance with feature off).
+    let validation_loop: Option<ValidationLoop> = if let (Some(dir), n) =
+        (args.validation_dataset_dir.as_ref(), args.validation_every_steps)
+    {
+        if n > 0 {
+            let v = ValidationLoop::new(dir, n)?;
+            log::info!(
+                "[validation] {} held-out samples, every {} steps",
+                v.len(),
+                n
+            );
+            Some(v)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     for step in start_step..total_steps {
         // Stack `batch_size` cached samples (matches upstream Python klein9b/zimage preset = batch=2).
         let bs = args.batch_size.max(1);
@@ -615,6 +639,168 @@ fn main() -> anyhow::Result<()> {
             step, args.steps, cache_files.len(), args.batch_size.max(1),
             loss_val, total_norm, cur_lr, t_start, board.as_ref(),
         );
+
+        // Phase 2: validation eval pass (no_grad) every `validation_every_steps`.
+        // Mirrors the training step under AutogradContext::no_grad() with the
+        // SAME schedule/loss/forward signature. Uses a SIDE-RNG seeded from
+        // `SEED ^ (step+1)` so the training-side `rng` (StdRng seeded from SEED)
+        // is not perturbed — byte invariance with feature off (validation_loop
+        // is None) is preserved. Runs BEFORE EMA swap / save, mirroring Klein.
+        if let Some(ref vloop) = validation_loop {
+            if vloop.should_run(step + 1) {
+                let mut sum = 0.0_f32;
+                let mut count = 0_usize;
+                for vfile in &vloop.cache_files {
+                    let _g = AutogradContext::no_grad();
+                    let sample = match flame_core::serialization::load_file(vfile, &device) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log::warn!("[validation] load {} failed: {e}", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_lat_raw = match sample.get("latent") {
+                        Some(t) => match t.to_dtype(DType::BF16) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                log::warn!("[validation] {} latent dtype: {e}", vfile.display());
+                                continue;
+                            }
+                        },
+                        None => {
+                            log::warn!("[validation] {} missing latent", vfile.display());
+                            continue;
+                        }
+                    };
+                    // Apply the same VAE shift/scale the training step uses.
+                    let v_lat = match v_lat_raw
+                        .add_scalar(-ZIMAGE_VAE_SHIFT)
+                        .and_then(|t| t.mul_scalar(ZIMAGE_VAE_SCALE))
+                    {
+                        Ok(t) => t,
+                        Err(e) => {
+                            log::warn!("[validation] {} latent scale: {e}", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_cap = match sample.get("text_embedding") {
+                        Some(t) => match t.to_dtype(DType::BF16) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                log::warn!("[validation] {} text_embedding dtype: {e}", vfile.display());
+                                continue;
+                            }
+                        },
+                        None => {
+                            log::warn!("[validation] {} missing text_embedding", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_cap_mask = match sample.get("text_mask") {
+                        Some(t) => match t.to_dtype(DType::BF16) {
+                            Ok(t) => Some(t),
+                            Err(e) => {
+                                log::warn!("[validation] {} text_mask dtype: {e}", vfile.display());
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    // Side-RNG so training-side `rng` is not perturbed.
+                    let mut vrng = rand::rngs::StdRng::seed_from_u64(SEED ^ (step as u64 + 1));
+                    let raw_t = sample_timestep_logit_normal(&mut vrng);
+                    let t_continuous = timestep_bias::apply_bias(
+                        raw_t,
+                        NUM_TRAIN_TIMESTEPS as f32,
+                        &timestep_bias_cfg,
+                    );
+                    let v_sigma_idx = (t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
+                    let v_sigma = (v_sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32;
+                    let v_t_value = 1.0 - v_sigma;
+                    let v_noise = match Tensor::randn(v_lat.shape().clone(), 0.0, 1.0, device.clone())
+                        .and_then(|t| t.to_dtype(DType::BF16))
+                    {
+                        Ok(t) => t,
+                        Err(e) => {
+                            log::warn!("[validation] noise: {e}");
+                            continue;
+                        }
+                    };
+                    let v_noisy = match v_noise.mul_scalar(v_sigma)
+                        .and_then(|t| v_lat.mul_scalar(1.0 - v_sigma).and_then(|c| t.add(&c)))
+                    {
+                        Ok(t) => t,
+                        Err(e) => {
+                            log::warn!("[validation] noisy: {e}");
+                            continue;
+                        }
+                    };
+                    // Match training: target = clean - noise (Z-Image's negated
+                    // velocity convention; see line above `let target = ...`).
+                    let v_target = match v_lat.sub(&v_noise) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            log::warn!("[validation] target: {e}");
+                            continue;
+                        }
+                    };
+                    let v_timestep = match Tensor::from_vec(
+                        vec![v_t_value],
+                        Shape::from_dims(&[1]),
+                        device.clone(),
+                    ).and_then(|t| t.to_dtype(DType::BF16))
+                    {
+                        Ok(t) => t,
+                        Err(e) => {
+                            log::warn!("[validation] timestep: {e}");
+                            continue;
+                        }
+                    };
+                    let v_pred = match model.forward(&v_noisy, &v_timestep, &v_cap, v_cap_mask.as_ref()) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            log::warn!("[validation] forward failed: {e}");
+                            continue;
+                        }
+                    };
+                    let v_loss = match v_pred.to_dtype(DType::F32)
+                        .and_then(|p| v_target.to_dtype(DType::F32).and_then(|t| p.sub(&t)))
+                        .and_then(|d| d.square())
+                        .and_then(|d| d.mean())
+                    {
+                        Ok(t) => t,
+                        Err(e) => {
+                            log::warn!("[validation] loss: {e}");
+                            continue;
+                        }
+                    };
+                    let v_loss_val = match v_loss.to_vec() {
+                        Ok(v) if !v.is_empty() => v[0],
+                        _ => {
+                            AutogradContext::clear();
+                            continue;
+                        }
+                    };
+                    if v_loss_val.is_finite() {
+                        sum += v_loss_val;
+                        count += 1;
+                    }
+                    AutogradContext::clear();
+                }
+                if count > 0 {
+                    let val_avg = sum / count as f32;
+                    log::info!(
+                        "[validation step={}] loss/val = {:.4} ({} samples)",
+                        step + 1,
+                        val_avg,
+                        count
+                    );
+                    if let Some(b) = &board {
+                        b.log_scalar("loss/val", (step + 1) as u64, val_avg as f64);
+                    }
+                }
+            }
+        }
 
         // ── Periodic save (independent of sample) ──────────────────────
         let step_num = step + 1;

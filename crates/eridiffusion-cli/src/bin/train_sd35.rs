@@ -25,7 +25,7 @@ use flame_core::adam::AdamW;
 use eridiffusion_core::config::{LrScheduler, TrainConfig, TrainingMethod};
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::ema_advanced::EmaConfig;
-use eridiffusion_core::training::features::{loss_weight, lr_schedule, noise_modifiers, timestep_bias};
+use eridiffusion_core::training::features::{loss_weight, lr_schedule, noise_modifiers, timestep_bias, validation::ValidationLoop};
 use eridiffusion_core::training::training_features::OptimizerKind;
 use eridiffusion_core::debug as dbg;
 use eridiffusion_core::encoders::clip_g::ClipGEncoder;
@@ -46,6 +46,12 @@ const CLIP_GRAD_NORM: f32 = 1.0;
 const CLIP_L_PAD_ID: i32 = 49407;
 const CLIP_G_PAD_ID: i32 = 0;
 const CLIP_MAX_LEN: usize = 77;
+// HARD: T5 padded sequence length. Combined CLIP+T5 context is `[B, 154, 4096]`.
+// Mirrors `prepare_sd35.rs::TXT_PAD_LEN`. OT `StableDiffusion3BaseDataLoader.py:33`
+// passes `tokenizer_1.model_max_length=77` to all three tokenizers.
+const TXT_PAD_LEN: usize = 77;
+// HARD: 1024×1024 is the only supported training resolution.
+const TRAIN_RES: u32 = 1024;
 
 const VAE_LATENT_CHANNELS: usize = 16;
 const VAE_SCALE: f32 = 1.5305;
@@ -98,17 +104,25 @@ struct Args {
     #[arg(long)] sample_clip_l_tokenizer: Option<PathBuf>,
     #[arg(long)] sample_clip_g_tokenizer: Option<PathBuf>,
     #[arg(long)] sample_t5_tokenizer: Option<PathBuf>,
-    #[arg(long, default_value = "1024")] sample_size: usize,
+    /// HARD-locked to 1024 — the only supported training/sample resolution.
+    #[arg(long, default_value_t = TRAIN_RES as usize)] sample_size: usize,
     #[arg(long, default_value = "28")] sample_steps: usize,
     #[arg(long, default_value = "4.5")] sample_cfg: f32,
     /// Inference-time schedule shift. SD3 reference uses 3.0.
     #[arg(long, default_value = "3.0")] sample_shift: f32,
-    #[arg(long, default_value = "256")] sample_t5_max_len: usize,
+    /// HARD-locked to 77 — combined CLIP+T5 context shape is `[B, 154, 4096]`.
+    #[arg(long, default_value_t = TXT_PAD_LEN)] sample_t5_max_len: usize,
     #[arg(long, default_value = "42")] sample_seed: u64,
 
     // ── Phase 0 multi-feature rollout (default-off; Phase 1+ will consume) ──
     #[arg(long)] min_snr_gamma: Option<f32>,
     #[arg(long, default_value_t = 0.0)] caption_dropout_probability: f32,
+    /// Path to a single cache file produced by `prepare_sd35` from an empty-
+    /// caption sample. When `--caption-dropout-probability > 0`, the trainer
+    /// loads `text_embedding` + `pooled` from this file and swaps them in
+    /// (correlated) with probability `p` per step. If unset and dropout > 0,
+    /// the feature is disabled with a warning.
+    #[arg(long)] null_text_cache: Option<PathBuf>,
     #[arg(long, default_value_t = 1.0)] noise_offset_probability: f32,
     #[arg(long, default_value_t = 0.0)] gamma_input_perturbation: f32,
     #[arg(long, default_value_t = 0.0)] huber_strength: f32,
@@ -162,14 +176,24 @@ struct Args {
     #[arg(long, default_value_t = 1.0)] lr_cycles: f32,
 }
 
-/// LOGIT_NORMAL timestep sample → continuous t in `[0, num_train_timesteps)`.
-/// Mirrors OT `_get_timestep_discrete` (LOGIT_NORMAL branch, line 154).
-fn sample_timestep_logit_normal(rng: &mut rand::rngs::StdRng, shift: f32) -> f32 {
+/// LOGIT_NORMAL timestep sample → continuous t in `[min_t, max_t)`.
+/// Mirrors OT `_get_timestep_discrete` (LOGIT_NORMAL branch, line 154-160 +
+/// 172): scales the unit-interval logit-normal draw into
+/// `[min_noising_strength, max_noising_strength) * num_train_timesteps`,
+/// then applies the resolution-aware shift.
+fn sample_timestep_logit_normal(
+    rng: &mut rand::rngs::StdRng,
+    shift: f32,
+    min_strength: f32,
+    max_strength: f32,
+) -> f32 {
     use rand_distr::{Distribution, Normal};
     let normal = Normal::new(LOGIT_NORMAL_BIAS, LOGIT_NORMAL_SCALE).unwrap();
     let z = normal.sample(rng);
     let logit_normal = 1.0 / (1.0 + (-z).exp());
-    let t = logit_normal * NUM_TRAIN_TIMESTEPS as f32;
+    let min_t = NUM_TRAIN_TIMESTEPS as f32 * min_strength.max(0.0);
+    let max_t = NUM_TRAIN_TIMESTEPS as f32 * max_strength.min(1.0);
+    let t = logit_normal * (max_t - min_t) + min_t;
     if (shift - 1.0).abs() < 1e-6 {
         t
     } else {
@@ -220,6 +244,67 @@ fn tokenize_t5(tok: &tokenizers::Tokenizer, text: &str, max_len: usize) -> anyho
     if ids.len() > max_len { ids.truncate(max_len); }
     while ids.len() < max_len { ids.push(0); }
     Ok(ids)
+}
+
+/// HIGH-1 fix: 3 independent Bernoulli draws per OT
+/// `StableDiffusion3Model.encode_text:397-415`. Each encoder is masked
+/// independently — CLIP-L, CLIP-G, T5 — into both the combined `text_embedding`
+/// `[B, 154, 4096]` and the pooled `[B, 2048]` (T5 has no pooled component).
+///
+/// Combined tensor layout (must match `prepare_sd35.rs::TXT_PAD_LEN=77`):
+///   text_embedding rows  0..77 : padded CLIP-L+CLIP-G (channels 0..768
+///                                = CLIP-L, 768..2048 = CLIP-G, 2048..4096 = pad)
+///   text_embedding rows 77..154: T5 hidden (full 4096 channels)
+///   pooled channels  0..768  : CLIP-L pooled
+///   pooled channels  768..2048: CLIP-G pooled
+fn apply_per_encoder_dropout(
+    text: &Tensor,
+    pooled: &Tensor,
+    drop_clip_l: bool,
+    drop_clip_g: bool,
+    drop_t5: bool,
+    device: &std::sync::Arc<flame_core::CudaDevice>,
+) -> anyhow::Result<(Tensor, Tensor)> {
+    if !drop_clip_l && !drop_clip_g && !drop_t5 {
+        return Ok((text.clone(), pooled.clone()));
+    }
+    // text shape: [B, 154, 4096]
+    let dims = text.dims().to_vec();
+    let (b, seq, hidden) = (dims[0], dims[1], dims[2]);
+    debug_assert_eq!(seq, 154, "combined seq must be 154 (OT-parity)");
+    debug_assert_eq!(hidden, 4096, "context hidden must be 4096");
+
+    // Split text along seq into CLIP rows (0..77) and T5 rows (77..154).
+    let clip_rows = text.narrow(1, 0, CLIP_MAX_LEN)?;       // [B, 77, 4096]
+    let t5_rows = text.narrow(1, CLIP_MAX_LEN, CLIP_MAX_LEN)?; // [B, 77, 4096]
+
+    // Within CLIP rows, channels split: 0..768 (CLIP-L), 768..2048 (CLIP-G),
+    // 2048..4096 (zero pad — leave alone regardless).
+    let clip_rows = if drop_clip_l || drop_clip_g {
+        let clip_l_part = clip_rows.narrow(2, 0, 768)?;
+        let clip_g_part = clip_rows.narrow(2, 768, 1280)?;
+        let pad_part = clip_rows.narrow(2, 2048, 2048)?;
+        let clip_l_part = if drop_clip_l { clip_l_part.mul_scalar(0.0)? } else { clip_l_part };
+        let clip_g_part = if drop_clip_g { clip_g_part.mul_scalar(0.0)? } else { clip_g_part };
+        Tensor::cat(&[&clip_l_part, &clip_g_part, &pad_part], 2)?
+    } else {
+        clip_rows
+    };
+
+    let t5_rows = if drop_t5 { t5_rows.mul_scalar(0.0)? } else { t5_rows };
+    let new_text = Tensor::cat(&[&clip_rows, &t5_rows], 1)?;
+
+    // Pooled: 0..768 CLIP-L, 768..2048 CLIP-G.
+    let pdims = pooled.dims().to_vec();
+    debug_assert_eq!(pdims[1], 2048, "pooled hidden must be 2048");
+    let pool_l = pooled.narrow(1, 0, 768)?;
+    let pool_g = pooled.narrow(1, 768, 1280)?;
+    let pool_l = if drop_clip_l { pool_l.mul_scalar(0.0)? } else { pool_l };
+    let pool_g = if drop_clip_g { pool_g.mul_scalar(0.0)? } else { pool_g };
+    let new_pooled = Tensor::cat(&[&pool_l, &pool_g], 1)?;
+
+    let _ = (b, device); // silence unused
+    Ok((new_text, new_pooled))
 }
 
 /// Encode one prompt → `(context [1, seq, 4096], pooled [1, 2048])`.
@@ -329,9 +414,14 @@ fn inline_sample(
     for i in 0..steps {
         let t_curr = timesteps[i];
         let t_next = timesteps[i + 1];
+        // MED-1 fix: keep timestep in F32. BF16 has 8-bit mantissa → loses
+        // 1-LSB precision for integer values >256, which is most of the
+        // [0, 999] range. Train ↔ inference timestep embedding parity breaks
+        // otherwise. The MMDiT timestep_embed promotes to F32 internally
+        // (sd35.rs:398), so passing F32 here is zero cost.
         let t_vec = Tensor::from_vec(
             vec![t_curr * 1000.0], Shape::from_dims(&[1]), device.clone(),
-        )?.to_dtype(DType::BF16)?;
+        )?.to_dtype(DType::F32)?;
         let pred_cond = model.forward_inner(&latent, &t_vec, context, pooled)?;
         let pred_uncond = model.forward_inner(&latent, &t_vec, neg_context, neg_pooled)?;
         let diff = pred_cond.sub(&pred_uncond)?;
@@ -355,6 +445,30 @@ fn main() -> anyhow::Result<()> {
     use rand::SeedableRng;
     env_logger::init();
     let args = Args::parse();
+    // HARD: T5 max len locked to 77 (combined seq=154). Both training and
+    // sample paths must use 77 — anything else hard-fails.
+    if args.sample_t5_max_len != TXT_PAD_LEN {
+        anyhow::bail!(
+            "--sample-t5-max-len must be {TXT_PAD_LEN} (combined context = 154 tokens, OT-parity); got {}",
+            args.sample_t5_max_len
+        );
+    }
+    // HARD: 1024 is the only supported sample/inline resolution.
+    if args.sample_size as u32 != TRAIN_RES {
+        anyhow::bail!(
+            "--sample-size must be {TRAIN_RES} (only 1024×1024 is supported); got {}",
+            args.sample_size
+        );
+    }
+    // MED-3: OT raises NotImplementedError for Min-SNR-γ on flow-matching loss
+    // (`ModelSetupDiffusionLossMixin._flow_matching_losses` accepts only
+    // CONSTANT and SIGMA). User-directed exception: keep wired but warn.
+    if args.min_snr_gamma.is_some() {
+        log::warn!(
+            "[divergence] --min-snr-gamma={} is wired into the flow-matching loss; OT FORBIDS this for SD3 (FM has no SNR). User-requested override.",
+            args.min_snr_gamma.unwrap()
+        );
+    }
     // Phase 2: Klein-only wiring of multi-backend + validation prompts library.
     // Other trainers accept-and-warn so configs/launchers aren't broken; full
     // wiring is a follow-up after the per-model encoder + sample paths are
@@ -411,12 +525,63 @@ fn main() -> anyhow::Result<()> {
         ),
         Err(e) => log::warn!("--optimizer parse: {} — falling back to AdamW", e),
     }
-    if args.caption_dropout_probability > 0.0 {
-        log::warn!(
-            "caption_dropout_probability={:.3} requested but SD3.5 trainer has no inline encoder — feature disabled",
-            args.caption_dropout_probability
-        );
-    }
+    let effective_caption_dropout_prob = args.caption_dropout_probability;
+    // HIGH-1: OT-style 3 INDEPENDENT per-encoder Bernoullis. Each step,
+    // CLIP-L / CLIP-G / T5 are zeroed independently with prob `p` each,
+    // matching `StableDiffusion3Model.py:397-415`. `--null-text-cache` is
+    // OPTIONAL — it's only used as a small optimisation when all three
+    // encoders draw on the same step.
+    let null_text: Option<(Tensor, Tensor)> = if effective_caption_dropout_prob > 0.0 {
+        match args.null_text_cache.as_ref() {
+            Some(p) => match flame_core::serialization::load_file(p, &device) {
+                Ok(s) => {
+                    let nt = s.get("text_embedding")
+                        .ok_or_else(|| anyhow::anyhow!("--null-text-cache missing 'text_embedding'"))?
+                        .to_dtype(DType::BF16)?;
+                    let nt_d = nt.dims();
+                    if nt_d.len() != 3 || nt_d[1] != 2 * TXT_PAD_LEN || nt_d[2] != 4096 {
+                        anyhow::bail!(
+                            "--null-text-cache text_embedding shape {:?} but expected [B, {}, 4096]",
+                            nt_d, 2 * TXT_PAD_LEN
+                        );
+                    }
+                    let np = s.get("pooled")
+                        .ok_or_else(|| anyhow::anyhow!("--null-text-cache missing 'pooled'"))?
+                        .to_dtype(DType::BF16)?;
+                    let np_d = np.dims();
+                    if np_d.len() != 2 || np_d[1] != 2048 {
+                        anyhow::bail!(
+                            "--null-text-cache pooled shape {:?} but expected [B, 2048]",
+                            np_d
+                        );
+                    }
+                    log::info!(
+                        "[caption-dropout] WIRED OT-style — per-encoder p={:.3} (null cache provided as 3-of-3 fast path: text={:?} pooled={:?})",
+                        effective_caption_dropout_prob,
+                        nt.shape().dims(),
+                        np.shape().dims()
+                    );
+                    Some((nt, np))
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[caption-dropout] failed to load --null-text-cache {}: {e} — using slice-zero only",
+                        p.display()
+                    );
+                    None
+                }
+            },
+            None => {
+                log::info!(
+                    "[caption-dropout] WIRED OT-style — per-encoder p={:.3} (slice-zero, no null-text-cache)",
+                    effective_caption_dropout_prob
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut opt = AdamW::new(args.lr, 0.9, 0.999, 1e-8, 0.01);
 
     // EMA shadow (Phase 3). See train_klein.rs for the same pattern.
@@ -498,6 +663,25 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("No cached samples in {:?}", args.cache_dir);
     }
     log::info!("Found {} cached samples", cache_files.len());
+
+    // Phase 2: validation harness — held-out cache + cadence. None at default.
+    let validation_loop: Option<ValidationLoop> = if let (Some(dir), n) =
+        (args.validation_dataset_dir.as_ref(), args.validation_every_steps)
+    {
+        if n > 0 {
+            let v = ValidationLoop::new(dir, n)?;
+            log::info!(
+                "[validation] {} held-out samples, every {} steps",
+                v.len(),
+                n
+            );
+            Some(v)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
 
@@ -593,9 +777,55 @@ fn main() -> anyhow::Result<()> {
             let t = sample.get("text_embedding")
                 .ok_or_else(|| anyhow::anyhow!("cached sample {cache_idx} missing 'text_embedding'"))?
                 .to_dtype(DType::BF16)?;
+            // HARD: combined CLIP+T5 sequence must be exactly 154 tokens
+            // (TXT_PAD_LEN*2). Reject pre-2026-05-08 caches built with the
+            // old --t5-max-len=256 default (seq=333), which would otherwise
+            // silently feed off-distribution context into the MMDiT.
+            let t_dims = t.dims();
+            if t_dims.len() != 3 || t_dims[1] != 2 * TXT_PAD_LEN || t_dims[2] != 4096 {
+                anyhow::bail!(
+                    "cache {} has text_embedding shape {:?} but expected [B, {}, 4096] (TXT_PAD_LEN={}). Re-run prepare_sd35 with current code.",
+                    cache_files[cache_idx].display(), t_dims, 2 * TXT_PAD_LEN, TXT_PAD_LEN
+                );
+            }
             let p = sample.get("pooled")
                 .ok_or_else(|| anyhow::anyhow!("cached sample {cache_idx} missing 'pooled'"))?
                 .to_dtype(DType::BF16)?;
+            let p_dims = p.dims();
+            if p_dims.len() != 2 || p_dims[1] != 2048 {
+                anyhow::bail!(
+                    "cache {} has pooled shape {:?} but expected [B, 2048].",
+                    cache_files[cache_idx].display(), p_dims
+                );
+            }
+            // HIGH-1 fix: OT-style 3 INDEPENDENT per-encoder Bernoullis
+            // (`StableDiffusion3Model.py:397-415`). The cached combined tensors
+            // are sliced and partially zeroed in place; no `--null-text-cache`
+            // dependency for the encoder-mask path. The legacy single-coin
+            // null-cache swap is preserved as a fallback when --null-text-cache
+            // is provided AND --caption-dropout-probability > 0: we keep the
+            // existing behaviour for users who had it wired previously, and
+            // apply the new per-encoder draws on TOP for OT parity.
+            let (t, p) = if effective_caption_dropout_prob > 0.0 {
+                use rand::Rng;
+                let p_drop = effective_caption_dropout_prob;
+                let drop_l = rng.r#gen::<f32>() < p_drop;
+                let drop_g = rng.r#gen::<f32>() < p_drop;
+                let drop_t5 = rng.r#gen::<f32>() < p_drop;
+                // If null-text-cache is provided AND all three encoders draw,
+                // use the cached null pair (cheaper than zeroing all slices).
+                if drop_l && drop_g && drop_t5 {
+                    if let Some((ref nt, ref np)) = null_text {
+                        (nt.clone(), np.clone())
+                    } else {
+                        apply_per_encoder_dropout(&t, &p, true, true, true, &device)?
+                    }
+                } else {
+                    apply_per_encoder_dropout(&t, &p, drop_l, drop_g, drop_t5, &device)?
+                }
+            } else {
+                (t, p)
+            };
             latents.push(l); texts.push(t); pooleds.push(p);
         }
         let latent = if bs == 1 { latents.into_iter().next().unwrap() }
@@ -610,7 +840,12 @@ fn main() -> anyhow::Result<()> {
         let mut sigma_per_b: Vec<f32> = Vec::with_capacity(bs);
         let mut t_model_per_b: Vec<f32> = Vec::with_capacity(bs);
         for _ in 0..bs {
-            let raw_t = sample_timestep_logit_normal(&mut rng, args.timestep_shift);
+            let raw_t = sample_timestep_logit_normal(
+                &mut rng,
+                args.timestep_shift,
+                config.min_noising_strength as f32,
+                config.max_noising_strength as f32,
+            );
             // Default-off: Strategy::None → returns raw_t unchanged.
             let t_continuous = timestep_bias::apply_bias(
                 raw_t,
@@ -773,6 +1008,119 @@ fn main() -> anyhow::Result<()> {
             step, args.steps, cache_files.len(), args.batch_size.max(1),
             loss_val, total_norm, cur_lr, t_start, board.as_ref(),
         );
+
+        // Phase 2: validation eval pass (no_grad) every `validation_every_steps`.
+        // step+1 because `step` here is 0-based; ValidationLoop::should_run
+        // expects the 1-based completed-step number.
+        if let Some(ref vloop) = validation_loop {
+            if vloop.should_run(step + 1) {
+                let mut sum = 0.0_f32;
+                let mut count = 0_usize;
+                for vfile in &vloop.cache_files {
+                    let _g = AutogradContext::no_grad();
+                    let sample = match flame_core::serialization::load_file(vfile, &device) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log::warn!("[validation] load {} failed: {e}", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_lat = match sample.get("latent") {
+                        Some(t) => t.to_dtype(DType::BF16)?,
+                        None => {
+                            log::warn!("[validation] {} missing latent", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_txt = match sample.get("text_embedding") {
+                        Some(t) => {
+                            let d = t.dims();
+                            if d.len() != 3 || d[1] != 2 * TXT_PAD_LEN || d[2] != 4096 {
+                                log::warn!(
+                                    "[validation] {} has text_embedding shape {:?} but expected [B, {}, 4096]; skipping",
+                                    vfile.display(), d, 2 * TXT_PAD_LEN
+                                );
+                                continue;
+                            }
+                            t.to_dtype(DType::BF16)?
+                        }
+                        None => {
+                            log::warn!("[validation] {} missing text_embedding", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_pool = match sample.get("pooled") {
+                        Some(t) => t.to_dtype(DType::BF16)?,
+                        None => {
+                            log::warn!("[validation] {} missing pooled", vfile.display());
+                            continue;
+                        }
+                    };
+                    // Sample timestep + noise identically to training. Validation
+                    // uses its OWN run-side RNG so it does not perturb the
+                    // training-side seeded sequence (byte invariance). SD3.5
+                    // schedule respects --timestep-shift exactly like the
+                    // training step.
+                    // MED-5 fix: avoid the `SEED ^ (step+1)` collision class
+                    // (when `step + 1 == SEED`, the seed becomes 0). Mix with a
+                    // 64-bit golden-ratio prime instead.
+                    let mut vrng = rand::rngs::StdRng::seed_from_u64(
+                        SEED.wrapping_mul(0x9E3779B97F4A7C15)
+                            .wrapping_add(step as u64 + 1),
+                    );
+                    let t_continuous = sample_timestep_logit_normal(
+                        &mut vrng,
+                        args.timestep_shift,
+                        config.min_noising_strength as f32,
+                        config.max_noising_strength as f32,
+                    );
+                    let sigma_idx = (t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
+                    let sigma = (sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32;
+                    let v_noise = Tensor::randn(v_lat.shape().clone(), 0.0, 1.0, device.clone())?
+                        .to_dtype(DType::BF16)?;
+                    let v_noisy = v_noise.mul_scalar(sigma)?
+                        .add(&v_lat.mul_scalar(1.0 - sigma)?)?;
+                    let v_target = v_noise.sub(&v_lat)?;
+                    // Match training: F32 timestep with raw sigma_idx scale
+                    // (NOT sigma_idx+1; see comment at training-step assembly).
+                    let v_t_model = sigma_idx as f32;
+                    let v_timestep = Tensor::from_vec(
+                        vec![v_t_model],
+                        Shape::from_dims(&[v_lat.shape().dims()[0]]),
+                        device.clone(),
+                    )?.to_dtype(DType::F32)?;
+                    let v_pred = match model.forward_inner(&v_noisy, &v_timestep, &v_txt, &v_pool) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            log::warn!("[validation] forward failed: {e}");
+                            continue;
+                        }
+                    };
+                    let v_loss = v_pred.to_dtype(DType::F32)?
+                        .sub(&v_target.to_dtype(DType::F32)?)?
+                        .square()?
+                        .mean()?;
+                    let v_loss_val = v_loss.to_vec()?[0];
+                    if v_loss_val.is_finite() {
+                        sum += v_loss_val;
+                        count += 1;
+                    }
+                    AutogradContext::clear();
+                }
+                if count > 0 {
+                    let val_avg = sum / count as f32;
+                    log::info!(
+                        "[validation step={}] loss/val = {:.4} ({} samples)",
+                        step + 1,
+                        val_avg,
+                        count
+                    );
+                    if let Some(b) = &board {
+                        b.log_scalar("loss/val", (step + 1) as u64, val_avg as f64);
+                    }
+                }
+            }
+        }
 
         let step_num = step + 1;
 

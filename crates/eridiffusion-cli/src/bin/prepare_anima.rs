@@ -53,6 +53,14 @@ struct Args {
     #[arg(long, default_value_t = T5_MAX_LEN_DEFAULT)] t5_max_len: usize,
     #[arg(long, default_value_t = true)] skip_existing: bool,
     #[arg(long, default_value_t = 0)] max_samples: usize,
+    /// Image augmentations at prep time. All default-off → byte-identical
+    /// caches. Set `--aug-flip` for 50% horizontal flip; `--aug-brightness`
+    /// and `--aug-contrast` jitter pixel values uniformly. `--aug-seed`
+    /// seeds the per-sample RNG.
+    #[arg(long, default_value_t = false)] aug_flip: bool,
+    #[arg(long, default_value_t = 0.0)] aug_brightness: f32,
+    #[arg(long, default_value_t = 0.0)] aug_contrast: f32,
+    #[arg(long, default_value_t = 0)] aug_seed: u64,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -117,6 +125,29 @@ fn main() -> anyhow::Result<()> {
     }
     log::info!("Found {} (image, caption) pairs", pairs.len());
 
+    let aug_cfg = eridiffusion_core::training::features::image_aug::AugConfig {
+        flip: args.aug_flip,
+        brightness: args.aug_brightness,
+        contrast: args.aug_contrast,
+    };
+    if aug_cfg.is_active() {
+        log::info!(
+            "[image-aug] flip={} brightness={} contrast={} seed={}",
+            aug_cfg.flip, aug_cfg.brightness, aug_cfg.contrast, args.aug_seed
+        );
+    }
+
+    // Cache format sentinel. Version 2 = T5 pad rows zeroed in `text_embedding`
+    // post-Qwen3 (matches Anima-Standalone-Trainer reference). Version 1 (no
+    // sentinel) = pre-fix caches that silently train on non-zero pad row
+    // activations through all 28 cross-attn layers. Trainer bails on legacy.
+    const CACHE_VERSION: u32 = 2;
+    let meta = format!(
+        r#"{{"version": {}, "mask_zeroed": true, "format": "anima-v2"}}"#,
+        CACHE_VERSION
+    );
+    let _ = std::fs::write(args.output_dir.join("_meta.json"), &meta);
+
     let mut written = 0usize;
     let mut skipped = 0usize;
     let t_start = std::time::Instant::now();
@@ -131,6 +162,17 @@ fn main() -> anyhow::Result<()> {
             Ok(i) => i.resize_exact(args.resolution, args.resolution, image::imageops::FilterType::Lanczos3).to_rgb32f(),
             Err(e) => { log::warn!("[{idx}] skipping {}: {e}", img_path.display()); continue; }
         };
+        let mut img = img;
+        if aug_cfg.is_active() {
+            use rand::SeedableRng;
+            let mut aug_rng = rand::rngs::StdRng::seed_from_u64(args.aug_seed ^ idx as u64);
+            eridiffusion_core::training::features::image_aug::apply_augs(
+                &mut img,
+                None,
+                &aug_cfg,
+                &mut aug_rng,
+            );
+        }
         let (w, h) = img.dimensions();
         // CHW transpose — see prepare_klein.rs for full bug writeup. Without
         // this, image::pixels() (HWC interleaved) reshaped to [1, 3, H, W]
@@ -167,6 +209,19 @@ fn main() -> anyhow::Result<()> {
             qwen_mask, Shape::from_dims(&[1, args.qwen3_max_len]), device.clone(),
         )?;
 
+        // Zero pad positions in text_embedding. Reference:
+        // `library/strategy_anima.py:166-169` — pad rows of last_hidden_state
+        // are set to 0 before the embedding leaves the strategy. Without
+        // this, junk Qwen3 outputs at pad positions feed Anima's cross-attn
+        // (which has no mask path) and corrupt the caption signal at every
+        // training step.
+        let qwen_hidden_dims = qwen_hidden.shape().dims().to_vec();
+        let mask_3d = qwen_mask_t
+            .reshape(&[1, args.qwen3_max_len, 1])?
+            .to_dtype(qwen_hidden.dtype())?
+            .broadcast_to(&Shape::from_dims(&qwen_hidden_dims))?;
+        let qwen_hidden = qwen_hidden.mul(&mask_3d)?;
+
         // T5 tokens — used as input IDs to LLM Adapter's embedding table only.
         let t5_enc = t5_tok.encode(caption_str, true)
             .map_err(|e| anyhow::anyhow!("t5 tokenize: {e}"))?;
@@ -177,8 +232,16 @@ fn main() -> anyhow::Result<()> {
 
         let mut t5_mask = vec![0.0f32; args.t5_max_len];
         for slot in t5_mask.iter_mut().take(t5_valid_len) { *slot = 1.0; }
-        // Save T5 ids as F32 (flame_core safetensors I/O is dtype-uniform; the
-        // trainer converts back to i32 when feeding LLMAdapter.embed).
+        // Save T5 ids as F32. Ideally these would be I32 (vocab=32128 fits
+        // comfortably in i32; F32 mantissa is unsafe past 2^24, and the
+        // file size is 2× larger than necessary), but the flame_core
+        // safetensors loader explicitly skips I32 dtype tensors at read
+        // time (see `flame-core/src/serialization.rs:520-522` —
+        // `if !matches!(dtype_str, "F32" | "BF16" | "F16" | "F8_E4M3")`).
+        // Switching the cache to I32 would silently drop the t5_input_ids
+        // tensor when the trainer reloads the cache. Keep F32 until the
+        // safetensors path supports I32 round-trip.
+        // FIXME: vocab > 2^24 unsafe — current T5 vocab=32128 is bit-stable.
         let t5_ids_f32: Vec<f32> = t5_ids.iter().map(|&i| i as f32).collect();
         let t5_ids_t = Tensor::from_vec(
             t5_ids_f32, Shape::from_dims(&[1, args.t5_max_len]), device.clone(),

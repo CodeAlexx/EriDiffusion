@@ -46,6 +46,23 @@
 //! interchangeable with `inference-flame/sd3_lora_infer`. **TODO(user audit):
 //! widen to OT-Python-style "all linears" if you want bit-for-bit parity
 //! with upstream Python's training output.**
+//!
+//! Wave-2 audit (HIGH-2, 2026-05-08): the gap is concrete. OT preset
+//! `#sd 3 LoRA.json` has no `layer_filter` field → empty filter →
+//! `LoRAModuleWrapper` walks `named_modules()` and wraps every
+//! `nn.Linear | nn.Conv2d`. Compared to the kohya set above, the missing
+//! adapters are:
+//!   - per joint block: `x_block.adaLN_modulation.1`,
+//!     `context_block.adaLN_modulation.1` (last-block has
+//!     `swap_chunks=True` per `convert_sd3_lora.py:24`)
+//!   - global: `pos_embed.proj` (Conv2d!), `context_embedder`,
+//!     `t_embedder.mlp.{0,2}`, `y_embedder.mlp.{0,2}`,
+//!     `final_layer.linear`, `final_layer.adaLN_modulation.1`
+//!     (also `swap_chunks=True`)
+//! The widening adds ~20% trainable params at rank=16 and changes the
+//! gradient flow on the modulation/time-embed paths. NOT applied in this
+//! Wave-2 fix — the Conv2d LoRA target requires lora_conv2d support in
+//! flame-core which is out of scope here. Tracked as deferred follow-up.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -783,6 +800,17 @@ impl TrainableModel for SD35Model {
     /// `inference-flame/sd3_lora_infer` expects via `LoraStack::load`'s
     /// AiToolkit-compatible path: bare `<prefix>.lora_{A,B}` keys whose
     /// `<prefix>.weight` matches a base key).
+    ///
+    /// HIGH-3 audit (2026-05-08): OT/kohya/ComfyUI ecosystem expects
+    /// `lora_down.weight / lora_up.weight` keys with `lora_transformer_*`
+    /// prefixes and SPLIT QKV (per `convert_sd3_lora_key_sets` in
+    /// OneTrainer). Producing that format requires splitting fused QKV LoRAs
+    /// (`lora_B` row-split into 3) AND remapping prefixes — a non-trivial
+    /// change with risk of breaking the in-tree `inference-flame/sd3_lora_infer`
+    /// consumer (its `detect_format()` would fall back to KleinTrainer for
+    /// bare `lora_down/up` without `lora_unet_` prefix, breaking load). For
+    /// now: PEFT-format save is preserved. Follow-up: add a
+    /// `--export-format kohya|peft` CLI flag + full OMI conversion.
     fn save_weights(&self, path: &str) -> Result<()> {
         if !self.is_lora {
             return Err(EriDiffusionError::Model(

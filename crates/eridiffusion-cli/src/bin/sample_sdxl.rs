@@ -64,10 +64,11 @@ struct Args {
     /// Inference steps. SDXL audit H4: OT preset default is 30 (Euler-A).
     #[arg(long, default_value = "30")] steps: usize,
     #[arg(long, default_value = "7.5")] cfg_scale: f32,
-    /// SDXL audit H4: CFG-rescale (Lin et al. 2023) default 0.7 per OT
-    /// `__sample_base(cfg_rescale=0.7)`. Set to 0.0 for raw classifier-free
-    /// guidance without rescaling.
-    #[arg(long, default_value = "0.7")] cfg_rescale: f32,
+    /// CFG-rescale (Lin et al. 2023). OT runtime default is 0.0 — the
+    /// 0.7 path only fires when `force_last_timestep=True` (zero-terminal-SNR
+    /// v-pred fine-tunes). Pair `--cfg-rescale 0.7` with `--zero-terminal-snr`
+    /// at training time.
+    #[arg(long, default_value = "0.0")] cfg_rescale: f32,
     #[arg(long, default_value = "42")] seed: u64,
 
     /// Sampler scheduler. SDXL audit H4: OT preset default is `euler_a`.
@@ -111,10 +112,18 @@ fn load_one_or_dir(
     Ok(all)
 }
 
+// CLIP EOS token id. Both CLIP-L and CLIP-G tokenizers use 49407 as EOS.
+const CLIP_EOS_ID: i32 = 49407;
+
 fn tokenize(tok: &tokenizers::Tokenizer, text: &str, pad_id: i32) -> anyhow::Result<Vec<i32>> {
     let enc = tok.encode(text, true).map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
     let mut ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
-    if ids.len() > CLIP_MAX_LEN { ids.truncate(CLIP_MAX_LEN); }
+    // SDXL audit CRIT-2: preserve EOS at slot 76 when truncating long
+    // captions. See prepare_sdxl.rs::tokenize for the full writeup.
+    if ids.len() > CLIP_MAX_LEN {
+        ids.truncate(CLIP_MAX_LEN - 1);
+        ids.push(CLIP_EOS_ID);
+    }
     while ids.len() < CLIP_MAX_LEN { ids.push(pad_id); }
     Ok(ids)
 }
@@ -360,17 +369,35 @@ fn main() -> anyhow::Result<()> {
                 // CFG: pred = uncond + cfg_scale * (cond - uncond)
                 let pred_cfg = pred_uncond.add(
                     &pred_cond.sub(&pred_uncond)?.mul_scalar(args.cfg_scale)?)?;
-                // CFG-rescale (Lin et al. 2023 §3.4): rescale = std(cond)/std(cfg).
-                // pred = mix(pred_cfg, pred_cfg * rescale, cfg_rescale).
-                // Default 0.7 per OT __sample_base. Skip for cfg_rescale ≤ 0.
+                // CFG-rescale (Lin et al. 2023 §3.4) per OT
+                // `StableDiffusionXLSampler.py:163-169`:
+                //   std_pos  = noise_pred_positive.std(dim=[1..N], keepdim=True)
+                //   std_pred = noise_pred.std(dim=[1..N], keepdim=True)
+                //   rescaled = noise_pred * (std_pos / std_pred)
+                //   noise_pred = cfg_rescale * rescaled + (1 - cfg_rescale) * noise_pred
+                // Per-sample std-around-mean over [C,H,W], broadcast as [B,1,1,1].
+                // OT default 0.0 (only 0.7 with force_last_timestep). Skip for ≤ 0.
+                // Divergence note: PyTorch `.std()` defaults to unbiased
+                // (n-1 denominator); flame-core `Tensor::std` is biased (n).
+                // For SDXL latents at 1024² the reduction is over 65k elements,
+                // so the (n-1)/n correction is ~1 ppm — sub-noise.
                 if args.cfg_rescale > 0.0 {
                     let cond_f32 = pred_cond.to_dtype(DType::F32)?;
                     let cfg_f32 = pred_cfg.to_dtype(DType::F32)?;
-                    let std_cond = cond_f32.square()?.mean()?.to_vec()?[0].sqrt();
-                    let std_cfg = cfg_f32.square()?.mean()?.to_vec()?[0].sqrt().max(1e-8);
-                    let rescale = std_cond / std_cfg;
-                    let mix = args.cfg_rescale * rescale + (1.0 - args.cfg_rescale);
-                    pred_cfg.mul_scalar(mix)?
+                    let ndim = cond_f32.shape().dims().len();
+                    let non_batch_dims: Vec<usize> = (1..ndim).collect();
+                    // std along non-batch dims, keepdim → [B,1,1,...,1].
+                    let std_pos = cond_f32.std(Some(&non_batch_dims), true)?;
+                    let std_pred = cfg_f32.std(Some(&non_batch_dims), true)?
+                        .add_scalar(1e-8)?;
+                    let ratio = std_pos.div(&std_pred)?;
+                    // Broadcast `ratio` over [B,C,H,W] via mul.
+                    let ratio_bc = ratio.broadcast_to(cfg_f32.shape())?;
+                    let rescaled = cfg_f32.mul(&ratio_bc)?;
+                    // Mix: cfg_rescale * rescaled + (1 - cfg_rescale) * pred_cfg.
+                    let mixed = rescaled.mul_scalar(args.cfg_rescale)?
+                        .add(&cfg_f32.mul_scalar(1.0 - args.cfg_rescale)?)?;
+                    mixed.to_dtype(pred_cfg.dtype())?
                 } else {
                     pred_cfg
                 }

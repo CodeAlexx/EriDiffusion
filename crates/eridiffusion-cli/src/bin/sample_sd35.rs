@@ -21,6 +21,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 const CLIP_MAX_LEN: usize = 77;
+// HARD: T5 padded sequence length. Combined CLIP+T5 context is `[B, 154, 4096]`.
+const TXT_PAD_LEN: usize = 77;
+// HARD: 1024×1024 is the only supported sample resolution.
+const SAMPLE_RES: usize = 1024;
 const CLIP_L_PAD_ID: i32 = 49407;
 const CLIP_G_PAD_ID: i32 = 0;
 
@@ -53,13 +57,15 @@ struct Args {
     #[arg(long)] clip_g_tokenizer: PathBuf,
     #[arg(long)] t5_tokenizer: PathBuf,
 
-    #[arg(long, default_value = "1024")] size: usize,
+    /// HARD-locked to 1024 — the only supported sample resolution.
+    #[arg(long, default_value_t = SAMPLE_RES)] size: usize,
     #[arg(long, default_value = "28")] steps: usize,
     /// CFG scale. Set to 1.0 to disable CFG (single forward).
     #[arg(long, default_value = "4.5")] cfg_scale: f32,
     /// Discrete-flow schedule shift. SD3 reference default 3.0.
     #[arg(long, default_value = "3.0")] shift: f32,
-    #[arg(long, default_value = "256")] t5_max_len: usize,
+    /// HARD-locked to 77 — combined CLIP+T5 context is `[B, 154, 4096]`.
+    #[arg(long, default_value_t = TXT_PAD_LEN)] t5_max_len: usize,
     #[arg(long, default_value = "42")] seed: u64,
 
     /// Optional trained LoRA safetensors (PEFT-format keys produced by train_sd35).
@@ -179,6 +185,20 @@ fn main() -> anyhow::Result<()> {
     use rand::{Rng, SeedableRng};
     env_logger::init();
     let args = Args::parse();
+    // HARD: lock T5 max len to 77 (combined seq=154, OT-parity).
+    if args.t5_max_len != TXT_PAD_LEN {
+        anyhow::bail!(
+            "--t5-max-len must be {TXT_PAD_LEN} (combined context = 154 tokens, OT-parity); got {}",
+            args.t5_max_len
+        );
+    }
+    // HARD: lock sample size to 1024.
+    if args.size != SAMPLE_RES {
+        anyhow::bail!(
+            "--size must be {SAMPLE_RES} (only 1024×1024 is supported); got {}",
+            args.size
+        );
+    }
     let device = flame_core::global_cuda_device();
     let _no_grad = flame_core::autograd::AutogradContext::no_grad();
     flame_core::config::set_default_dtype(DType::BF16);
@@ -327,9 +347,14 @@ fn main() -> anyhow::Result<()> {
         for i in 0..args.steps {
             let t_curr = timesteps[i];
             let t_next = timesteps[i + 1];
+            // MED-1 fix: keep timestep in F32. BF16 has 8-bit mantissa →
+            // loses 1-LSB precision for integer values >256, which is most of
+            // the [0, 999] range. Train ↔ inference timestep embedding parity
+            // breaks otherwise. The MMDiT timestep_embed promotes to F32
+            // internally (sd35.rs:398), so passing F32 here is zero cost.
             let t_vec = Tensor::from_vec(
                 vec![t_curr * 1000.0], Shape::from_dims(&[1]), device.clone(),
-            )?.to_dtype(DType::BF16)?;
+            )?.to_dtype(DType::F32)?;
             let pred_cond = <SD35Model as TrainableModel>::forward(
                 &mut model, &latent, &t_vec,
                 std::slice::from_ref(ctx_cond), Some(pool_cond),

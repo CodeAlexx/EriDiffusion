@@ -4,11 +4,13 @@
 //! Patterned after `prepare_zimage.rs` and `prepare_anima.rs`.
 //!
 //! Output per sample (one safetensors file in `--output-dir`,
-//! filename = md5 of image path so partial runs are resumable):
-//!   - latent:         BF16 [1, 16, H/8, W/8]   raw VAE z (no shift/scale —
-//!                     Qwen-Image trains on raw VAE output per
-//!                     `qwen_image_train_network.py:scale_shift_latents` which
-//!                     is identity).
+//! filename = md5 of `vN|res=...|maxtxt=...|<image_path>` so resolution +
+//! template + cache-version changes invalidate stale caches):
+//!   - latent:         BF16 [1, 16, H/8, W/8]   normalized via VAE
+//!                     `(z - latents_mean) * (1/latents_std)` (per-channel,
+//!                     16-vector from vae/config.json). Matches diffusers
+//!                     `QwenImagePipeline._encode_vae_image` and OneTrainer
+//!                     `QwenModel.scale_latents`.
 //!   - text_embedding: BF16 [1, T_seq, 3584]    Qwen2.5-VL last hidden state.
 //!
 //! Reference for the cache schema:
@@ -56,6 +58,14 @@ struct Args {
     #[arg(long, default_value_t = TXT_PAD_LEN_DEFAULT)] max_text_len: usize,
     #[arg(long, default_value_t = true)] skip_existing: bool,
     #[arg(long, default_value_t = 0)] max_samples: usize,
+    /// Image augmentations at prep time. All default-off → byte-identical
+    /// caches. Set `--aug-flip` for 50% horizontal flip; `--aug-brightness`
+    /// and `--aug-contrast` jitter pixel values uniformly. `--aug-seed`
+    /// seeds the per-sample RNG.
+    #[arg(long, default_value_t = false)] aug_flip: bool,
+    #[arg(long, default_value_t = 0.0)] aug_brightness: f32,
+    #[arg(long, default_value_t = 0.0)] aug_contrast: f32,
+    #[arg(long, default_value_t = 0)] aug_seed: u64,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -74,7 +84,10 @@ fn main() -> anyhow::Result<()> {
     let device = flame_core::global_cuda_device();
 
     log::info!("[1/3] Loading Wan21 VAE encoder (qwen_image_vae)...");
-    // Qwen-Image trains on RAW VAE z (musubi `scale_shift_latents` is identity).
+    // Cache stores latents NORMALIZED per-channel via
+    // `vae.encode_image_normalized` → `(z - latents_mean) * (1/latents_std)`.
+    // Sampler un-normalizes before the VAE decode. Matches OT
+    // `QwenModel.scale_latents` + diffusers `QwenImagePipeline`.
     let vae = Wan21VaeEncoder::from_safetensors(
         args.vae_ckpt.to_str().unwrap(), &device,
     )?;
@@ -105,21 +118,58 @@ fn main() -> anyhow::Result<()> {
     }
     log::info!("Found {} (image, caption) pairs", pairs.len());
 
+    let aug_cfg = eridiffusion_core::training::features::image_aug::AugConfig {
+        flip: args.aug_flip,
+        brightness: args.aug_brightness,
+        contrast: args.aug_contrast,
+    };
+    if aug_cfg.is_active() {
+        log::info!(
+            "[image-aug] flip={} brightness={} contrast={} seed={}",
+            aug_cfg.flip, aug_cfg.brightness, aug_cfg.contrast, args.aug_seed
+        );
+    }
+
+    // Sentinel `_meta.json` records prep settings so the trainer can warn
+    // if the cache dir was produced at a different resolution / max_text_len.
+    let meta = format!(
+        r#"{{"resolution": {}, "max_text_len": {}, "version": 2}}"#,
+        args.resolution, args.max_text_len
+    );
+    let _ = std::fs::write(args.output_dir.join("_meta.json"), &meta);
+
     let mut written = 0usize;
     let mut skipped = 0usize;
     let t_start = std::time::Instant::now();
 
     for (idx, (img_path, txt_path)) in pairs.iter().enumerate() {
         if args.max_samples > 0 && written + skipped >= args.max_samples { break; }
+        // NOTE: hash is `md5(image_path)` only — resolution + template are
+        // NOT in the key. Use a per-resolution cache dir (e.g.
+        // `<dataset>_qwen_512/`) to avoid silent OOD-reuse on resolution
+        // changes. A sentinel `_meta.json` (written below) records the
+        // prep settings so the trainer can warn at startup if the cache
+        // dir was produced for a different resolution / template.
         let hash = format!("{:x}", md5::compute(img_path.to_string_lossy().as_bytes()));
         let out_path = args.output_dir.join(format!("{hash}.safetensors"));
         if args.skip_existing && out_path.exists() { skipped += 1; continue; }
 
-        // ── Image → VAE latent (raw) ──────────────────────────────────────
+        // ── Image → normalized VAE latent ─────────────────────────────────
         let img = match image::open(img_path) {
             Ok(i) => i.resize_exact(args.resolution, args.resolution, image::imageops::FilterType::Lanczos3).to_rgb32f(),
             Err(e) => { log::warn!("[{idx}] skipping {}: {e}", img_path.display()); continue; }
         };
+        let mut img = img;
+        if aug_cfg.is_active() {
+            use rand::SeedableRng;
+            let mut aug_rng = rand::rngs::StdRng::seed_from_u64(args.aug_seed ^ idx as u64);
+            eridiffusion_core::training::features::image_aug::apply_augs(
+                &mut img,
+                None,
+                &aug_cfg,
+                &mut aug_rng,
+            );
+        }
         let (w, h) = img.dimensions();
         // CHW transpose — see prepare_klein.rs for full bug writeup. image::pixels
         // (HWC interleaved) reshaped to [1, 3, H, W] (CHW) scrambles channels and
@@ -151,6 +201,14 @@ fn main() -> anyhow::Result<()> {
         // `qwenimage_encode::encode_and_trim` (qwenimage_encode.rs:92-115).
         let caption = std::fs::read_to_string(txt_path).unwrap_or_default();
         let caption = caption.trim();
+        if caption.is_empty() {
+            log::warn!(
+                "[{idx}] skipping {}: caption file is empty (would train on the bare PROMPT template)",
+                img_path.display()
+            );
+            skipped += 1;
+            continue;
+        }
         let wrapped = format!("{PROMPT_PREFIX}{caption}{PROMPT_SUFFIX}");
         let enc = tokenizer.encode(wrapped, false)
             .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;

@@ -13,6 +13,14 @@ struct Args {
     #[arg(long)] tokenizer_path: PathBuf,
     #[arg(long, default_value = "128")] size: usize,
     #[arg(long)] skip_existing: bool,
+    /// Image augmentations at prep time. All default-off → byte-identical
+    /// caches. Set `--aug-flip` for 50% horizontal flip; `--aug-brightness`
+    /// and `--aug-contrast` jitter pixel values uniformly. `--aug-seed`
+    /// seeds the per-sample RNG.
+    #[arg(long, default_value_t = false)] aug_flip: bool,
+    #[arg(long, default_value_t = 0.0)] aug_brightness: f32,
+    #[arg(long, default_value_t = 0.0)] aug_contrast: f32,
+    #[arg(long, default_value_t = 0)] aug_seed: u64,
 }
 
 /// ERNIE text-encoder pad token id. Matches:
@@ -66,8 +74,20 @@ fn main() -> anyhow::Result<()> {
     }
     log::info!("Found {} image-text pairs", pairs.len());
 
+    let aug_cfg = eridiffusion_core::training::features::image_aug::AugConfig {
+        flip: args.aug_flip,
+        brightness: args.aug_brightness,
+        contrast: args.aug_contrast,
+    };
+    if aug_cfg.is_active() {
+        log::info!(
+            "[image-aug] flip={} brightness={} contrast={} seed={}",
+            aug_cfg.flip, aug_cfg.brightness, aug_cfg.contrast, args.aug_seed
+        );
+    }
+
     let mut cached = 0;
-    for (img_path, txt_path) in &pairs {
+    for (idx, (img_path, txt_path)) in pairs.iter().enumerate() {
         let hash = format!("{:x}", md5::compute(img_path.to_string_lossy().as_bytes()));
         let out_path = args.output_dir.join(format!("{hash}.safetensors"));
         if args.skip_existing && out_path.exists() { continue; }
@@ -76,6 +96,17 @@ fn main() -> anyhow::Result<()> {
         let img = image::open(img_path)?
             .resize_exact(args.size as u32, args.size as u32, image::imageops::FilterType::Lanczos3)
             .to_rgb32f();
+        let mut img = img;
+        if aug_cfg.is_active() {
+            use rand::SeedableRng;
+            let mut aug_rng = rand::rngs::StdRng::seed_from_u64(args.aug_seed ^ idx as u64);
+            eridiffusion_core::training::features::image_aug::apply_augs(
+                &mut img,
+                None,
+                &aug_cfg,
+                &mut aug_rng,
+            );
+        }
         let (w, h) = img.dimensions();
         // CHW transpose — see prepare_klein.rs for full bug writeup. Without
         // this, image::pixels() (HWC interleaved) reshaped to [1, 3, H, W]

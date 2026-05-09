@@ -179,12 +179,17 @@ fn main() -> anyhow::Result<()> {
     for (idx, (cap_cond, mask_cond, t5_cond, t5mask_cond)) in cond_quads.iter().enumerate() {
         log::info!("  [{}/{}] denoising prompt...", idx + 1, cond_quads.len());
         let mut latent = {
-            use rand::SeedableRng;
             // Per-prompt seed offset → diverse compositions across the batch.
-            let _rng = rand::rngs::StdRng::seed_from_u64(args.seed.wrapping_add(idx as u64));
-            Tensor::randn(
+            // Use `Tensor::randn_seeded` (CPU Box-Muller, fully reproducible
+            // per `seed`) instead of the global-RNG `Tensor::randn`, which
+            // would ignore the per-prompt offset and produce non-reproducible
+            // latents across runs (was a dead-`StdRng` binding before).
+            // Reference: `library/anima_train_utils.py:428-434`.
+            Tensor::randn_seeded(
                 Shape::from_dims(&[1, anima_mod::IN_CHANNELS, h_lat, w_lat]),
-                0.0, 1.0, device.clone(),
+                0.0, 1.0,
+                args.seed.wrapping_add(idx as u64),
+                device.clone(),
             )?.to_dtype(DType::BF16)?
         };
 

@@ -39,6 +39,7 @@ use eridiffusion_core::training::board::BoardWriter;
 use eridiffusion_core::training::checkpoint::{self, CkptHeader};
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::ema_advanced::EmaConfig;
+use eridiffusion_core::training::features::validation::ValidationLoop;
 use eridiffusion_core::training::features::{loss_weight, lr_schedule, noise_modifiers, timestep_bias};
 use eridiffusion_core::training::training_features::OptimizerKind;
 use std::path::PathBuf;
@@ -84,6 +85,12 @@ struct Args {
     // ── Phase 0 multi-feature rollout (default-off; Phase 1+ will consume) ──
     #[arg(long)] min_snr_gamma: Option<f32>,
     #[arg(long, default_value_t = 0.0)] caption_dropout_probability: f32,
+    /// Path to a single cache file produced by `prepare_flux` from an empty-
+    /// caption sample. When `--caption-dropout-probability > 0`, the trainer
+    /// loads `t5_embed` + `clip_pool` from this file and swaps them in with
+    /// probability `p` per step. If unset and dropout > 0, the feature is
+    /// disabled with a warning (preserves prior behaviour).
+    #[arg(long)] null_text_cache: Option<PathBuf>,
     #[arg(long, default_value_t = 1.0)] noise_offset_probability: f32,
     #[arg(long, default_value_t = 0.0)] gamma_input_perturbation: f32,
     #[arg(long, default_value_t = 0.0)] huber_strength: f32,
@@ -298,15 +305,48 @@ fn main() -> anyhow::Result<()> {
         cfg
     };
 
-    // Phase 1: caption_dropout requires an unconditional embedding source.
-    // Flux trainer doesn't currently encode one (no inline sample mode);
-    // warn + disable when requested.
-    if args.caption_dropout_probability > 0.0 {
-        log::warn!(
-            "caption_dropout_probability={:.3} requested but Flux trainer has no inline encoder — feature disabled",
-            args.caption_dropout_probability
-        );
-    }
+    // Phase 1: caption_dropout. Flux has no inline encoder, so the user
+    // supplies a `--null-text-cache` produced by `prepare_flux` on a single
+    // empty-caption sample. We load `t5_embed` + `clip_pool` once and swap
+    // them in per-step with the configured probability. Without
+    // `--null-text-cache`, the feature is disabled with a warning.
+    let mut effective_caption_dropout_prob = args.caption_dropout_probability;
+    let null_text: Option<(Tensor, Tensor)> = if effective_caption_dropout_prob > 0.0 {
+        match args.null_text_cache.as_ref() {
+            Some(p) => match flame_core::serialization::load_file(p, &device) {
+                Ok(s) => {
+                    let nt5 = s.get("t5_embed")
+                        .ok_or_else(|| anyhow::anyhow!("--null-text-cache missing 't5_embed'"))?
+                        .to_dtype(DType::BF16)?;
+                    let nclip = s.get("clip_pool")
+                        .ok_or_else(|| anyhow::anyhow!("--null-text-cache missing 'clip_pool'"))?
+                        .to_dtype(DType::BF16)?;
+                    log::info!(
+                        "[caption-dropout] WIRED — prob={:.3} (null_t5={:?}, null_clip_pool={:?})",
+                        effective_caption_dropout_prob,
+                        nt5.shape().dims(),
+                        nclip.shape().dims()
+                    );
+                    Some((nt5, nclip))
+                }
+                Err(e) => {
+                    log::warn!("[caption-dropout] failed to load --null-text-cache {}: {e} — feature disabled", p.display());
+                    effective_caption_dropout_prob = 0.0;
+                    None
+                }
+            },
+            None => {
+                log::warn!(
+                    "caption_dropout_probability={:.3} requested but --null-text-cache not provided — feature disabled",
+                    effective_caption_dropout_prob
+                );
+                effective_caption_dropout_prob = 0.0;
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     if let Some(resume_path) = args.resume_lora.as_ref() {
         log::info!("Resuming LoRA weights only (no optimizer state) from {}", resume_path.display());
@@ -363,6 +403,28 @@ fn main() -> anyhow::Result<()> {
     let t_start = std::time::Instant::now();
     let mut total_loss = 0f32;
 
+    // Validation harness — held-out cache + cadence. None at default
+    // (validation_every_steps == 0). Mirrors train_klein.rs:608-624. Default-off
+    // is byte-identical to pre-port behaviour: harness not constructed, no
+    // per-step branch executed, training-side `rng` untouched.
+    let validation_loop: Option<ValidationLoop> = if let (Some(dir), n) =
+        (args.validation_dataset_dir.as_ref(), args.validation_every_steps)
+    {
+        if n > 0 {
+            let v = ValidationLoop::new(dir, n)?;
+            log::info!(
+                "[validation] {} held-out samples, every {} steps",
+                v.len(),
+                n
+            );
+            Some(v)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let sched: LrScheduler = lr_schedule::parse_cli_scheduler(&args.lr_scheduler);
     for step in start_step..args.steps {
         let cache_idx = step % cache_files.len();
@@ -380,6 +442,19 @@ fn main() -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("missing 't5_embed'"))?.to_dtype(DType::BF16)?;
         let clip_pool = sample.get("clip_pool")
             .ok_or_else(|| anyhow::anyhow!("missing 'clip_pool'"))?.to_dtype(DType::BF16)?;
+        // Caption dropout: single Bernoulli per step swaps both T5 + CLIP
+        // pool together (correlated, matching CFG training convention).
+        // Default-off (prob == 0.0 OR null_text == None) draws no rng.
+        let (t5, clip_pool) = if let Some((ref nt5, ref nclip)) = null_text {
+            use rand::Rng;
+            if rng.r#gen::<f32>() < effective_caption_dropout_prob {
+                (nt5.clone(), nclip.clone())
+            } else {
+                (t5, clip_pool)
+            }
+        } else {
+            (t5, clip_pool)
+        };
 
         // VAE shift/scale (H2: encode = `(raw - shift) * scale` — multiply,
         // not divide; pre-fix prepare_flux divided which left latents at
@@ -403,8 +478,15 @@ fn main() -> anyhow::Result<()> {
             NUM_TRAIN_TIMESTEPS as f32,
             &timestep_bias_cfg,
         );
+        // OT parity (BUG-2): discretize the continuous timestep to integer
+        // bins BEFORE deriving sigma and the model timestep, matching
+        // `ModelSetupNoiseMixin.py:212` which returns `timestep.int()`. The
+        // BFL DiT was distilled on integer timesteps; passing fractional
+        // bins shifts the sinusoid phase off the trained band. Sigma and
+        // model-t now share the same discretization.
         let sigma_idx = (t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
         let sigma = (sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32;
+        let t_int = sigma_idx as f32;
 
         let noise = Tensor::randn(latent.shape().clone(), 0.0, 1.0, device.clone())?
             .to_dtype(DType::BF16)?;
@@ -441,7 +523,11 @@ fn main() -> anyhow::Result<()> {
         // exactly once. Pre-fix the trainer passed `t ∈ [0, 1000)` and the
         // embedder multiplied again → `t * 1_000_000` in the sinusoid arg.
         // Mirrors Klein's recently-landed fix (`train_klein.rs:147`).
-        let t_model = t_continuous / NUM_TRAIN_TIMESTEPS as f32;
+        //
+        // BUG-2 (Wave-2): use the integer-discretized timestep so the model
+        // sees the same bin OT does (`BaseFluxSetup.py:289` passes
+        // `timestep / 1000` where timestep is `.int()`).
+        let t_model = t_int / NUM_TRAIN_TIMESTEPS as f32;
         let timestep = Tensor::from_vec(
             vec![t_model],
             Shape::from_dims(&[1]),
@@ -531,6 +617,118 @@ fn main() -> anyhow::Result<()> {
             step, args.steps, cache_files.len(), 1,
             loss_val, total_norm, cur_lr, t_start, board.as_ref(),
         );
+
+        // Validation eval pass (no_grad) every `validation_every_steps`.
+        // Mirrors train_klein.rs:1063-1142. Validation uses its own SIDE-RNG
+        // seeded as `SEED ^ (step as u64 + 1)` so it does NOT perturb the
+        // training-side `rng` sequence (byte-invariance with feature off).
+        // Runs BEFORE periodic save / EMA swap.
+        // Flux specifics vs Klein:
+        //   - cache fields: latent / t5_embed / clip_pool (no `text_embedding`)
+        //   - VAE shift/scale + pack_latents must be replayed (matches train step)
+        //   - forward takes `(noisy, timestep, context=[t5,img_ids,txt_ids], Some(clip_pool))`
+        if let Some(ref vloop) = validation_loop {
+            if vloop.should_run(step + 1) {
+                let mut sum = 0.0_f32;
+                let mut count = 0_usize;
+                for vfile in &vloop.cache_files {
+                    let _g = AutogradContext::no_grad();
+                    let sample = match flame_core::serialization::load_file(vfile, &device) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log::warn!("[validation] load {} failed: {e}", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_latent_raw = match sample.get("latent") {
+                        Some(t) => t.to_dtype(DType::BF16)?,
+                        None => {
+                            log::warn!("[validation] {} missing latent", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_t5 = match sample.get("t5_embed") {
+                        Some(t) => t.to_dtype(DType::BF16)?,
+                        None => {
+                            log::warn!("[validation] {} missing t5_embed", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_clip_pool = match sample.get("clip_pool") {
+                        Some(t) => t.to_dtype(DType::BF16)?,
+                        None => {
+                            log::warn!("[validation] {} missing clip_pool", vfile.display());
+                            continue;
+                        }
+                    };
+                    // Replay VAE shift/scale + pack_latents identically to train step.
+                    let v_latent_scaled = v_latent_raw
+                        .add_scalar(-SHIFT)?
+                        .mul_scalar(SCALE)?;
+                    let (v_latent, v_h_tok, v_w_tok) = pack_latents(&v_latent_scaled)?;
+                    let v_latent = v_latent.to_dtype(DType::BF16)?;
+                    let v_n_txt = v_t5.shape().dims()[1];
+                    let v_img_ids = build_img_ids(v_h_tok, v_w_tok, device.clone())?
+                        .to_dtype(DType::BF16)?;
+                    let v_txt_ids = build_txt_ids(v_n_txt, device.clone())?
+                        .to_dtype(DType::BF16)?;
+
+                    // SIDE-RNG: do NOT touch training-side `rng`.
+                    let mut vrng = rand::rngs::StdRng::seed_from_u64(SEED ^ (step as u64 + 1));
+                    let raw_t = sample_timestep_logit_normal(&mut vrng);
+                    let t_continuous = timestep_bias::apply_bias(
+                        raw_t,
+                        NUM_TRAIN_TIMESTEPS as f32,
+                        &timestep_bias_cfg,
+                    );
+                    let sigma_idx = (t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
+                    let sigma = (sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32;
+                    let v_noise = Tensor::randn(v_latent.shape().clone(), 0.0, 1.0, device.clone())?
+                        .to_dtype(DType::BF16)?;
+                    let v_noisy = v_noise.mul_scalar(sigma)?
+                        .add(&v_latent.mul_scalar(1.0 - sigma)?)?;
+                    let v_target = v_noise.sub(&v_latent)?;
+                    let v_t_model = t_continuous / NUM_TRAIN_TIMESTEPS as f32;
+                    let v_timestep = Tensor::from_vec(
+                        vec![v_t_model],
+                        Shape::from_dims(&[1]),
+                        device.clone(),
+                    )?;
+                    let v_context = vec![v_t5, v_img_ids, v_txt_ids];
+                    let v_pred = match <FluxModel as TrainableModel>::forward(
+                        &mut model, &v_noisy, &v_timestep, &v_context, Some(&v_clip_pool),
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            log::warn!("[validation] forward failed: {e}");
+                            continue;
+                        }
+                    };
+                    let v_loss = v_pred.to_dtype(DType::F32)?
+                        .sub(&v_target.to_dtype(DType::F32)?)?
+                        .square()?
+                        .mean()?;
+                    let v_loss_val = v_loss.to_vec()?[0];
+                    if v_loss_val.is_finite() {
+                        sum += v_loss_val;
+                        count += 1;
+                    }
+                    AutogradContext::clear();
+                }
+                if count > 0 {
+                    let val_avg = sum / count as f32;
+                    log::info!(
+                        "[validation step={}] loss/val = {:.4} ({} samples)",
+                        step + 1,
+                        val_avg,
+                        count
+                    );
+                    if let Some(b) = &board {
+                        b.log_scalar("loss/val", (step + 1) as u64, val_avg as f64);
+                    }
+                }
+            }
+        }
 
         // Periodic save (full or weights-only).
         let step_num = step + 1;

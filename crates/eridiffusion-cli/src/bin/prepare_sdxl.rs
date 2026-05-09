@@ -55,6 +55,14 @@ struct Args {
     #[arg(long, default_value = "1024")] resolution: u32,
     #[arg(long, default_value_t = true)] skip_existing: bool,
     #[arg(long, default_value_t = 0)] max_samples: usize,
+    /// Image augmentations at prep time. All default-off → byte-identical
+    /// caches. Set `--aug-flip` for 50% horizontal flip; `--aug-brightness`
+    /// and `--aug-contrast` jitter pixel values uniformly. `--aug-seed`
+    /// seeds the per-sample RNG.
+    #[arg(long, default_value_t = false)] aug_flip: bool,
+    #[arg(long, default_value_t = 0.0)] aug_brightness: f32,
+    #[arg(long, default_value_t = 0.0)] aug_contrast: f32,
+    #[arg(long, default_value_t = 0)] aug_seed: u64,
 }
 
 fn load_one_or_dir(
@@ -74,10 +82,24 @@ fn load_one_or_dir(
     Ok(all)
 }
 
+// CLIP EOS token id. Both CLIP-L and CLIP-G tokenizers use 49407 as EOS;
+// only the pad-id differs (CLIP-L pads with EOS, CLIP-G pads with 0).
+const CLIP_EOS_ID: i32 = 49407;
+
 fn tokenize(tok: &tokenizers::Tokenizer, text: &str, pad_id: i32) -> anyhow::Result<Vec<i32>> {
     let enc = tok.encode(text, true).map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
     let mut ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
-    if ids.len() > CLIP_MAX_LEN { ids.truncate(CLIP_MAX_LEN); }
+    // SDXL audit CRIT-2: HF CLIPTokenizer with `truncation=True, max_length=77`
+    // guarantees `[BOS, ...75 content tokens..., EOS]`. The raw `tokenizers`
+    // crate doesn't auto-truncate, so a >77-token sequence has its trailing
+    // EOS sliced off by `truncate(77)`. Downstream `text_projection` finds
+    // EOS via `position(== 49407)`; a missing EOS makes it gather pooled
+    // output at a pad slot (or the last token), corrupting CLIP-G pooled.
+    // Fix: preserve EOS at slot 76 when truncating long captions.
+    if ids.len() > CLIP_MAX_LEN {
+        ids.truncate(CLIP_MAX_LEN - 1);
+        ids.push(CLIP_EOS_ID);
+    }
     while ids.len() < CLIP_MAX_LEN { ids.push(pad_id); }
     Ok(ids)
 }
@@ -99,15 +121,24 @@ fn main() -> anyhow::Result<()> {
     let device = flame_core::global_cuda_device();
 
     log::info!("[1/4] Loading SDXL VAE encoder (4-ch, scale=0.13025)...");
-    // SDXL audit H2: the SDXL VAE is FP16-broken per OT canonical and OT
-    // Python defaults to F32. flame-core's `Conv2d` is BF16-only at the
-    // kernel level (`flame-core/src/conv.rs:330` rejects non-BF16 input),
-    // so a pure-Rust F32 VAE encode requires kernel work in flame-core that
-    // is out of scope for this fix executor. Cast input to F32 below as a
-    // best-effort precision boost; the BF16 weights still bottleneck the
-    // mid-block attention but at least the surrounding ops use the F32 input
-    // until the first conv does the implicit BF16 cast. TODO(flame-core):
-    // F32 conv path so this VAE matches upstream Python latents bit-for-bit.
+    // SDXL audit HIGH-2 / MED-4: OT preset pins `vae.weight_dtype = FLOAT_32`
+    // because the SDXL VAE is FP16-broken in mid-block attention
+    // (huggingface/diffusers#3994). EDv2 currently runs the VAE encode in
+    // BF16 throughout — flame-core's `Conv2d` is BF16-only at the kernel
+    // level (`flame-core/src/conv.rs:330` rejects non-BF16 input), and
+    // bumping it to F32 requires NHWC F32 conv kernels we don't yet have.
+    //
+    // Effect: cached latents diverge from OT-encoded latents at the ~0.5–1%
+    // level. Trainer + sampler use the same biased VAE so LoRAs converge
+    // fine internally, but cached latents are NOT byte-portable to/from
+    // OneTrainer or Kohya pipelines. Color-sensitive datasets may see
+    // visible drift in dark regions.
+    //
+    // TODO(flame-core): F32 conv path → drop the BF16 cast at line 200,
+    // load VAE weights at F32, match OT bit-for-bit.
+    log::warn!("[VAE] running encode in BF16 (flame-core Conv2d limitation). \
+        Latents will diverge from OT F32 reference at ~0.5-1%. See \
+        prepare_sdxl.rs source for the TODO.");
     let vae = SdxlVaeEncoder::from_safetensors(args.vae_ckpt.to_str().unwrap(), &device)?;
 
     log::info!("[2/4] Loading CLIP-L (768d, 12L, quick_gelu)...");
@@ -140,8 +171,20 @@ fn main() -> anyhow::Result<()> {
     if args.max_samples > 0 { pairs.truncate(args.max_samples); }
     log::info!("Found {} image-caption pairs", pairs.len());
 
+    let aug_cfg = eridiffusion_core::training::features::image_aug::AugConfig {
+        flip: args.aug_flip,
+        brightness: args.aug_brightness,
+        contrast: args.aug_contrast,
+    };
+    if aug_cfg.is_active() {
+        log::info!(
+            "[image-aug] flip={} brightness={} contrast={} seed={}",
+            aug_cfg.flip, aug_cfg.brightness, aug_cfg.contrast, args.aug_seed
+        );
+    }
+
     let mut cached = 0usize;
-    for (img_path, txt_path) in &pairs {
+    for (idx, (img_path, txt_path)) in pairs.iter().enumerate() {
         let hash = format!("{:x}", md5::compute(img_path.to_string_lossy().as_bytes()));
         let out_path = args.output_dir.join(format!("{hash}.safetensors"));
         if args.skip_existing && out_path.exists() { continue; }
@@ -155,6 +198,17 @@ fn main() -> anyhow::Result<()> {
         let img = orig_img
             .resize_exact(args.resolution, args.resolution, image::imageops::FilterType::Lanczos3)
             .to_rgb32f();
+        let mut img = img;
+        if aug_cfg.is_active() {
+            use rand::SeedableRng;
+            let mut aug_rng = rand::rngs::StdRng::seed_from_u64(args.aug_seed ^ idx as u64);
+            eridiffusion_core::training::features::image_aug::apply_augs(
+                &mut img,
+                None,
+                &aug_cfg,
+                &mut aug_rng,
+            );
+        }
         let (w, h) = img.dimensions();
         // CHW transpose — see prepare_klein.rs for full bug writeup. Without
         // this, image::pixels() (HWC interleaved) reshaped to [1, 3, H, W]

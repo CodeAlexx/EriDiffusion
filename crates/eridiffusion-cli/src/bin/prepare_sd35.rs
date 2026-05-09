@@ -11,8 +11,8 @@
 //!         clip_g_h = penultimate hidden [77, 1280]
 //!         clip_lg  = cat([clip_l_h, clip_g_h], -1)         → [77, 2048]
 //!         clip_lg_padded = pad_last_dim(clip_lg, 4096)     → [77, 4096]
-//!         t5_h     = T5 final hidden                       → [N, 4096]   (N=77 typical)
-//!         context  = cat([clip_lg_padded, t5_h], dim=1)    → [77+N, 4096]
+//!         t5_h     = T5 final hidden                       → [77, 4096]   (HARD: TXT_PAD_LEN=77)
+//!         context  = cat([clip_lg_padded, t5_h], dim=1)    → [154, 4096]
 //!         pooled   = cat([clip_l_pool, clip_g_pool], -1)   → [2048]
 //!
 //! Cache layout (per-sample safetensors):
@@ -37,6 +37,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 const CLIP_MAX_LEN: usize = 77;
+// HARD: project rule — T5 sequence length is locked to 77 to match the
+// combined `[B, 154, 4096]` context shape that SD3/SD3.5 was pre-trained on.
+// OT (`StableDiffusion3BaseDataLoader.py:33`) passes `tokenizer_1.model_max_length`
+// (=77) to all three tokenizers including T5. Combined seq = 77 + 77 = 154.
+const TXT_PAD_LEN: usize = 77;
+// HARD: training resolution is locked to 1024×1024 (OT `#sd 3 LoRA.json` preset).
+const TRAIN_RES: u32 = 1024;
 // Per-encoder pad ids — see SDXL audit H1 / prepare_sdxl.rs:36-38.
 const CLIP_L_PAD_ID: i32 = 49407;
 const CLIP_G_PAD_ID: i32 = 0;
@@ -65,12 +72,24 @@ struct Args {
     #[arg(long)] clip_g_tokenizer: PathBuf,
     #[arg(long)] t5_tokenizer: PathBuf,
 
-    #[arg(long, default_value = "1024")] resolution: u32,
-    /// T5 max sequence length. SD3 reference uses 256 (lower than the
-    /// 512 T5-XXL trains at) for VRAM. 256 matches diffusers SD3 default.
-    #[arg(long, default_value = "256")] t5_max_len: usize,
+    /// HARD-locked to 1024 — the only supported training resolution per the
+    /// SD3 LoRA preset. Any other value hard-fails at startup.
+    #[arg(long, default_value_t = TRAIN_RES)] resolution: u32,
+    /// T5 max sequence length. HARD-locked to 77 to match OT
+    /// `StableDiffusion3BaseDataLoader.py:33` and the [B, 154, 4096] combined
+    /// context shape that SD3/SD3.5 was pre-trained on. Setting any other
+    /// value hard-fails at startup.
+    #[arg(long, default_value_t = TXT_PAD_LEN)] t5_max_len: usize,
     #[arg(long, default_value_t = true)] skip_existing: bool,
     #[arg(long, default_value_t = 0)] max_samples: usize,
+    /// Image augmentations at prep time. All default-off → byte-identical
+    /// caches. Set `--aug-flip` for 50% horizontal flip; `--aug-brightness`
+    /// and `--aug-contrast` jitter pixel values uniformly. `--aug-seed`
+    /// seeds the per-sample RNG.
+    #[arg(long, default_value_t = false)] aug_flip: bool,
+    #[arg(long, default_value_t = 0.0)] aug_brightness: f32,
+    #[arg(long, default_value_t = 0.0)] aug_contrast: f32,
+    #[arg(long, default_value_t = 0)] aug_seed: u64,
 }
 
 fn load_one_or_dir(
@@ -118,6 +137,19 @@ fn main() -> anyhow::Result<()> {
     }
     env_logger::init();
     let args = Args::parse();
+    // HARD rules: lock resolution and T5 max len to OT-parity values.
+    if args.resolution != TRAIN_RES {
+        anyhow::bail!(
+            "--resolution must be {TRAIN_RES} (only 1024×1024 is supported); got {}",
+            args.resolution
+        );
+    }
+    if args.t5_max_len != TXT_PAD_LEN {
+        anyhow::bail!(
+            "--t5-max-len must be {TXT_PAD_LEN} (combined context = 154 tokens, OT-parity); got {}",
+            args.t5_max_len
+        );
+    }
     std::fs::create_dir_all(&args.output_dir)?;
     flame_core::config::set_default_dtype(DType::BF16);
     let _no_grad = flame_core::autograd::AutogradContext::no_grad();
@@ -167,8 +199,20 @@ fn main() -> anyhow::Result<()> {
     if args.max_samples > 0 { pairs.truncate(args.max_samples); }
     log::info!("Found {} image-caption pairs", pairs.len());
 
+    let aug_cfg = eridiffusion_core::training::features::image_aug::AugConfig {
+        flip: args.aug_flip,
+        brightness: args.aug_brightness,
+        contrast: args.aug_contrast,
+    };
+    if aug_cfg.is_active() {
+        log::info!(
+            "[image-aug] flip={} brightness={} contrast={} seed={}",
+            aug_cfg.flip, aug_cfg.brightness, aug_cfg.contrast, args.aug_seed
+        );
+    }
+
     let mut cached = 0usize;
-    for (img_path, txt_path) in &pairs {
+    for (idx, (img_path, txt_path)) in pairs.iter().enumerate() {
         let hash = format!("{:x}", md5::compute(img_path.to_string_lossy().as_bytes()));
         let out_path = args.output_dir.join(format!("{hash}.safetensors"));
         if args.skip_existing && out_path.exists() { continue; }
@@ -177,6 +221,17 @@ fn main() -> anyhow::Result<()> {
         let img = image::open(img_path)?
             .resize_exact(args.resolution, args.resolution, image::imageops::FilterType::Lanczos3)
             .to_rgb32f();
+        let mut img = img;
+        if aug_cfg.is_active() {
+            use rand::SeedableRng;
+            let mut aug_rng = rand::rngs::StdRng::seed_from_u64(args.aug_seed ^ idx as u64);
+            eridiffusion_core::training::features::image_aug::apply_augs(
+                &mut img,
+                None,
+                &aug_cfg,
+                &mut aug_rng,
+            );
+        }
         let (w, h) = img.dimensions();
         // CHW transpose. enumerate_pixels gives HWC interleaved; manual
         // index math is the only reliable conversion to [1, 3, H, W] CHW.

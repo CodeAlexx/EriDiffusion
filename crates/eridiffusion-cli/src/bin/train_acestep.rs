@@ -19,6 +19,7 @@ use eridiffusion_core::training::checkpoint::{self, CkptHeader};
 use eridiffusion_core::config::LrScheduler;
 use eridiffusion_core::training::features::{
     ema_advanced::EmaConfig, loss_weight, lr_schedule, noise_modifiers, timestep_bias,
+    validation::ValidationLoop,
 };
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::schedule;
@@ -58,6 +59,14 @@ struct Args {
     // ── Phase 0 multi-feature rollout (default-off; Phase 1+ will consume) ──
     #[arg(long)] min_snr_gamma: Option<f32>,
     #[arg(long, default_value_t = 0.0)] caption_dropout_probability: f32,
+    /// Path to a single cache file produced upstream from an empty-caption
+    /// sample. When `--caption-dropout-probability > 0`, the trainer loads
+    /// `encoder_hidden_states` from this file and swaps it in with probability
+    /// `p` per step. This is independent of `--cfg-ratio` (which uses the
+    /// model's internal `null_condition_emb`); both can be active and either
+    /// firing produces a null-conditioned step. If unset and dropout > 0, the
+    /// feature is disabled with a warning.
+    #[arg(long)] null_text_cache: Option<PathBuf>,
     #[arg(long, default_value_t = 1.0)] noise_offset_probability: f32,
     #[arg(long, default_value_t = 0.0)] gamma_input_perturbation: f32,
     #[arg(long, default_value_t = 0.0)] huber_strength: f32,
@@ -178,6 +187,26 @@ fn main() -> anyhow::Result<()> {
     }
     log::info!("Found {} cached samples", cache_files.len());
 
+    // Phase 2: validation harness — held-out cache + cadence. None at default.
+    let validation_loop: Option<ValidationLoop> = if let (Some(dir), n) =
+        (args.validation_dataset_dir.as_ref(), args.validation_every_steps)
+    {
+        if n > 0 {
+            let v = ValidationLoop::new(dir, n)
+                .map_err(|e| anyhow::anyhow!("validation harness: {e}"))?;
+            log::info!(
+                "[validation] {} held-out samples, every {} steps",
+                v.len(),
+                n
+            );
+            Some(v)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     match OptimizerKind::parse(&args.optimizer) {
         Ok(OptimizerKind::AdamW) => {}
         Ok(other) => log::warn!(
@@ -186,12 +215,56 @@ fn main() -> anyhow::Result<()> {
         ),
         Err(e) => log::warn!("--optimizer parse: {} — falling back to AdamW", e),
     }
-    if args.caption_dropout_probability > 0.0 {
-        log::warn!(
-            "caption_dropout_probability={:.3} requested but ACE-Step trainer has no inline encoder — feature disabled",
-            args.caption_dropout_probability
-        );
-    }
+    // Phase 1: caption_dropout. ACE-Step has no inline encoder, so the user
+    // supplies a `--null-text-cache` produced upstream on a single
+    // empty-caption sample. We load `encoder_hidden_states` once and swap it
+    // in per-step with the configured probability. Without `--null-text-cache`,
+    // the feature is disabled with a warning. Note: this is independent of
+    // the existing `--cfg-ratio` path which uses the model's internal
+    // `null_condition_emb()` — both can be active. The cached
+    // `encoder_attention_mask` is not consumed by the training step (assigned
+    // to `_encoder_mask`), so we do not swap it.
+    let mut effective_caption_dropout_prob = args.caption_dropout_probability;
+    let null_text: Option<Tensor> = if effective_caption_dropout_prob > 0.0 {
+        match args.null_text_cache.as_ref() {
+            Some(p) => match flame_core::serialization::load_file(p, &device) {
+                Ok(s) => {
+                    let nt_raw = s.get("encoder_hidden_states")
+                        .ok_or_else(|| anyhow::anyhow!("--null-text-cache missing 'encoder_hidden_states'"))?
+                        .to_dtype(DType::BF16)?;
+                    // Match the per-step `pull("encoder_hidden_states")?.unsqueeze(0)`
+                    // pattern: cached null is [T, C], we add the batch dim to
+                    // produce [1, T, C] so the swap is shape-aligned.
+                    let nt = if nt_raw.shape().dims().len() == 2 {
+                        nt_raw.unsqueeze(0)?
+                    } else {
+                        nt_raw
+                    };
+                    log::info!(
+                        "[caption-dropout] WIRED — prob={:.3} (null_encoder_hidden_states={:?})",
+                        effective_caption_dropout_prob,
+                        nt.shape().dims()
+                    );
+                    Some(nt)
+                }
+                Err(e) => {
+                    log::warn!("[caption-dropout] failed to load --null-text-cache {}: {e} — feature disabled", p.display());
+                    effective_caption_dropout_prob = 0.0;
+                    None
+                }
+            },
+            None => {
+                log::warn!(
+                    "caption_dropout_probability={:.3} requested but --null-text-cache not provided — feature disabled",
+                    effective_caption_dropout_prob
+                );
+                effective_caption_dropout_prob = 0.0;
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut optimizer = AdamW::new(args.lr, 0.9, 0.999, 1e-8, 0.01);
     let mut start_step = 0usize;
 
@@ -324,6 +397,20 @@ fn main() -> anyhow::Result<()> {
         let encoder_hs = pull("encoder_hidden_states")?.unsqueeze(0)?;
         let _encoder_mask = pull("encoder_attention_mask")?.unsqueeze(0)?;
         let context_latents = pull("context_latents")?.unsqueeze(0)?;
+
+        // Caption dropout (independent of --cfg-ratio): single Bernoulli per
+        // step swaps encoder_hidden_states with null cache. Default-off
+        // (prob == 0.0 OR null_text == None) draws no rng.
+        let encoder_hs = if let Some(ref nt) = null_text {
+            use rand::Rng;
+            if rng.r#gen::<f32>() < effective_caption_dropout_prob {
+                nt.clone()
+            } else {
+                encoder_hs
+            }
+        } else {
+            encoder_hs
+        };
 
         // CFG dropout: replace encoder_hs with null_emb at probability cfg_ratio.
         let encoder_hs = apply_cfg_dropout(&encoder_hs, &null_emb, args.cfg_ratio, &mut rng)?;
@@ -459,6 +546,170 @@ fn main() -> anyhow::Result<()> {
             step, args.steps, cache_files.len(), 1,
             loss_val, grad_norm, current_lr, t_start, board.as_ref(),
         );
+
+        // Phase 2: validation eval pass (no_grad) every `validation_every_steps`.
+        // step+1 because `step` here is 0-based; ValidationLoop::should_run
+        // expects the 1-based completed-step number. Validation uses its OWN
+        // run-side RNG (seed ^ (step+1)) so it does not perturb the
+        // training-side seeded sequence — byte invariance with --validation-
+        // every-steps=0 (default) is guaranteed because the harness Option is
+        // None and this entire block is skipped.
+        if let Some(ref vloop) = validation_loop {
+            if vloop.should_run((step + 1) as usize) {
+                let mut sum = 0.0_f32;
+                let mut count = 0_usize;
+                for vfile in &vloop.cache_files {
+                    let _g = AutogradContext::no_grad();
+                    let vtensors = match flame_core::serialization::load_file(vfile, &device) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log::warn!("[validation] load {} failed: {e}", vfile.display());
+                            continue;
+                        }
+                    };
+                    let vpull = |k: &str| -> Option<Tensor> {
+                        vtensors.get(k).map(|t| {
+                            t.clone().to_dtype(DType::BF16).unwrap_or_else(|_| t.clone())
+                        })
+                    };
+                    let v_target = match vpull("target_latents") {
+                        Some(t) => match t.unsqueeze(0) { Ok(x) => x, Err(e) => {
+                            log::warn!("[validation] {} target_latents unsqueeze: {e}", vfile.display());
+                            continue;
+                        }},
+                        None => {
+                            log::warn!("[validation] {} missing target_latents", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_encoder_hs = match vpull("encoder_hidden_states") {
+                        Some(t) => match t.unsqueeze(0) { Ok(x) => x, Err(e) => {
+                            log::warn!("[validation] {} encoder_hidden_states unsqueeze: {e}", vfile.display());
+                            continue;
+                        }},
+                        None => {
+                            log::warn!("[validation] {} missing encoder_hidden_states", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_context = match vpull("context_latents") {
+                        Some(t) => match t.unsqueeze(0) { Ok(x) => x, Err(e) => {
+                            log::warn!("[validation] {} context_latents unsqueeze: {e}", vfile.display());
+                            continue;
+                        }},
+                        None => {
+                            log::warn!("[validation] {} missing context_latents", vfile.display());
+                            continue;
+                        }
+                    };
+                    // Sample timestep + noise identically to training. Validation
+                    // uses its OWN run-side RNG so it does not perturb the
+                    // training-side seeded sequence (byte invariance).
+                    let mut vrng = StdRng::seed_from_u64(args.seed ^ (step as u64 + 1));
+                    let v_t_val = schedule::sample_timestep_logit_normal(
+                        &mut vrng, args.timestep_mu, args.timestep_sigma,
+                    );
+                    // Mirror training: validation uses CLEAN noise (no offset/
+                    // perturbation/multires — multires is a no-op for non-4D
+                    // anyway, and offset+perturbation are training-only random
+                    // augmentations that should not influence the eval signal).
+                    let v_x1 = match Tensor::randn(
+                        v_target.shape().clone(),
+                        0.0,
+                        1.0,
+                        device.clone(),
+                    ) {
+                        Ok(t) => match t.to_dtype(DType::BF16) {
+                            Ok(x) => x,
+                            Err(e) => {
+                                log::warn!("[validation] noise dtype: {e}");
+                                continue;
+                            }
+                        },
+                        Err(e) => {
+                            log::warn!("[validation] noise: {e}");
+                            continue;
+                        }
+                    };
+                    // x_t = t * x1 + (1 - t) * x0
+                    let v_xt = match v_x1.mul_scalar(v_t_val)
+                        .and_then(|x| v_target.mul_scalar(1.0 - v_t_val).and_then(|y| x.add(&y)))
+                    {
+                        Ok(x) => x,
+                        Err(e) => {
+                            log::warn!("[validation] xt mix: {e}");
+                            continue;
+                        }
+                    };
+                    let v_t_tensor = match Tensor::from_vec(
+                        vec![v_t_val],
+                        Shape::from_dims(&[1]),
+                        device.clone(),
+                    ).and_then(|t| t.to_dtype(DType::BF16)) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            log::warn!("[validation] t_tensor: {e}");
+                            continue;
+                        }
+                    };
+                    let v_pred = match model.forward(
+                        &v_xt,
+                        &v_t_tensor,
+                        &v_t_tensor,
+                        &v_encoder_hs,
+                        &v_context,
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            log::warn!("[validation] forward failed: {e}");
+                            continue;
+                        }
+                    };
+                    let v_flow = match v_x1.sub(&v_target) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            log::warn!("[validation] flow target: {e}");
+                            continue;
+                        }
+                    };
+                    let v_loss = match v_pred.to_dtype(DType::F32)
+                        .and_then(|p| v_flow.to_dtype(DType::F32).and_then(|f| p.sub(&f)))
+                        .and_then(|d| d.square())
+                        .and_then(|s| s.mean())
+                    {
+                        Ok(l) => l,
+                        Err(e) => {
+                            log::warn!("[validation] loss compute: {e}");
+                            continue;
+                        }
+                    };
+                    let v_loss_val = match v_loss.to_vec() {
+                        Ok(v) => v.first().copied().unwrap_or(f32::NAN),
+                        Err(e) => {
+                            log::warn!("[validation] loss to_vec: {e}");
+                            continue;
+                        }
+                    };
+                    if v_loss_val.is_finite() {
+                        sum += v_loss_val;
+                        count += 1;
+                    }
+                    AutogradContext::clear();
+                }
+                if count > 0 {
+                    let val_avg = sum / count as f32;
+                    log::info!(
+                        "[validation step={}] loss/val = {:.4} ({} samples)",
+                        step + 1,
+                        val_avg,
+                        count
+                    );
+                    if let Some(b) = &board {
+                        b.log_scalar("loss/val", (step + 1) as u64, val_avg as f64);
+                    }
+                }
+            }
+        }
 
         // Periodic save.
         if args.save_every > 0 && (step + 1) % args.save_every == 0 && (step + 1) < args.steps {

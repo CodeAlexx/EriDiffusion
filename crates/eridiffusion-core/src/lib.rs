@@ -1,7 +1,9 @@
+pub mod adapter;
 pub mod config;
 pub mod data;
 pub mod debug;
 pub mod lora;
+pub mod lycoris;
 pub mod models;
 pub mod pipeline;
 pub mod training;

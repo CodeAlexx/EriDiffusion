@@ -31,6 +31,7 @@ use std::path::PathBuf;
 use eridiffusion_core::config::{LrScheduler, TrainConfig, TrainingMethod};
 use eridiffusion_core::training::features::{
     ema_advanced::EmaConfig, loss_weight, lr_schedule, noise_modifiers, timestep_bias,
+    validation::ValidationLoop,
 };
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::training_features::OptimizerKind;
@@ -76,6 +77,12 @@ struct Args {
     // ── Phase 0 multi-feature rollout (default-off; Phase 1+ will consume) ──
     #[arg(long)] min_snr_gamma: Option<f32>,
     #[arg(long, default_value_t = 0.0)] caption_dropout_probability: f32,
+    /// Path to a single cache file produced by `prepare_ltx2` from an empty-
+    /// caption sample. When `--caption-dropout-probability > 0`, the trainer
+    /// loads `text_embedding` from this file and swaps it in with probability
+    /// `p` per sample. If unset and dropout > 0, the feature is disabled with
+    /// a warning (preserves prior behaviour).
+    #[arg(long)] null_text_cache: Option<PathBuf>,
     #[arg(long, default_value_t = 1.0)] noise_offset_probability: f32,
     #[arg(long, default_value_t = 0.0)] gamma_input_perturbation: f32,
     #[arg(long, default_value_t = 0.0)] huber_strength: f32,
@@ -221,12 +228,44 @@ fn main() -> anyhow::Result<()> {
         ),
         Err(e) => log::warn!("--optimizer parse: {} — falling back to AdamW", e),
     }
-    if args.caption_dropout_probability > 0.0 {
-        log::warn!(
-            "caption_dropout_probability={:.3} requested but LTX2 trainer has no inline encoder — feature disabled",
-            args.caption_dropout_probability
-        );
-    }
+    // Phase 1: caption_dropout. LTX-2 has no inline encoder, so the user
+    // supplies a `--null-text-cache` produced by `prepare_ltx2` on a single
+    // empty-caption sample. We load `text_embedding` once and swap it in
+    // per-sample with the configured probability. Without `--null-text-cache`,
+    // the feature is disabled with a warning.
+    let mut effective_caption_dropout_prob = args.caption_dropout_probability;
+    let null_text: Option<Tensor> = if effective_caption_dropout_prob > 0.0 {
+        match args.null_text_cache.as_ref() {
+            Some(p) => match flame_core::serialization::load_file(p, &device) {
+                Ok(s) => {
+                    let nt = s.get("text_embedding")
+                        .ok_or_else(|| anyhow::anyhow!("--null-text-cache missing 'text_embedding'"))?
+                        .to_dtype(DType::BF16)?;
+                    log::info!(
+                        "[caption-dropout] WIRED — prob={:.3} (null_text_embedding={:?})",
+                        effective_caption_dropout_prob,
+                        nt.shape().dims()
+                    );
+                    Some(nt)
+                }
+                Err(e) => {
+                    log::warn!("[caption-dropout] failed to load --null-text-cache {}: {e} — feature disabled", p.display());
+                    effective_caption_dropout_prob = 0.0;
+                    None
+                }
+            },
+            None => {
+                log::warn!(
+                    "caption_dropout_probability={:.3} requested but --null-text-cache not provided — feature disabled",
+                    effective_caption_dropout_prob
+                );
+                effective_caption_dropout_prob = 0.0;
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut opt = AdamW::new(args.lr, 0.9, 0.999, 1e-8, 0.01);
 
     // EMA shadow (Phase 3 advanced). Default-off → byte-identical to no-EMA.
@@ -300,6 +339,26 @@ fn main() -> anyhow::Result<()> {
     }
     log::info!("Found {} cached samples (batch_size={})", cache_files.len(), args.batch_size);
 
+    // Phase 2: validation harness — held-out cache + cadence. None at default
+    // (validation_every_steps == 0 OR no dir) → byte-identical off-path.
+    let validation_loop: Option<ValidationLoop> = if let (Some(dir), n) =
+        (args.validation_dataset_dir.as_ref(), args.validation_every_steps)
+    {
+        if n > 0 {
+            let v = ValidationLoop::new(dir, n)?;
+            log::info!(
+                "[validation] {} held-out samples, every {} steps",
+                v.len(),
+                n
+            );
+            Some(v)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
 
     let board = BoardWriter::open(
@@ -333,6 +392,19 @@ fn main() -> anyhow::Result<()> {
             // Trim to real_len if available (Gemma3 uses fixed 1024 left-pad,
             // so the first `pad_n` positions are pad embeddings; we keep them).
             // (T2V cross-attn applies mask if needed; here we pass full 1024.)
+            // Caption dropout: per-sample Bernoulli swaps text_embedding with
+            // null cache. Default-off (prob == 0.0 OR null_text == None) draws
+            // no rng.
+            let txt_full = if let Some(ref nt) = null_text {
+                use rand::Rng;
+                if rng.r#gen::<f32>() < effective_caption_dropout_prob {
+                    nt.clone()
+                } else {
+                    txt_full
+                }
+            } else {
+                txt_full
+            };
             batch_latents.push(latent);
             batch_texts.push(txt_full);
         }
@@ -512,6 +584,104 @@ fn main() -> anyhow::Result<()> {
             step, args.steps, cache_files.len(), args.batch_size.max(1),
             loss_val, total_norm, cur_lr, t_start, board.as_ref(),
         );
+
+        // Phase 2: validation eval pass (no_grad) every `validation_every_steps`.
+        // step+1 because `step` here is 0-based; ValidationLoop::should_run
+        // expects the 1-based completed-step number. Default-off invariant:
+        // when `validation_loop` is None, this entire block is skipped and the
+        // training-side RNG sequence is untouched.
+        if let Some(ref vloop) = validation_loop {
+            if vloop.should_run(step + 1) {
+                let mut sum = 0.0_f32;
+                let mut count = 0_usize;
+                for vfile in &vloop.cache_files {
+                    let _g = AutogradContext::no_grad();
+                    let sample = match flame_core::serialization::load_file(vfile, &device) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log::warn!("[validation] load {} failed: {e}", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_lat = match sample.get("latent") {
+                        Some(t) => t.to_dtype(DType::BF16)?,
+                        None => {
+                            log::warn!("[validation] {} missing latent", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_txt = match sample.get("text_embedding") {
+                        Some(t) => t.to_dtype(DType::BF16)?,
+                        None => {
+                            log::warn!("[validation] {} missing text_embedding", vfile.display());
+                            continue;
+                        }
+                    };
+                    // LTX-2 specifics: 5D video latent [B, 128, F, H, W]. Token
+                    // count for the shifted-LTX2 mu = F * H * W.
+                    let v_dims = v_lat.shape().dims();
+                    if v_dims.len() != 5 {
+                        log::warn!(
+                            "[validation] {} latent rank {} != 5; skipping",
+                            vfile.display(), v_dims.len()
+                        );
+                        continue;
+                    }
+                    let v_n_tokens = v_dims[2] * v_dims[3] * v_dims[4];
+                    let v_mu = ltx2_sampler::shift_for_token_count(v_n_tokens);
+                    // Validation uses its OWN run-side RNG so it does not
+                    // perturb the training-side seeded sequence (byte invariance).
+                    let mut vrng = rand::rngs::StdRng::seed_from_u64(SEED ^ (step as u64 + 1));
+                    let v_t_continuous = ltx2_sampler::sample_timestep_logit_normal(&mut vrng, v_mu);
+                    let v_sigma_idx = (v_t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
+                    let v_sigma = (v_sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32;
+                    // Clean noise, no offset / no input perturbation — eval should
+                    // measure model fit, not augmented-noise fit.
+                    let v_noise = Tensor::randn(v_lat.shape().clone(), 0.0, 1.0, device.clone())?
+                        .to_dtype(DType::BF16)?;
+                    let v_noisy = v_noise.mul_scalar(v_sigma)?
+                        .add(&v_lat.mul_scalar(1.0 - v_sigma)?)?;
+                    let v_target = v_noise.sub(&v_lat)?;
+                    // Mirror trainer's per-batch-element timestep tensor (B=1 here).
+                    let v_timestep = Tensor::from_vec(
+                        vec![v_t_continuous],
+                        Shape::from_dims(&[v_dims[0]]),
+                        device.clone(),
+                    )?;
+                    let v_pred = match Ltx2Model::forward(
+                        &mut model, &v_noisy, &v_txt, &v_timestep, args.fps,
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            log::warn!("[validation] forward failed: {e}");
+                            continue;
+                        }
+                    };
+                    let v_loss = v_pred.to_dtype(DType::F32)?
+                        .sub(&v_target.to_dtype(DType::F32)?)?
+                        .square()?
+                        .mean()?;
+                    let v_loss_val = v_loss.to_vec()?[0];
+                    if v_loss_val.is_finite() {
+                        sum += v_loss_val;
+                        count += 1;
+                    }
+                    AutogradContext::clear();
+                }
+                if count > 0 {
+                    let val_avg = sum / count as f32;
+                    log::info!(
+                        "[validation step={}] loss/val = {:.4} ({} samples)",
+                        step + 1,
+                        val_avg,
+                        count
+                    );
+                    if let Some(b) = &board {
+                        b.log_scalar("loss/val", (step + 1) as u64, val_avg as f64);
+                    }
+                }
+            }
+        }
 
         // ── Periodic save + sample ──
         // EMA swap: when `--ema --ema-validation-swap`, save and sample see

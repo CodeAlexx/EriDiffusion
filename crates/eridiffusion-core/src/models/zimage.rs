@@ -234,6 +234,11 @@ fn tensors_with_weight_alias(
 pub struct ZImageModel {
     pub model_path: std::path::PathBuf,
     pub bundle: ZImageLoraBundle,
+    /// Optional LyCORIS bundle (Phase 2b wiring). When `Some`, takes priority
+    /// over the legacy `bundle` per-target lookup in the per-block forward.
+    /// When `None` (default), the legacy `LoRALinear` path is byte-identical
+    /// to the pre-Phase-2b behaviour.
+    pub lycoris: Option<Arc<crate::lycoris::LycorisBundle>>,
     pub num_blocks: usize,
     resident_weights: HashMap<String, Tensor>,
     block_weights: Vec<HashMap<String, Tensor>>,
@@ -327,6 +332,7 @@ impl ZImageModel {
         Ok(Self {
             model_path: model_path.to_path_buf(),
             bundle,
+            lycoris: None,
             num_blocks: NUM_LAYERS,
             resident_weights: resident,
             block_weights: per_block,
@@ -646,7 +652,7 @@ impl ZImageModel {
                 self.bundle.refresh_caches();
                 h_state = block_forward_iflame(
                     &h_state, &unified_cos, &unified_sin, &adaln_input, i,
-                    &self.bundle, &block_w,
+                    &self.bundle, None, &block_w,
                 )?;
             } else if use_checkpoint {
                 let h_c = h_state.clone();
@@ -665,7 +671,7 @@ impl ZImageModel {
                         bundle_c.refresh_caches();
                         block_forward_standalone(
                             &h_c, &cos_c, &sin_c, &adaln_c, i,
-                            &bundle_c, &block_w_c,
+                            &bundle_c, None, &block_w_c,
                         )
                     },
                 )?;
@@ -684,7 +690,7 @@ impl ZImageModel {
                 self.bundle.refresh_caches();
                 h_state = block_forward_standalone(
                     &h_state, &unified_cos, &unified_sin, &adaln_input, i,
-                    &self.bundle, &block_w,
+                    &self.bundle, None, &block_w,
                 )?;
             }
             if let Some(ref d) = dump_dir {
@@ -1290,6 +1296,22 @@ fn sinusoidal_embedding(t: &Tensor, dim: usize) -> Result<Tensor> {
     Tensor::cat(&[&cos_part, &sin_part], 1)?.to_dtype(DType::BF16)
 }
 
+/// Resolve `(block_idx, target)` into the dotted-path adapter name used by
+/// the LyCORIS wiring (Phase 2b). Mirrors `ZImageLoraBundle::ai_toolkit_suffix`
+/// + the saved-key prefix scheme so both code paths agree on adapter names.
+pub(crate) fn lycoris_target_name(block_idx: usize, target: LoraTarget) -> String {
+    let suffix = match target {
+        LoraTarget::AttnQ => "attention.to_q",
+        LoraTarget::AttnK => "attention.to_k",
+        LoraTarget::AttnV => "attention.to_v",
+        LoraTarget::AttnOut => "attention.to_out.0",
+        LoraTarget::FfnW1 => "feed_forward.w1",
+        LoraTarget::FfnW2 => "feed_forward.w2",
+        LoraTarget::FfnW3 => "feed_forward.w3",
+    };
+    format!("layers.{block_idx}.{suffix}")
+}
+
 /// Standalone block forward for use inside `checkpoint_offload` closures.
 /// Duplicates `ZImageModel::transformer_block_with_lora` but takes
 /// explicit weight maps instead of `&self`.
@@ -1300,6 +1322,7 @@ fn block_forward_standalone(
     adaln_input: &Tensor,
     block_idx: usize,
     bundle: &ZImageLoraBundle,
+    lycoris: Option<&Arc<crate::lycoris::LycorisBundle>>,
     block_weights: &HashMap<String, Tensor>,
 ) -> Result<Tensor> {
     let bw = |suffix: &str| -> Result<&Tensor> {
@@ -1342,6 +1365,18 @@ fn block_forward_standalone(
     };
 
     let add_lora = |base: Tensor, input: &Tensor, target: LoraTarget| -> Result<Tensor> {
+        // Phase 2b: LyCORIS bundle takes priority when wired. When absent
+        // (default) the legacy LoRALinear branch runs unchanged → byte-identical.
+        if let Some(lyc) = lycoris {
+            let name = lycoris_target_name(block_idx, target);
+            let in3d = ensure_3d(input)?;
+            if let Some(delta) = lyc.forward_delta(&name, &in3d).map_err(|e| {
+                flame_core::FlameError::InvalidInput(format!("lycoris forward_delta({name}): {e}"))
+            })? {
+                return base.add(&delta);
+            }
+            return Ok(base);
+        }
         if let Some(lora) = bundle.adapters.get(&(block_idx, target)) {
             let delta = lora.forward_delta(&ensure_3d(input)?).map_err(|e| flame_core::FlameError::InvalidInput(format!("lora delta: {e}")))?;
             base.add(&delta)
@@ -1428,6 +1463,7 @@ fn block_forward_iflame(
     adaln_input: &Tensor,
     block_idx: usize,
     bundle: &ZImageLoraBundle,
+    lycoris: Option<&Arc<crate::lycoris::LycorisBundle>>,
     block_weights: &HashMap<String, Tensor>,
 ) -> Result<Tensor> {
     use flame_core::ops::fused_inference::fused_rms_norm;
@@ -1464,6 +1500,18 @@ fn block_forward_iflame(
     // LoRA delta: adds LoRA output on top of base projection when an adapter
     // exists for this block and target.
     let add_lora = |base: Tensor, input: &Tensor, target: LoraTarget| -> Result<Tensor> {
+        // Phase 2b: LyCORIS bundle takes priority when wired. When absent
+        // (default) the legacy LoRALinear branch runs unchanged → byte-identical.
+        if let Some(lyc) = lycoris {
+            let name = lycoris_target_name(block_idx, target);
+            let in3d = ensure_3d(input)?;
+            if let Some(delta) = lyc.forward_delta(&name, &in3d).map_err(|e| {
+                flame_core::FlameError::InvalidInput(format!("lycoris forward_delta({name}): {e}"))
+            })? {
+                return base.add(&delta);
+            }
+            return Ok(base);
+        }
         if let Some(lora) = bundle.adapters.get(&(block_idx, target)) {
             let delta = lora.forward_delta(&ensure_3d(input)?)
                 .map_err(|e| flame_core::FlameError::InvalidInput(

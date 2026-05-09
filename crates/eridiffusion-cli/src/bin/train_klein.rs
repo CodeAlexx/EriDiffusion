@@ -241,6 +241,19 @@ struct Args {
     /// notifications at training start, each checkpoint save, completion,
     /// and on panic. Default unset → no notifications, no `ureq` calls.
     #[arg(long)] webhook_url: Option<String>,
+
+    // ── LyCORIS bundle (Phase 2a wiring — surface only) ──────────────────
+    // 12 `--lycoris-*` flags. Default `--lycoris-algo none` → fall through
+    // to the legacy LoRA path; byte-identical to all pre-flag commits.
+    // Selecting any non-none algo currently aborts at startup because the
+    // model-side forward integration (Phase 2b) is NOT wired here — see
+    // `KleinModel::forward_inner`, which consumes its internal
+    // `Vec<LoRALinear>` directly. Honoring "no legacy-path behavior change"
+    // means the LyCORIS forward path lands in a follow-up that adds an
+    // optional `LycorisBundle` arm to the model's `forward_inner` /
+    // `double_block_forward_standalone` / `single_block_forward_standalone`.
+    #[command(flatten)]
+    pub lycoris: eridiffusion_core::lycoris::LycorisCliArgs,
 }
 
 /// LOGIT_NORMAL timestep sample. Returns continuous t in [0, 1000).
@@ -281,6 +294,24 @@ fn main() -> anyhow::Result<()> {
 
     flame_core::config::set_default_dtype(DType::BF16);
     let device = flame_core::global_cuda_device();
+
+    // ── LyCORIS bundle setup (Phase 2a — surface only) ───────────────────
+    // Parse `--lycoris-*` flags into a `LycorisBundleConfig`. Default-off:
+    // `algo == LycorisAlgo::None` → `use_lycoris == false` → every legacy
+    // code path runs unchanged.
+    let lycoris_cfg = eridiffusion_core::lycoris::LycorisBundleConfig::from_cli(&args.lycoris)?;
+    let use_lycoris =
+        lycoris_cfg.algo != eridiffusion_core::lycoris::LycorisAlgo::None;
+    if use_lycoris {
+        log::info!(
+            "[lycoris] algo={} rank={} alpha={} dora={} storage={:?}",
+            lycoris_cfg.algo.as_str(),
+            lycoris_cfg.rank,
+            lycoris_cfg.alpha,
+            lycoris_cfg.dora,
+            lycoris_cfg.storage,
+        );
+    }
 
     let mut config = TrainConfig::from_json_path(&args.config.to_string_lossy())?;
     config.training_method = TrainingMethod::Lora;
@@ -373,6 +404,168 @@ fn main() -> anyhow::Result<()> {
     if params.is_empty() {
         anyhow::bail!("No trainable parameters — TrainingMethod::Lora produced empty param list");
     }
+
+    // ── LyCORIS bundle population (Phase 2a — populate + stat, then gate) ─
+    // When `--lycoris-algo` is non-none, build a parallel `LycorisBundle`
+    // that mirrors Klein's existing LoRA target list one-for-one. We populate
+    // the bundle with `add_linear` for every (block, slot) using the model's
+    // `named_parameters()` ordering as the source of truth — that's the same
+    // ordering used by `save_weights` / `load_weights` and the Kohya save
+    // format, so adapters built here are interchangeable with the legacy
+    // path on disk.
+    //
+    // Then we BAIL with an explicit error: the model's per-step forward
+    // (`forward_inner` → `double_block_forward_standalone` /
+    // `single_block_forward_standalone`) consumes its internal
+    // `Vec<LoRALinear>` directly. Routing a `LycorisAdapter` through the
+    // forward closures requires a model-side change that is intentionally
+    // out of scope for "trainer-side wiring only". This phase ships the
+    // CLI surface, the bundle constructor, and the save plumbing; the
+    // model-forward integration is the Phase 2b follow-up.
+    //
+    // **Invariant**: when `use_lycoris == false` (default), this entire
+    // block is bypassed — the legacy LoRA path runs byte-identically.
+    let _lycoris_bundle: Option<eridiffusion_core::lycoris::LycorisBundle> = if use_lycoris {
+        let mut b = eridiffusion_core::lycoris::LycorisBundle::new(
+            lycoris_cfg.clone(),
+            device.clone(),
+        );
+        // Walk Klein's per-block LoRA target list. Each adapter consumes
+        // 2 `named_parameters` entries (`lora_A.weight`, `lora_B.weight`),
+        // so step by 2 and use the `lora_A` key as the dotted-path stem
+        // (strip the `.lora_A.weight` suffix so the bundle suffixes its
+        // own `.lora_A.weight` / `.lora_B.weight` etc. on save).
+        let named = model.named_parameters();
+        if named.len() % 2 != 0 {
+            anyhow::bail!(
+                "[lycoris] expected even named_parameters() count (lora_A + lora_B per adapter), got {}",
+                named.len()
+            );
+        }
+        // Klein's `KleinConfig` carries `inner_dim`/`mlp_hidden`. Each
+        // (block_idx, slot) maps to a fixed (in, out) pair — encoded in
+        // `KleinModel::new`. Reuse that mapping rather than guessing the
+        // shape from the param tensors (whose `[rank, in]` / `[out, rank]`
+        // shapes are LoRA-specific, not the underlying linear shape).
+        let inner = model.kconfig.inner_dim;
+        let mlp = model.kconfig.mlp_hidden;
+        // (in_features, out_features) per DOUBLE_LORA_KEYS slot. Mirrors the
+        // shape decisions in `KleinModel::new` for the double-block branch.
+        let double_io: [(usize, usize); 12] = [
+            (inner, inner),       // 0  img_attn.to_q
+            (inner, inner),       // 1  img_attn.to_k
+            (inner, inner),       // 2  img_attn.to_v
+            (inner, inner),       // 3  img_attn.proj
+            (inner, inner),       // 4  txt_attn.to_q
+            (inner, inner),       // 5  txt_attn.to_k
+            (inner, inner),       // 6  txt_attn.to_v
+            (inner, inner),       // 7  txt_attn.proj
+            (inner, 2 * mlp),     // 8  img_mlp.0 (gate+up fused)
+            (mlp, inner),         // 9  img_mlp.2 (down)
+            (inner, 2 * mlp),     // 10 txt_mlp.0
+            (mlp, inner),         // 11 txt_mlp.2
+        ];
+        let single_io: [(usize, usize); 2] = [
+            (inner, 3 * inner + 2 * mlp), // 0 linear1
+            (inner + mlp, inner),         // 1 linear2
+        ];
+
+        // Iterate (block_idx, slot) in the SAME order as
+        // `KleinModel::named_parameters` — that's how `save_safetensors`
+        // keys come out of the bundle, so post-training the file lays out
+        // identically to the legacy path's PEFT output.
+        let mut name_iter = named.iter().step_by(2);
+        let num_double = model.kconfig.num_double;
+        let num_single = model.kconfig.num_single;
+        for i in 0..num_double {
+            for slot in 0..12 {
+                // Use the `named_parameters()` name (without `.lora_A.weight`)
+                // as the stable dotted path. This guarantees the LyCORIS
+                // save format mirrors the legacy save's prefix exactly.
+                let (full_a_key, _) = name_iter
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("[lycoris] named_parameters() exhausted at double block {i} slot {slot}"))?;
+                let stem = full_a_key
+                    .strip_suffix(".lora_A.weight")
+                    .ok_or_else(|| anyhow::anyhow!("[lycoris] expected `.lora_A.weight` suffix in named_parameters() entry, got '{full_a_key}'"))?;
+                let (in_feat, out_feat) = double_io[slot];
+                // `w_orig` for DoRA: pull the underlying base weight from
+                // `model.weights` via the existing key convention. For the
+                // 3 split-Q/K/V slots the on-disk weight is the FUSED
+                // `img_attn.qkv.weight` / `txt_attn.qkv.weight`, which has
+                // shape `[3*inner, inner]` — that doesn't match the
+                // `[inner, inner]` per-slice DoRA magnitude expectation.
+                // Pass `None` for those slots (DoRA + split-QKV is a
+                // Phase 2b follow-up; non-DoRA path ignores `w_orig`).
+                let w_orig: Option<&Tensor> = if lycoris_cfg.dora {
+                    let weight_key = match slot {
+                        0..=2 | 4..=6 => None, // split-QKV → defer DoRA
+                        3 => Some(format!("double_blocks.{i}.img_attn.proj.weight")),
+                        7 => Some(format!("double_blocks.{i}.txt_attn.proj.weight")),
+                        8 => Some(format!("double_blocks.{i}.img_mlp.0.weight")),
+                        9 => Some(format!("double_blocks.{i}.img_mlp.2.weight")),
+                        10 => Some(format!("double_blocks.{i}.txt_mlp.0.weight")),
+                        11 => Some(format!("double_blocks.{i}.txt_mlp.2.weight")),
+                        _ => unreachable!(),
+                    };
+                    weight_key.as_ref().and_then(|k| model.weights.get(k))
+                } else {
+                    None
+                };
+                b.add_linear(stem, in_feat, out_feat, w_orig)?;
+            }
+        }
+        for i in 0..num_single {
+            for slot in 0..2 {
+                let (full_a_key, _) = name_iter
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("[lycoris] named_parameters() exhausted at single block {i} slot {slot}"))?;
+                let stem = full_a_key
+                    .strip_suffix(".lora_A.weight")
+                    .ok_or_else(|| anyhow::anyhow!("[lycoris] expected `.lora_A.weight` suffix in named_parameters() entry, got '{full_a_key}'"))?;
+                let (in_feat, out_feat) = single_io[slot];
+                let w_orig: Option<&Tensor> = if lycoris_cfg.dora {
+                    let weight_key = match slot {
+                        0 => format!("single_blocks.{i}.linear1.weight"),
+                        1 => format!("single_blocks.{i}.linear2.weight"),
+                        _ => unreachable!(),
+                    };
+                    model.weights.get(&weight_key)
+                } else {
+                    None
+                };
+                b.add_linear(stem, in_feat, out_feat, w_orig)?;
+            }
+        }
+
+        let (n_adapt, n_elem, mb) = b.stats();
+        log::info!(
+            "[lycoris] populated bundle: {} adapters, {} param elements, ~{:.1} MiB",
+            n_adapt, n_elem, mb,
+        );
+
+        // Phase 2a stops here. The forward path still runs through the
+        // legacy `Vec<LoRALinear>` inside `KleinModel`, which is NOT updated
+        // by the bundle's `parameters()` — wiring through would either
+        // require a model-side rewrite (out of scope for this phase) or
+        // duplicate the gradient updates onto two parallel adapter sets
+        // (which violates byte-invariance: each forward would need to add
+        // both deltas, doubling the LoRA effect). We bail explicitly.
+        anyhow::bail!(
+            "[lycoris] Phase 2a wiring stops here. The trainer surface, \
+             config, and bundle population are validated, but \
+             KleinModel::forward_inner still consumes its internal \
+             Vec<LoRALinear> — running training with --lycoris-algo={} \
+             would either skip every adapter or double-apply LoRA. The \
+             model-forward integration (threading LycorisBundle through \
+             double_block_forward_standalone and single_block_forward_standalone) \
+             is the Phase 2b follow-up. To run training now, omit \
+             --lycoris-algo or pass --lycoris-algo none.",
+            lycoris_cfg.algo.as_str()
+        );
+    } else {
+        None
+    };
 
     // EMA shadow (Phase 3 advanced). Built from current live params (post
     // resume_lora / pre-step-0). Updated after each opt.step via

@@ -1,22 +1,24 @@
-//! prepare_flux — image+caption → cached latents+embeddings for FLUX.1 (Dev/Schnell) LoRA training.
+//! prepare_chroma — image+caption → cached latents+T5 embeddings for Chroma LoRA training.
 //!
-//! Mirrors prepare_ernie / prepare_klein structure. Per sample (one safetensors in `--output-dir`):
-//!   - `latent`:    BF16 [1, 16, H/8, W/8] — RAW Flux VAE posterior (NO shift/scale, NO patchify)
-//!   - `t5_embed`:  BF16 [1, 512, 4096]    — T5-XXL @ 512 tokens (BFL convention)
-//!   - `clip_pool`: BF16 [1, 768]          — CLIP-L pooled (used as `vector` input to DiT)
+//! Chroma is a FLUX.1-derived DiT (Lodestone Rock's Chroma1-HD). It uses the
+//! same Flux VAE (16-ch LDM, scale=0.3611, shift=0.1159) and T5-XXL text
+//! encoder, but has NO CLIP branch — the modulation comes from a small
+//! "approximator" MLP fed the timestep, not pooled CLIP. Cache shape:
 //!
-//! T5 tokenizer:   `tokenizer_2/spiece.model`-derived JSON (HF T5TokenizerFast)
-//! CLIP tokenizer: `tokenizer/tokenizer.json` (HF CLIPTokenizer)
+//!   - `latent`:    BF16 [1, 16, H/8, W/8] — RAW Flux VAE posterior
+//!   - `t5_embed`:  BF16 [1, T5_MAX_LEN, 4096] — T5-XXL hidden states
 //!
-//! Audit fix FLUX_VERIFY §H3 / SKEPTIC §H3: the cache stores RAW VAE latent
-//! (`posterior.mode()`), no shift/scale, no patchify, no img/txt position IDs.
-//! `(latent - SHIFT) * SCALE` and `pack_latents` happen at training time
-//! (matches upstream Python contract — `BaseFluxSetup.py:235`).
+//! Latent convention matches `prepare_flux` (audit fix FLUX_VERIFY §H3): cache
+//! stores RAW posterior. `(latent - SHIFT) * SCALE` happens at training time.
+//!
+//! Differences vs `prepare_flux`:
+//!   - No CLIP encoder, no `clip_pool` field.
+//!   - T5 padded to 512 tokens (matches `sample_chroma.rs` and the archive
+//!     trainer's `T5_SEQ_LEN`).
 
 use clap::Parser;
 use flame_core::{serialization::save_file, DType, Shape, Tensor};
 use eridiffusion_core::encoders::{
-    clip_l::{ClipConfig, ClipEncoder},
     flux_vae::{FluxVaeEncoder, LATENT_CHANNELS},
     t5_xxl::T5Encoder,
 };
@@ -24,25 +26,21 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 const T5_MAX_LEN: usize = 512;
-const CLIP_MAX_LEN: usize = 77;
-const CLIP_PAD_ID: i32 = 49407; // CLIPTokenizer pads with eos_token_id
 
 #[derive(Parser)]
 struct Args {
     #[arg(long)] input_dir: PathBuf,
     #[arg(long)] output_dir: PathBuf,
-    /// Flux VAE safetensors (FLUX.1-dev/ae.safetensors).
+    /// Flux VAE safetensors (Chroma uses the same VAE — `ae.safetensors` or
+    /// the diffusers-format VAE shipped with Chroma1-HD).
     #[arg(long)] vae_ckpt: PathBuf,
     /// T5-XXL weights (single file or directory of shards).
     #[arg(long)] t5_ckpt: PathBuf,
-    /// CLIP-L weights (single file).
-    #[arg(long)] clip_ckpt: PathBuf,
     /// T5 tokenizer.json.
     #[arg(long)] t5_tokenizer: PathBuf,
-    /// CLIP-L tokenizer.json.
-    #[arg(long)] clip_tokenizer: PathBuf,
-    /// OT preset default 768 ("#flux LoRA.json").
-    #[arg(long, default_value = "768")] resolution: u32,
+    /// Default 1024 (chroma1-HD's native training resolution). Must be a
+    /// multiple of 16 (patch=2 × VAE 8 = 16).
+    #[arg(long, default_value = "1024")] resolution: u32,
     #[arg(long, default_value_t = true)] skip_existing: bool,
     #[arg(long, default_value_t = 0)] max_samples: usize,
     /// Image augmentations at prep time. All default-off → byte-identical
@@ -53,26 +51,6 @@ struct Args {
     #[arg(long, default_value_t = 0.0)] aug_brightness: f32,
     #[arg(long, default_value_t = 0.0)] aug_contrast: f32,
     #[arg(long, default_value_t = 0)] aug_seed: u64,
-}
-
-fn load_shards(path: &std::path::Path, device: &std::sync::Arc<flame_core::CudaDevice>)
-    -> flame_core::Result<HashMap<String, Tensor>>
-{
-    if path.is_file() {
-        return flame_core::serialization::load_file(path, device);
-    }
-    let mut all = HashMap::new();
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
-        .map_err(|e| flame_core::Error::Io(format!("read_dir: {e}")))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
-        .collect();
-    entries.sort();
-    for p in entries {
-        let part = flame_core::serialization::load_file(&p, device)?;
-        all.extend(part);
-    }
-    Ok(all)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -86,31 +64,28 @@ fn main() -> anyhow::Result<()> {
     }
     env_logger::init();
     let args = Args::parse();
+    if args.resolution % 16 != 0 {
+        anyhow::bail!("--resolution must be a multiple of 16 (patch=2 × VAE 8), got {}", args.resolution);
+    }
     std::fs::create_dir_all(&args.output_dir)?;
     flame_core::config::set_default_dtype(DType::BF16);
     let _no_grad = flame_core::autograd::AutogradContext::no_grad();
     let device = flame_core::global_cuda_device();
 
-    log::info!("[1/4] Loading Flux VAE encoder (16-ch LDM)...");
+    log::info!("[1/3] Loading Flux VAE encoder (16-ch LDM)...");
     let vae = FluxVaeEncoder::from_safetensors(
         args.vae_ckpt.to_str().unwrap(),
         LATENT_CHANNELS,
         &device,
     )?;
 
-    log::info!("[2/4] Loading T5-XXL (4096-d, 24L)...");
+    log::info!("[2/3] Loading T5-XXL (4096-d, 24L)...");
     let mut t5 = T5Encoder::load(args.t5_ckpt.to_str().unwrap(), &device)?;
-
-    log::info!("[3/4] Loading CLIP-L (768-d, 12L)...");
-    let clip_weights = load_shards(&args.clip_ckpt, &device)?;
-    let clip = ClipEncoder::new(clip_weights, ClipConfig::default(), device.clone());
 
     let t5_tok = tokenizers::Tokenizer::from_file(&args.t5_tokenizer)
         .map_err(|e| anyhow::anyhow!("T5 tokenizer: {e}"))?;
-    let clip_tok = tokenizers::Tokenizer::from_file(&args.clip_tokenizer)
-        .map_err(|e| anyhow::anyhow!("CLIP tokenizer: {e}"))?;
 
-    log::info!("[4/4] Encoding samples at {}²...", args.resolution);
+    log::info!("[3/3] Encoding samples at {}²...", args.resolution);
     let mut pairs = Vec::new();
     for entry in std::fs::read_dir(&args.input_dir)? {
         let p = entry?.path();
@@ -138,13 +113,22 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Cache version sentinel. Mirrors prepare_anima — Chroma cache v1 is the
+    // initial published format (raw VAE posterior + T5 hidden, no CLIP).
+    const CACHE_VERSION: u32 = 1;
+    let meta = format!(
+        r#"{{"version": {}, "format": "chroma-v1", "fields": ["latent", "t5_embed"]}}"#,
+        CACHE_VERSION
+    );
+    let _ = std::fs::write(args.output_dir.join("_meta.json"), &meta);
+
     let mut cached = 0usize;
     for (idx, (img_path, txt_path)) in pairs.iter().enumerate() {
         let hash = format!("{:x}", md5::compute(img_path.to_string_lossy().as_bytes()));
         let out_path = args.output_dir.join(format!("{hash}.safetensors"));
         if args.skip_existing && out_path.exists() { continue; }
 
-        // ── Image → VAE latent → pack ──
+        // ── Image → VAE latent (RAW, no shift/scale, no patchify) ──
         let img = image::open(img_path)?
             .resize_exact(args.resolution, args.resolution, image::imageops::FilterType::Lanczos3)
             .to_rgb32f();
@@ -160,7 +144,6 @@ fn main() -> anyhow::Result<()> {
             );
         }
         let (w, h) = img.dimensions();
-        // [-1, 1] normalized like Klein/Ernie prepare.
         // CHW transpose — see prepare_klein.rs for full bug writeup. Without
         // this, image::pixels() (HWC interleaved) reshaped to [1, 3, H, W]
         // (CHW) scrambles channels and the VAE silently encodes garbage.
@@ -172,18 +155,13 @@ fn main() -> anyhow::Result<()> {
         }
         let img_t = Tensor::from_vec(pixels, Shape::from_dims(&[1, 3, hu, wu]), device.clone())?
             .to_dtype(DType::BF16)?;
-        // Audit fix FLUX_VERIFY §H2 + §H3 / SKEPTIC §H2 + §H3: store RAW
-        // posterior latent (`[1, 16, H/8, W/8]`). Shift/scale and patchify
-        // happen in the trainer at flow-matching step time. The pre-fix path
-        // applied `(latent - SHIFT) / SCALE` here — that's the *decode*
-        // direction (BFL `autoencoder.py:308-315`). Encode is `(raw - shift) *
-        // scale` (multiply, not divide). Pre-fix latents were ~7.7× the
-        // variance the BFL DiT was trained on; the symmetric inversion in the
-        // sampler made the bug silent (cancels for round-trip but kills LoRA
-        // identity transfer because the DiT is fed garbage-magnitude latents).
+        // RAW posterior: trainer applies `(latent - SHIFT) * SCALE` per step
+        // (matches FLUX_VERIFY §H3 / SKEPTIC §H3). Archive's prepare_dataset
+        // pre-scaled latents; we deliberately diverge so all FLUX-family
+        // caches (Klein/Flux/Chroma) share one contract.
         let latent_raw = vae.encode(&img_t)?; // [1, 16, H/8, W/8]
 
-        // ── Caption → T5 + CLIP ──
+        // ── Caption → T5 ──
         let caption = std::fs::read_to_string(txt_path).unwrap_or_default();
         let caption = caption.trim();
 
@@ -194,18 +172,9 @@ fn main() -> anyhow::Result<()> {
         // T5Encoder::encode pads to max_seq_len (512) internally with id=0.
         let t5_embed = t5.encode(&t5_ids)?;
 
-        let clip_enc = clip_tok.encode(caption, true)
-            .map_err(|e| anyhow::anyhow!("CLIP tokenize: {e}"))?;
-        let mut clip_ids: Vec<i32> = clip_enc.get_ids().iter().map(|&x| x as i32).collect();
-        if clip_ids.len() > CLIP_MAX_LEN { clip_ids.truncate(CLIP_MAX_LEN); }
-        // ClipEncoder::encode pads with eos_token_id internally.
-        let _ = CLIP_PAD_ID; // documented constant; encoder pads itself
-        let (_clip_hidden, clip_pool) = clip.encode(&clip_ids)?;
-
         let mut tensors = HashMap::new();
         tensors.insert("latent".to_string(), latent_raw.to_dtype(DType::BF16)?);
         tensors.insert("t5_embed".to_string(), t5_embed.to_dtype(DType::BF16)?);
-        tensors.insert("clip_pool".to_string(), clip_pool.to_dtype(DType::BF16)?);
         save_file(&tensors, &out_path)?;
         cached += 1;
 
