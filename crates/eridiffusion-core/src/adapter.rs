@@ -227,18 +227,16 @@ impl LycorisLinear {
         }
     }
 
-    /// Cast `input` to the trainer storage dtype if needed (typical pattern
-    /// is BF16 model input → F32 LoRA leaves), run the upstream forward,
-    /// cast the output back to the input dtype. Mirrors the cast pattern
-    /// inside [`LoRALinear::forward_delta`].
+    /// Run the upstream forward at the input's dtype.  Each algo's `forward`
+    /// is responsible for casting its own F32-storage params to
+    /// `input.dtype()` with autograd recording (so backward routes Cast →
+    /// F32 leaf).  The previous design — cast `input` to storage dtype, run
+    /// algo forward in F32, cast output back to BF16 — built an F32
+    /// sub-tape whose saved tensors corrupted FlashAttention backward
+    /// (CUDA_ERROR_MISALIGNED_ADDRESS, 2026-05-09).
     fn forward_delta_cast(&self, input: &Tensor) -> FlameResult<Tensor> {
-        let storage_dt = self.storage.to_dtype();
         let input_dt = input.dtype();
-        let cast_in = if input_dt != storage_dt {
-            input.to_dtype(storage_dt)?
-        } else {
-            input.clone()
-        };
+        let cast_in = input.clone();
         let out = match &self.adapter {
             LycorisAdapter::LoCon(m) => m.forward(&cast_in),
             LycorisAdapter::LoHa(m) => m.forward(&cast_in),
