@@ -828,26 +828,24 @@ impl ChromaTrainingModel {
                     },
                 )?;
 
-                // Unpack without recording to the outer tape (prevents
-                // O(blocks) saved tensor accumulation from narrow/cat ops).
+                // 2026-05-09 fix: previous version wrapped these unpacks in
+                // `AutogradContext::no_grad` and then called `requires_grad_(true)`,
+                // which produced orphaned leaves with no parent in the tape — the
+                // next dual block's checkpoint_offload couldn't propagate
+                // gradient back to *this* block's sub-tape, so all 19 dual
+                // blocks' LoRAs got zero grad. Recording the narrow ops adds
+                // 2 small entries per block (38 total) — negligible vs the
+                // sub-tape size — and keeps the gradient chain intact.
                 let img_seq = img_h.shape().dims()[1];
-                {
-                    let _ng = AutogradContext::no_grad();
-                    img_h = block_out.narrow(1, 0, img_seq)?;
-                    txt_h = block_out.narrow(1, img_seq, nt)?;
-                }
-                // Restore requires_grad for the next checkpoint
-                img_h = img_h.requires_grad_(true);
-                txt_h = txt_h.requires_grad_(true);
+                img_h = block_out.narrow(1, 0, img_seq)?;
+                txt_h = block_out.narrow(1, img_seq, nt)?;
                 log::debug!("[fwd] double block {i}/{} done", self.num_double_blocks);
             }
 
-            // Concat for single blocks (outside tape)
-            let combined = {
-                let _ng = AutogradContext::no_grad();
-                Tensor::cat(&[&txt_h, &img_h], 1)?
-            };
-            let mut h = combined.requires_grad_(true);
+            // Concat for single blocks. Same reasoning as the narrow above —
+            // recording this cat is cheap and keeps the gradient chain alive
+            // back into the dual blocks.
+            let mut h = Tensor::cat(&[&txt_h, &img_h], 1)?;
 
             // Single blocks — closure fetches weights on demand
             for i in 0..self.num_single_blocks {
@@ -1524,10 +1522,15 @@ fn modulate_pre(x: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
 }
 
 fn rms_norm_head(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
+    // 2026-05-09 fix: `cuda_ops_bf16::rms_norm_bf16` is inference-only — its
+    // output never carries `requires_grad`, severing the gradient chain at Q/K
+    // for every transformer block (single + dual). Use `flame_core::norm::rms_norm`
+    // which records `Op::RmsNorm` and matches Klein's `head_rms_norm_local`
+    // (klein.rs:491-497). Same kernel under the hood, autograd-aware wrapper.
     let dims = x.shape().dims().to_vec();
     let (b, h, s, d) = (dims[0], dims[1], dims[2], dims[3]);
     let flat = x.reshape(&[b * h * s, d])?;
-    let normed = flame_core::cuda_ops_bf16::rms_norm_bf16(&flat, Some(weight), NORM_EPS)?;
+    let normed = flame_core::norm::rms_norm(&flat, &[d], Some(weight), NORM_EPS)?;
     normed.reshape(&[b, h, s, d])
 }
 
@@ -1671,9 +1674,22 @@ fn double_block_fwd(
 
     let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
 
-    // attn_split_txt_img_bf16 falls back to narrow+permute+reshape when recording.
-    let (txt_attn, img_attn) =
-        flame_core::bf16_ops::attn_split_txt_img_bf16(&attn_out, n_t, n_img)?;
+    // 2026-05-09 fix: inline the narrow+permute+reshape split.
+    // `attn_split_txt_img_bf16`'s "autograd-aware" branch turned out to leave
+    // the dual-block LoRAs at zero (50-step smoke). Inlining the same ops at
+    // the call site dodges any kernel-fallback / dispatch issue and uses the
+    // autograd-clean primitives (narrow, permute, reshape all record their
+    // own ops). attn_out is `[B, H, N_total, D]` BF16 from cuDNN SDPA.
+    let txt_attn = attn_out
+        .narrow(2, 0, n_t)?
+        .permute(&[0, 2, 1, 3])?
+        .contiguous()?
+        .reshape(&[b, n_t, NUM_HEADS * HEAD_DIM])?;
+    let img_attn = attn_out
+        .narrow(2, n_t, n_img)?
+        .permute(&[0, 2, 1, 3])?
+        .contiguous()?
+        .reshape(&[b, n_img, NUM_HEADS * HEAD_DIM])?;
 
     let mut img_out = linear_bias_pt(&img_attn, get_w(weights, pfx, block_idx, "attn.to_out.0.weight")?, get_w(weights, pfx, block_idx, "attn.to_out.0.bias")?, pt)?;
     img_out = add_lora_delta_double(img_out, &img_attn, bundle, block_idx, DoubleLoraTarget::ImgOut)?;
