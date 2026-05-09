@@ -27,10 +27,25 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use cudarc::driver::CudaDevice;
 use flame_core::{parameter::Parameter, DType, Shape, Tensor};
+use crate::adapter::AdapterModule;
 use crate::config::TrainConfig;
 use crate::lora::LoRALinear;
+use crate::lycoris::{LycorisAlgo, LycorisBundleConfig};
 use crate::models::TrainableModel;
 use crate::Result;
+
+/// Per-block adapter slice — Klein's checkpoint-replay closures clone one of
+/// these per block per step. Legacy plain-LoRA path stores a `Vec<LoRALinear>`
+/// (kept for byte-identical training); LyCORIS path stores
+/// `Vec<Arc<dyn AdapterModule>>` so `Arc::clone` is the only cost.
+///
+/// Only one variant is populated per `KleinModel`. The forward path branches
+/// on `self.lyc_adapters.is_some()`.
+#[derive(Clone)]
+pub enum BlockAdapterSlice {
+    Legacy(Vec<LoRALinear>),
+    Lyc(Vec<Arc<dyn AdapterModule>>),
+}
 
 #[derive(Debug, Clone)]
 pub struct KleinConfig {
@@ -140,7 +155,19 @@ pub struct KleinModel {
     pub weights: HashMap<String, Tensor>,
     /// `num_double * 8 + num_single * 2` adapters in stable order
     /// (all double blocks first, then all single blocks).
+    ///
+    /// **Legacy LoRA path only.** When `lyc_adapters` is `Some`, this Vec is
+    /// empty and the LyCORIS path consumes `lyc_adapters` instead. Kept as
+    /// a dedicated field so the legacy code path is byte-identical to the
+    /// pre-LyCORIS commits — no trait-object dispatch, no `Arc` clones.
     pub lora_adapters: Vec<LoRALinear>,
+    /// LyCORIS adapter store, populated only when the trainer requests a
+    /// non-LoRA algo (`locon` / `loha` / `lokr` / `oft`, optionally DoRA).
+    /// Slot order matches `lora_adapters`.
+    pub lyc_adapters: Option<Vec<Arc<dyn AdapterModule>>>,
+    /// LyCORIS bundle config (algo, rank, alpha, dora flags). `None` on the
+    /// legacy path. Used for save metadata + log lines.
+    pub lyc_config: Option<LycorisBundleConfig>,
     pub parameters: Vec<Parameter>,
     pub is_lora: bool,
     /// When Some, per-block weights are streamed from pinned host RAM into
@@ -151,10 +178,30 @@ pub struct KleinModel {
 }
 
 impl KleinModel {
+    /// Convenience over [`load_with_lycoris`] that requests the legacy LoRA
+    /// path. Byte-identical to the pre-LyCORIS load.
     pub fn load(
         paths: &[std::path::PathBuf],
         config: &TrainConfig,
         device: Arc<CudaDevice>,
+    ) -> Result<Self> {
+        Self::load_with_lycoris(paths, config, device, None)
+    }
+
+    /// Same as [`load`], but accepts an optional [`LycorisBundleConfig`].
+    /// `None` (or `algo == None`) = legacy plain-LoRA path; non-None algo =
+    /// LyCORIS adapter store (LoCon / LoHa / LoKr / OFT, optionally DoRA).
+    ///
+    /// **Byte-equivalence**: when `lyc_cfg` is `None` OR
+    /// `lyc_cfg.algo == LycorisAlgo::None`, construction is bit-identical
+    /// to [`load`] — same `LoRALinear::new` calls, same seeds, same
+    /// `parameters` order. The Klein 5-step regression smoke is gated on
+    /// this path only.
+    pub fn load_with_lycoris(
+        paths: &[std::path::PathBuf],
+        config: &TrainConfig,
+        device: Arc<CudaDevice>,
+        lyc_cfg: Option<LycorisBundleConfig>,
     ) -> Result<Self> {
         let mut weights = HashMap::new();
         for p in paths {
@@ -170,21 +217,127 @@ impl KleinModel {
             kconfig.num_double, kconfig.num_single, kconfig.num_heads,
             if kconfig.inner_dim == 3072 { "4B" } else if kconfig.inner_dim == 4096 { "9B" } else { "?" },
         );
-        Self::new(weights, kconfig, config, device)
+        Self::new_inner(weights, kconfig, config, device, lyc_cfg)
     }
 
     /// Construct from already-loaded weights (used by sample_klein for the
-    /// base-only path that wants to skip the F32 parameter copy).
+    /// base-only path). Convenience over [`new_inner`] that requests the
+    /// legacy plain-LoRA path. Byte-identical to pre-LyCORIS commits.
     pub fn new(
         weights: HashMap<String, Tensor>,
         kconfig: KleinConfig,
         config: &TrainConfig,
         device: Arc<CudaDevice>,
     ) -> Result<Self> {
+        Self::new_inner(weights, kconfig, config, device, None)
+    }
+
+    /// Full constructor — `lyc_cfg = Some(cfg)` with a non-None algo switches
+    /// the LoRA branch over to LyCORIS adapters; otherwise the legacy
+    /// `LoRALinear` Vec is built unchanged.
+    pub fn new_inner(
+        weights: HashMap<String, Tensor>,
+        kconfig: KleinConfig,
+        config: &TrainConfig,
+        device: Arc<CudaDevice>,
+        lyc_cfg: Option<LycorisBundleConfig>,
+    ) -> Result<Self> {
         let is_lora = config.is_lora();
         let mut lora_adapters = Vec::new();
         let mut parameters = Vec::new();
-        if is_lora {
+        // Resolve the active LyCORIS config: anything that asks for the
+        // explicit `None` algo (or no config at all) takes the legacy path.
+        let lyc_active = lyc_cfg
+            .as_ref()
+            .filter(|c| c.algo != LycorisAlgo::None)
+            .cloned();
+        let mut lyc_adapters: Option<Vec<Arc<dyn AdapterModule>>> = None;
+        if is_lora && lyc_active.is_some() {
+            // ── LyCORIS path ──────────────────────────────────────────────
+            let cfg = lyc_active.as_ref().expect("checked above");
+            // Full algo can't ride the additive-delta forward path — the
+            // wrapper bails on `forward_delta` because it has no residual
+            // `x → ΔW(x)` form. Reject up front with a clear message.
+            if cfg.algo == LycorisAlgo::Full {
+                return Err(crate::EriDiffusionError::Model(
+                    "Klein LyCORIS: --algo full not yet supported (needs delta_weight \
+                     merge into base; forward_delta path is bail-only). Pick locon / \
+                     loha / lokr / oft instead.".into(),
+                ));
+            }
+            let inner = kconfig.inner_dim;
+            let mlp = kconfig.mlp_hidden;
+            // (in_features, out_features) per slot — mirrors the legacy
+            // `LoRALinear::new` shape arguments exactly.
+            let double_io: [(usize, usize); DOUBLE_LORA_SLOTS] = [
+                (inner, inner),     (inner, inner),     (inner, inner),     (inner, inner),
+                (inner, inner),     (inner, inner),     (inner, inner),     (inner, inner),
+                (inner, 2 * mlp),   (mlp, inner),       (inner, 2 * mlp),   (mlp, inner),
+            ];
+            let single_io: [(usize, usize); SINGLE_LORA_SLOTS] = [
+                (inner, 3 * inner + 2 * mlp),
+                (inner + mlp, inner),
+            ];
+            let mut store = crate::lycoris::AdapterStore::new(cfg.clone(), device.clone());
+            for i in 0..kconfig.num_double {
+                for slot in 0..DOUBLE_LORA_SLOTS {
+                    let (in_f, out_f) = double_io[slot];
+                    let name = format!("double_blocks.{i}.{}", DOUBLE_LORA_KEYS[slot]);
+                    // DoRA `w_orig`: split-Q/K/V slots (0..=2, 4..=6) point
+                    // at the FUSED `*_attn.qkv.weight` `[3*inner, inner]`
+                    // tensor — wrong shape for per-slice magnitude. Skip
+                    // DoRA on those slots; rest map directly to `*.weight`.
+                    let w_orig = if cfg.dora {
+                        let key = match slot {
+                            0..=2 | 4..=6 => None,
+                            3 => Some(format!("double_blocks.{i}.img_attn.proj.weight")),
+                            7 => Some(format!("double_blocks.{i}.txt_attn.proj.weight")),
+                            8 => Some(format!("double_blocks.{i}.img_mlp.0.weight")),
+                            9 => Some(format!("double_blocks.{i}.img_mlp.2.weight")),
+                            10 => Some(format!("double_blocks.{i}.txt_mlp.0.weight")),
+                            11 => Some(format!("double_blocks.{i}.txt_mlp.2.weight")),
+                            _ => None,
+                        };
+                        key.as_ref().and_then(|k| weights.get(k))
+                    } else { None };
+                    store.build_and_push_linear(&name, in_f, out_f, w_orig)
+                        .map_err(|e| crate::EriDiffusionError::Model(format!(
+                            "Klein LyCORIS double {i} slot {slot} ({}): {e}",
+                            DOUBLE_LORA_KEYS[slot]
+                        )))?;
+                }
+            }
+            for i in 0..kconfig.num_single {
+                for slot in 0..SINGLE_LORA_SLOTS {
+                    let (in_f, out_f) = single_io[slot];
+                    let name = format!("single_blocks.{i}.{}", SINGLE_LORA_KEYS[slot]);
+                    let w_orig = if cfg.dora {
+                        let key = format!("single_blocks.{i}.{}.weight", SINGLE_LORA_KEYS[slot]);
+                        weights.get(&key)
+                    } else { None };
+                    store.build_and_push_linear(&name, in_f, out_f, w_orig)
+                        .map_err(|e| crate::EriDiffusionError::Model(format!(
+                            "Klein LyCORIS single {i} slot {slot} ({}): {e}",
+                            SINGLE_LORA_KEYS[slot]
+                        )))?;
+                }
+            }
+            // Optimizer parameters: walk the store's flat parameter list.
+            parameters.extend(store.to_parameters());
+            // Move adapters out as `Arc<dyn AdapterModule>` so closures can
+            // clone references cheaply.
+            let arc_adapters: Vec<Arc<dyn AdapterModule>> = store
+                .adapters
+                .into_iter()
+                .map(|b| Arc::<dyn AdapterModule>::from(b))
+                .collect();
+            log::info!(
+                "Klein LyCORIS bundle: algo={} rank={} alpha={} dora={} adapters={} optim_params={}",
+                cfg.algo.as_str(), cfg.rank, cfg.alpha, cfg.dora,
+                arc_adapters.len(), parameters.len(),
+            );
+            lyc_adapters = Some(arc_adapters);
+        } else if is_lora {
             let rank = config.lora_rank as usize;
             let alpha = config.lora_alpha as f32;
             let inner = kconfig.inner_dim;
@@ -233,7 +386,8 @@ impl KleinModel {
             weights.len(), parameters.len(), is_lora);
         Ok(Self {
             config: config.clone(), kconfig, device,
-            weights, lora_adapters, parameters, is_lora,
+            weights, lora_adapters, lyc_adapters, lyc_config: lyc_active,
+            parameters, is_lora,
             offloader: None,
         })
     }
@@ -408,6 +562,56 @@ fn linear_with_split_qkv_lora(
     base.add(&delta)
 }
 
+/// LyCORIS-mirror of [`linear_with_lora`]. Routes per-target delta through
+/// the [`AdapterModule`] trait so LoCon / LoHa / LoKr / OFT all use the
+/// same call site. OFT is multiplicative-on-input rather than additive,
+/// but `LycorisLinear::forward_delta` returns `R·x − x` for OFT so
+/// `base + delta` collapses correctly when the base is the identity (Klein
+/// `base = x @ W^T` matches that contract).
+fn linear_with_lora_dyn(
+    x: &Tensor,
+    w: &Tensor,
+    adapter: Option<&dyn AdapterModule>,
+) -> flame_core::Result<Tensor> {
+    let base = linear_3d(x, w)?;
+    match adapter {
+        Some(a) => {
+            let delta = a.forward_delta(x)?;
+            base.add(&delta)
+        }
+        None => Ok(base),
+    }
+}
+
+/// LyCORIS-mirror of [`linear_with_split_qkv_lora`]. Same per-slice
+/// concatenation strategy as the legacy LoRA version, just dispatched
+/// through the [`AdapterModule`] trait.
+fn linear_with_split_qkv_lora_dyn(
+    x: &Tensor,
+    w_fused_qkv: &Tensor,
+    lora_q: Option<&dyn AdapterModule>,
+    lora_k: Option<&dyn AdapterModule>,
+    lora_v: Option<&dyn AdapterModule>,
+) -> flame_core::Result<Tensor> {
+    let base = linear_3d(x, w_fused_qkv)?;
+    if lora_q.is_none() && lora_k.is_none() && lora_v.is_none() {
+        return Ok(base);
+    }
+    let zeros_like_inner = || -> flame_core::Result<Tensor> {
+        let last = *base.shape().dims().last().unwrap();
+        debug_assert!(last % 3 == 0, "linear_with_split_qkv_lora_dyn: fused QKV last dim {} not divisible by 3", last);
+        let inner = last / 3;
+        let mut shape = base.shape().dims().to_vec();
+        *shape.last_mut().unwrap() = inner;
+        Tensor::zeros_dtype(Shape::from_dims(&shape), base.dtype(), base.device().clone())
+    };
+    let dq = match lora_q { Some(a) => a.forward_delta(x)?, None => zeros_like_inner()? };
+    let dk = match lora_k { Some(a) => a.forward_delta(x)?, None => zeros_like_inner()? };
+    let dv = match lora_v { Some(a) => a.forward_delta(x)?, None => zeros_like_inner()? };
+    let delta = Tensor::cat(&[&dq, &dk, &dv], dq.shape().dims().len() - 1)?;
+    base.add(&delta)
+}
+
 /// Sinusoidal timestep embedding (ComfyUI convention, time_factor=1000).
 fn timestep_embedding(
     t: &Tensor, dim: usize, time_factor: f32,
@@ -511,7 +715,7 @@ fn double_block_forward_standalone(
     pe_cos: Tensor,
     pe_sin: Tensor,
     layer_weights: HashMap<String, Tensor>,
-    lora_adapters: Option<Vec<LoRALinear>>,
+    adapters: Option<BlockAdapterSlice>,
     block_idx: usize,
     num_heads: usize,
     head_dim: usize,
@@ -527,8 +731,16 @@ fn double_block_forward_standalone(
     let lin = |x: &Tensor, key_suffix: &str, lora_idx: usize| -> flame_core::Result<Tensor> {
         let key = format!("{prefix}.{key_suffix}.weight");
         let weight = w(&key)?;
-        let adapter = lora_adapters.as_ref().and_then(|a| a.get(lora_idx));
-        linear_with_lora(x, weight, adapter)
+        match &adapters {
+            Some(BlockAdapterSlice::Legacy(v)) => {
+                linear_with_lora(x, weight, v.get(lora_idx))
+            }
+            Some(BlockAdapterSlice::Lyc(v)) => {
+                let a: Option<&dyn AdapterModule> = v.get(lora_idx).map(|arc| arc.as_ref());
+                linear_with_lora_dyn(x, weight, a)
+            }
+            None => linear_with_lora(x, weight, None),
+        }
     };
     // Fused-QKV linear with 3 separate Q/K/V LoRAs (audit fix H1.3 / H3).
     let lin_qkv_split = |x: &Tensor, key_suffix: &str,
@@ -536,10 +748,21 @@ fn double_block_forward_standalone(
                          -> flame_core::Result<Tensor> {
         let key = format!("{prefix}.{key_suffix}.weight");
         let weight = w(&key)?;
-        let lq = lora_adapters.as_ref().and_then(|a| a.get(lora_q_idx));
-        let lk = lora_adapters.as_ref().and_then(|a| a.get(lora_k_idx));
-        let lv = lora_adapters.as_ref().and_then(|a| a.get(lora_v_idx));
-        linear_with_split_qkv_lora(x, weight, lq, lk, lv)
+        match &adapters {
+            Some(BlockAdapterSlice::Legacy(v)) => {
+                linear_with_split_qkv_lora(
+                    x, weight,
+                    v.get(lora_q_idx), v.get(lora_k_idx), v.get(lora_v_idx),
+                )
+            }
+            Some(BlockAdapterSlice::Lyc(v)) => {
+                let lq: Option<&dyn AdapterModule> = v.get(lora_q_idx).map(|a| a.as_ref());
+                let lk: Option<&dyn AdapterModule> = v.get(lora_k_idx).map(|a| a.as_ref());
+                let lv: Option<&dyn AdapterModule> = v.get(lora_v_idx).map(|a| a.as_ref());
+                linear_with_split_qkv_lora_dyn(x, weight, lq, lk, lv)
+            }
+            None => linear_with_split_qkv_lora(x, weight, None, None, None),
+        }
     };
 
     let (img_shift1, img_scale1, img_gate1) = (&img_mods[0], &img_mods[1], &img_mods[2]);
@@ -624,7 +847,7 @@ fn single_block_forward_standalone(
     pe_cos: Tensor,
     pe_sin: Tensor,
     layer_weights: HashMap<String, Tensor>,
-    lora_adapters: Option<Vec<LoRALinear>>,
+    adapters: Option<BlockAdapterSlice>,
     block_idx: usize,
     num_heads: usize,
     head_dim: usize,
@@ -641,8 +864,16 @@ fn single_block_forward_standalone(
     let lin = |x: &Tensor, key_suffix: &str, lora_idx: usize| -> flame_core::Result<Tensor> {
         let key = format!("{prefix}.{key_suffix}.weight");
         let weight = w(&key)?;
-        let adapter = lora_adapters.as_ref().and_then(|a| a.get(lora_idx));
-        linear_with_lora(x, weight, adapter)
+        match &adapters {
+            Some(BlockAdapterSlice::Legacy(v)) => {
+                linear_with_lora(x, weight, v.get(lora_idx))
+            }
+            Some(BlockAdapterSlice::Lyc(v)) => {
+                let a: Option<&dyn AdapterModule> = v.get(lora_idx).map(|arc| arc.as_ref());
+                linear_with_lora_dyn(x, weight, a)
+            }
+            None => linear_with_lora(x, weight, None),
+        }
     };
 
     let (shift, scale, gate) = (&mods[0], &mods[1], &mods[2]);
@@ -841,8 +1072,16 @@ impl KleinModel {
                 if k.starts_with(&prefix) { layer_weights.insert(k.clone(), v.clone()); }
             }
             let lora_base = i * DOUBLE_LORA_SLOTS;
-            let lora = if self.is_lora {
-                Some(self.lora_adapters[lora_base..lora_base + DOUBLE_LORA_SLOTS].to_vec())
+            let lora: Option<BlockAdapterSlice> = if self.is_lora {
+                if let Some(ref lyc) = self.lyc_adapters {
+                    Some(BlockAdapterSlice::Lyc(
+                        lyc[lora_base..lora_base + DOUBLE_LORA_SLOTS].to_vec(),
+                    ))
+                } else {
+                    Some(BlockAdapterSlice::Legacy(
+                        self.lora_adapters[lora_base..lora_base + DOUBLE_LORA_SLOTS].to_vec(),
+                    ))
+                }
             } else { None };
 
             let img_in = img.clone();
@@ -929,8 +1168,16 @@ impl KleinModel {
             let prefix = format!("single_blocks.{i}.");
             let unified_idx = self.kconfig.num_double + i;
             let lora_base = self.kconfig.num_double * DOUBLE_LORA_SLOTS + i * SINGLE_LORA_SLOTS;
-            let lora = if self.is_lora {
-                Some(self.lora_adapters[lora_base..lora_base + SINGLE_LORA_SLOTS].to_vec())
+            let lora: Option<BlockAdapterSlice> = if self.is_lora {
+                if let Some(ref lyc) = self.lyc_adapters {
+                    Some(BlockAdapterSlice::Lyc(
+                        lyc[lora_base..lora_base + SINGLE_LORA_SLOTS].to_vec(),
+                    ))
+                } else {
+                    Some(BlockAdapterSlice::Legacy(
+                        self.lora_adapters[lora_base..lora_base + SINGLE_LORA_SLOTS].to_vec(),
+                    ))
+                }
             } else { None };
 
             let x_in = x.clone();
@@ -1112,21 +1359,45 @@ impl TrainableModel for KleinModel {
                 "save_weights for non-LoRA Klein not implemented".into()));
         }
         let mut out = HashMap::new();
-        // Double blocks: 8 adapters each
-        let mut k = 0;
-        for i in 0..self.kconfig.num_double {
-            for slot in 0..DOUBLE_LORA_SLOTS {
-                let prefix = format!("double_blocks.{i}.{}", DOUBLE_LORA_KEYS[slot]);
-                self.lora_adapters[k].save_tensors(&prefix, &mut out)?;
-                k += 1;
+        if let Some(ref lyc) = self.lyc_adapters {
+            // ── LyCORIS save ────────────────────────────────────────────
+            // Same (block, slot) order as `named_parameters()`. Per-adapter
+            // suffixes come from `AdapterModule::named_tensors()` (algo-specific).
+            let mut k = 0;
+            for i in 0..self.kconfig.num_double {
+                for slot in 0..DOUBLE_LORA_SLOTS {
+                    let prefix = format!("double_blocks.{i}.{}", DOUBLE_LORA_KEYS[slot]);
+                    for (suffix, t) in lyc[k].named_tensors() {
+                        out.insert(format!("{prefix}.{suffix}"), t);
+                    }
+                    k += 1;
+                }
             }
-        }
-        // Single blocks: 2 adapters each
-        for i in 0..self.kconfig.num_single {
-            for slot in 0..SINGLE_LORA_SLOTS {
-                let prefix = format!("single_blocks.{i}.{}", SINGLE_LORA_KEYS[slot]);
-                self.lora_adapters[k].save_tensors(&prefix, &mut out)?;
-                k += 1;
+            for i in 0..self.kconfig.num_single {
+                for slot in 0..SINGLE_LORA_SLOTS {
+                    let prefix = format!("single_blocks.{i}.{}", SINGLE_LORA_KEYS[slot]);
+                    for (suffix, t) in lyc[k].named_tensors() {
+                        out.insert(format!("{prefix}.{suffix}"), t);
+                    }
+                    k += 1;
+                }
+            }
+        } else {
+            // ── Legacy LoRA save (BYTE-IDENTICAL to pre-LyCORIS) ────────
+            let mut k = 0;
+            for i in 0..self.kconfig.num_double {
+                for slot in 0..DOUBLE_LORA_SLOTS {
+                    let prefix = format!("double_blocks.{i}.{}", DOUBLE_LORA_KEYS[slot]);
+                    self.lora_adapters[k].save_tensors(&prefix, &mut out)?;
+                    k += 1;
+                }
+            }
+            for i in 0..self.kconfig.num_single {
+                for slot in 0..SINGLE_LORA_SLOTS {
+                    let prefix = format!("single_blocks.{i}.{}", SINGLE_LORA_KEYS[slot]);
+                    self.lora_adapters[k].save_tensors(&prefix, &mut out)?;
+                    k += 1;
+                }
             }
         }
         flame_core::serialization::save_file(&out, std::path::Path::new(path))
@@ -1139,6 +1410,19 @@ impl TrainableModel for KleinModel {
         if !self.is_lora {
             return Err(crate::EriDiffusionError::Model(
                 "load_weights for non-LoRA Klein not implemented".into()));
+        }
+        if self.lyc_adapters.is_some() {
+            // Per-algo in-place tensor population for the LyCORIS variants
+            // requires `set_data` on each algo's bare-`Tensor` fields, which
+            // means duplicating the algo enum match here. Defer to a Phase
+            // 2c follow-up. `--resume-full` works through the optimizer's
+            // shared `Parameter` handles for both legacy and LyCORIS paths.
+            return Err(crate::EriDiffusionError::Model(
+                "load_weights for Klein LyCORIS path is not yet implemented \
+                 (Phase 2c). Use --resume-full to restore through the \
+                 optimizer's parameter list — works for both legacy LoRA and \
+                 LyCORIS bundles via shared Parameter handles.".into(),
+            ));
         }
         let source = flame_core::serialization::load_file(
             std::path::Path::new(path), &self.device,
@@ -1170,6 +1454,43 @@ impl KleinModel {
     /// single_blocks.{i}.{suffix}.lora_{A,B}.weight). Iteration order is
     /// deterministic (block index ascending, slot ascending, A then B).
     pub fn named_parameters(&self) -> Vec<(String, Parameter)> {
+        if let Some(ref lyc) = self.lyc_adapters {
+            // LyCORIS path: emit `<prefix>.<algo-specific-suffix>` names that
+            // match the on-disk safetensors keys. Pair each leaf with its
+            // matching `Parameter` from the same position in the
+            // `to_parameters()` vector — both walks share the
+            // `parameters()` (= `named_tensors()`) order in `AdapterModule`.
+            let mut out: Vec<(String, Parameter)> = Vec::new();
+            let mut k = 0usize;
+            for i in 0..self.kconfig.num_double {
+                for slot in 0..DOUBLE_LORA_SLOTS {
+                    let prefix = format!("double_blocks.{i}.{}", DOUBLE_LORA_KEYS[slot]);
+                    let nt = lyc[k].named_tensors();
+                    let pp = lyc[k].to_parameters();
+                    debug_assert_eq!(nt.len(), pp.len(),
+                        "AdapterModule contract: named_tensors and to_parameters length mismatch");
+                    for ((suffix, _), param) in nt.iter().zip(pp.into_iter()) {
+                        out.push((format!("{prefix}.{suffix}"), param));
+                    }
+                    k += 1;
+                }
+            }
+            for i in 0..self.kconfig.num_single {
+                for slot in 0..SINGLE_LORA_SLOTS {
+                    let prefix = format!("single_blocks.{i}.{}", SINGLE_LORA_KEYS[slot]);
+                    let nt = lyc[k].named_tensors();
+                    let pp = lyc[k].to_parameters();
+                    debug_assert_eq!(nt.len(), pp.len(),
+                        "AdapterModule contract: named_tensors and to_parameters length mismatch");
+                    for ((suffix, _), param) in nt.iter().zip(pp.into_iter()) {
+                        out.push((format!("{prefix}.{suffix}"), param));
+                    }
+                    k += 1;
+                }
+            }
+            return out;
+        }
+        // ── Legacy plain-LoRA path ──────────────────────────────────────
         let mut out = Vec::with_capacity(self.lora_adapters.len() * 2);
         let mut k = 0;
         for i in 0..self.kconfig.num_double {

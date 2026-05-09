@@ -33,6 +33,7 @@ use clap::{Parser, ValueEnum};
 use flame_core::{adam::AdamW, autograd::AutogradContext, DType, Shape, Tensor};
 use eridiffusion_core::config::{LrScheduler, TrainConfig, TrainingMethod};
 use eridiffusion_core::encoders::flux_vae::{SCALE, SHIFT};
+use eridiffusion_core::lycoris::{LycorisAlgo, LycorisBundleConfig};
 use eridiffusion_core::models::{flux::FluxModel, TrainableModel};
 use eridiffusion_core::sampler::flux_sampler::{build_img_ids, build_txt_ids, pack_latents};
 use eridiffusion_core::training::board::BoardWriter;
@@ -142,6 +143,40 @@ struct Args {
     #[arg(long, default_value_t = 0)] warmup_steps: usize,
     /// Phase 5: cosine-with-restarts cycle count.
     #[arg(long, default_value_t = 1.0)] lr_cycles: f32,
+
+    // ── Phase 2b: LyCORIS algo selection ───────────────────────────────
+    // Default `lora` keeps the legacy `FluxLoraBundle` path (byte-identical
+    // to pre-LyCORIS commits). Other values switch to `FluxLycorisBundle`:
+    // - `locon` — LoRA + Conv2d. Linear-only here so identical to plain
+    //   LoRA at the call-site, but uses the lycoris-rs leaves (different
+    //   init RNG, different storage layout).
+    // - `loha`  — Hadamard product LoRA.
+    // - `lokr`  — Kronecker product LoRA. See `--lokr-factor`.
+    // - `full`  — full-weight delta. Non-residual; trainer-side merge required
+    //   (Phase 2b plumbs the bundle path; merge-side is a follow-up).
+    // - `oft`   — Orthogonal Fine-Tuning (Diag-OFT). See `--oft-block-size`,
+    //   `--oft-neumann-terms`.
+    // Combine with `--dora` to layer DoRA on any of the above (except OFT).
+    /// LyCORIS algorithm selector. Default `lora` keeps the legacy
+    /// plain-LoRA path byte-identical.
+    #[arg(long, default_value = "lora")] algo: String,
+    /// LoKr Kronecker split factor (default 16). Ignored for non-LoKr algos.
+    #[arg(long, default_value_t = 16)] lokr_factor: i32,
+    /// OFT block size (default 32). Ignored for non-OFT algos.
+    #[arg(long, default_value_t = 32)] oft_block_size: usize,
+    /// OFT Cayley-Neumann series term count (default 5). Ignored for non-OFT.
+    #[arg(long, default_value_t = 5)] oft_neumann_terms: usize,
+    /// LoCon / LoHa / LoKr conv variant — Tucker decomposition for non-1×1.
+    /// Linear adapters ignore this flag.
+    #[arg(long, default_value_t = false)] use_tucker: bool,
+    /// LoKr only: factorize both W1 and W2 (default false: only W2).
+    #[arg(long, default_value_t = false)] decompose_both: bool,
+    /// Enable DoRA (weight-decomposed LoRA) on the adapter stack. Applies to
+    /// LoCon / LoHa / LoKr / Full; not OFT.
+    #[arg(long, default_value_t = false)] dora: bool,
+    /// DoRA axis convention. `true` (default) = lycoris-upstream norm over
+    /// input dims; `false` = OneTrainer norm over output dim.
+    #[arg(long, default_value_t = true)] dora_wd_on_out: bool,
 }
 
 /// LOGIT_NORMAL timestep sample matching OT `_get_timestep_discrete`.
@@ -218,12 +253,41 @@ fn main() -> anyhow::Result<()> {
     config.tread_route_pattern = args.tread_route_pattern.clone();
 
     let shards = collect_shards(&args.transformer)?;
-    log::info!("[Flux] loading transformer from {} shard(s) (variant={:?}, rank={}, alpha={})...",
-        shards.len(), args.variant, args.rank, args.lora_alpha);
+    log::info!("[Flux] loading transformer from {} shard(s) (variant={:?}, rank={}, alpha={}, algo={})...",
+        shards.len(), args.variant, args.rank, args.lora_alpha, args.algo);
 
-    // Per-shard load via FluxModel::load — pass the first shard (typical Flux release ships
-    // a single `flux1-dev.safetensors`); auto-detection of has_guidance happens from the keys.
-    let mut model = FluxModel::load(&shards[0], &config, device.clone())?;
+    // Phase 2b: parse `--algo`. `lora`/`none` → legacy `FluxLoraBundle`
+    // (byte-identical to pre-LyCORIS commits). Anything else → LyCORIS bundle.
+    // Build a `LycorisBundleConfig` either way; the model dispatches on
+    // `LycorisAlgo::None` to pick the legacy path.
+    let lyc_algo = LycorisAlgo::parse(&args.algo)
+        .map_err(|e| anyhow::anyhow!("--algo: {e}"))?;
+    let lyc_cfg = if lyc_algo == LycorisAlgo::None {
+        None
+    } else {
+        let mut cfg = LycorisBundleConfig::default();
+        cfg.algo = lyc_algo;
+        cfg.rank = args.rank;
+        cfg.alpha = args.lora_alpha as f32;
+        cfg.factor = args.lokr_factor;
+        cfg.block_size = args.oft_block_size;
+        cfg.neumann_terms = args.oft_neumann_terms;
+        cfg.use_tucker = args.use_tucker;
+        cfg.decompose_both = args.decompose_both;
+        cfg.dora = args.dora;
+        cfg.dora_wd_on_out = args.dora_wd_on_out;
+        log::info!(
+            "[Flux] LyCORIS config: algo={} rank={} alpha={} dora={} (wd_on_out={}) factor={} oft_block={} use_tucker={} decompose_both={}",
+            cfg.algo.as_str(), cfg.rank, cfg.alpha, cfg.dora, cfg.dora_wd_on_out,
+            cfg.factor, cfg.block_size, cfg.use_tucker, cfg.decompose_both,
+        );
+        Some(cfg)
+    };
+
+    // Per-shard load via FluxModel::load{,_with_lycoris} — pass the first
+    // shard (typical Flux release ships a single `flux1-dev.safetensors`);
+    // auto-detection of has_guidance happens from the keys.
+    let mut model = FluxModel::load_with_lycoris(&shards[0], &config, device.clone(), lyc_cfg)?;
     // Variant override: if the user explicitly says Schnell, force guidance off even if
     // the checkpoint accidentally has guidance keys (and vice-versa for Dev).
     match args.variant {
@@ -357,9 +421,15 @@ fn main() -> anyhow::Result<()> {
     if let Some(resume_path) = args.resume_full.as_ref() {
         log::info!("Full-resume from {}", resume_path.display());
         let loaded = checkpoint::load_full(resume_path, &device)?;
-        let bundle = model.bundle.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Flux full-resume requires LoRA mode"))?;
-        let named = bundle.named_parameters();
+        // Phase 2b: full-resume from either bundle. Order: legacy LoRA first
+        // (mutually exclusive at construction time, so at most one matches).
+        let named = if let Some(ref bundle) = model.bundle {
+            bundle.named_parameters()
+        } else if let Some(ref lb) = model.lycoris_bundle {
+            lb.named_parameters()
+        } else {
+            anyhow::bail!("Flux full-resume requires LoRA or LyCORIS mode");
+        };
         checkpoint::apply_lora_weights(&loaded, &named)?;
         checkpoint::apply_to_optimizer(&loaded, &mut opt, &named, args.rank, args.lora_alpha as f32)?;
         start_step = loaded.header.step as usize;
@@ -752,9 +822,14 @@ fn main() -> anyhow::Result<()> {
                     "train_flux", step_num as u64, &opt,
                     args.rank, args.lora_alpha as f32, SEED, String::new(),
                 );
-                let named = model.bundle.as_ref()
-                    .map(|b| b.named_parameters())
-                    .unwrap_or_default();
+                // Phase 2b: prefer legacy LoRA bundle; fall back to LyCORIS.
+                let named = if let Some(ref b) = model.bundle {
+                    b.named_parameters()
+                } else if let Some(ref lb) = model.lycoris_bundle {
+                    lb.named_parameters()
+                } else {
+                    Vec::new()
+                };
                 if let Err(e) = checkpoint::save_full(&mid_ckpt, &named, &opt, &header) {
                     log::warn!("[save step {step_num}] full save failed: {e}");
                 }
@@ -792,9 +867,14 @@ fn main() -> anyhow::Result<()> {
             "train_flux", args.steps as u64, &opt,
             args.rank, args.lora_alpha as f32, SEED, String::new(),
         );
-        let named = model.bundle.as_ref()
-            .map(|b| b.named_parameters())
-            .unwrap_or_default();
+        // Phase 2b: prefer legacy LoRA bundle; fall back to LyCORIS.
+        let named = if let Some(ref b) = model.bundle {
+            b.named_parameters()
+        } else if let Some(ref lb) = model.lycoris_bundle {
+            lb.named_parameters()
+        } else {
+            Vec::new()
+        };
         if let Err(e) = checkpoint::save_full(&ckpt, &named, &opt, &header) {
             log::warn!("save_full failed: {e}");
         } else {

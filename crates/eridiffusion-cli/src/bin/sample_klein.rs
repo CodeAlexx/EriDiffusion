@@ -195,6 +195,10 @@ fn main() -> anyhow::Result<()> {
             device: device.clone(),
             weights: all_weights,
             lora_adapters: Vec::new(),
+            // sample_klein is base-only; both LyCORIS fields stay None to
+            // mirror the legacy zero-LoRA inference path.
+            lyc_adapters: None,
+            lyc_config: None,
             parameters: Vec::new(),
             is_lora: false,
             offloader: None,

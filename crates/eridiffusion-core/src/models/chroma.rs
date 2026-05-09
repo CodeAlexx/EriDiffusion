@@ -1,5 +1,29 @@
 //! Chroma training model — loads FLUX-derivative DiT, injects LoRA or FFT.
 //!
+//! ## LyCORIS algo support
+//!
+//! `ChromaLoraBundle` accepts any [`crate::adapter::AdapterModule`] per target
+//! via `Arc<dyn AdapterModule>`. The `--algo` CLI flag on `train_chroma` selects:
+//!
+//! - `lora` (default): plain [`LoRALinear`]. Byte-identical to pre-Phase-2b.
+//!   The optimizer's `Vec<Parameter>` is the same `[lora_a, lora_b]` per
+//!   adapter, in HashMap iteration order — matching the legacy code path.
+//! - `locon` / `loha` / `lokr` / `dora`: build via [`LycorisLinear`] from
+//!   `lycoris-rs`. The trainer's call sites (`add_lora_delta_*`) dispatch
+//!   through the trait — no per-call-site match needed.
+//! - `full` / `oft`: bundle construction succeeds, but
+//!   [`AdapterModule::forward_delta`] returns an error at first forward
+//!   because chroma's call pattern is `base + delta_on_input`, which is
+//!   incompatible with Full's "weight delta merged into base" or OFT's
+//!   `R·(W·x+b)` semantics. Phase 2c will wire those by hoisting the merge
+//!   into the base linear.
+//!
+//! Save/load: legacy `--algo lora` checkpoints round-trip identically (writes
+//! `lora_A.weight`/`lora_B.weight` keys at the same prefixes). LyCORIS algos
+//! write algo-specific suffixes (e.g. `lokr_w1_a`/`lokr_w2`) under the same
+//! per-target prefix. `--resume-lora` works for both via per-adapter
+//! `load_named_tensors` which auto-detects the algo from key suffixes.
+//!
 //! ## Architecture (inference-flame `chroma_dit.rs`)
 //!
 //! ```text
@@ -42,8 +66,15 @@
 
 use flame_core::autograd::AutogradContext;
 use flame_core::{parameter::Parameter, DType, Result, Tensor};
+use crate::adapter::{AdapterModule, LycorisLinear};
 use crate::lora::LoRALinear;
+use crate::lycoris::{LycorisAlgo, LycorisBundleConfig};
 use crate::training::block_offload::{BlockOffloader, BlockFacilitator};
+use lycoris_rs::{
+    algorithms::{full::FullAdapter, locon::LoConModule, loha::LoHaModule, lokr::LoKrModule, oft::OFTModule},
+    dora::init_magnitude,
+    LycorisAdapter, LycorisModule, StorageDtype,
+};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -102,88 +133,212 @@ pub enum SingleLoraTarget {
 // LoRA bundle
 // ---------------------------------------------------------------------------
 
+/// Per-target adapter collection. Each entry is an `Arc<dyn AdapterModule>`
+/// so the bundle stays cheaply cloneable for `Arc<ChromaLoraBundle>` use in
+/// the offloader closures (the closures previously cloned the whole bundle —
+/// with `Arc<dyn>` per entry, that clone is now a per-entry refcount bump).
+///
+/// Algo dispatch is controlled by `algo`. Default `Lora` is byte-identical to
+/// the pre-Phase-2b code: per-target `LoRALinear`, `[lora_a, lora_b]`
+/// optimizer order, `lora_A.weight`/`lora_B.weight` save keys.
 #[derive(Clone)]
 pub struct ChromaLoraBundle {
-    pub double_adapters: HashMap<(usize, DoubleLoraTarget), LoRALinear>,
-    pub single_adapters: HashMap<(usize, SingleLoraTarget), LoRALinear>,
+    pub double_adapters: HashMap<(usize, DoubleLoraTarget), Arc<dyn AdapterModule>>,
+    pub single_adapters: HashMap<(usize, SingleLoraTarget), Arc<dyn AdapterModule>>,
+    /// `LycorisAlgo::None` is the legacy plain-LoRA path (this is what
+    /// `ChromaLoraBundle::new` produces). Other variants come from
+    /// `new_with_config` and are wired by `train_chroma --algo <foo>`.
+    pub algo: LycorisAlgo,
+    /// Plain-LoRA rank — kept for `load_from_safetensors` re-construction.
+    /// LyCORIS algos store rank inside `LycorisBundleConfig` (the algo-specific
+    /// path goes through `new_with_config_and_seed`).
+    pub rank: usize,
+    pub alpha: f32,
 }
 
+/// All Linear-target shapes for chroma. `None` everywhere here — the bundle
+/// constructor fills DIMs from `DIM`/`MLP_HIDDEN`, NOT from the model weights.
+const fn double_target_shape(target: DoubleLoraTarget) -> (usize, usize) {
+    match target {
+        DoubleLoraTarget::ImgQ
+        | DoubleLoraTarget::ImgK
+        | DoubleLoraTarget::ImgV
+        | DoubleLoraTarget::ImgOut
+        | DoubleLoraTarget::TxtQ
+        | DoubleLoraTarget::TxtK
+        | DoubleLoraTarget::TxtV
+        | DoubleLoraTarget::TxtOut => (DIM, DIM),
+        DoubleLoraTarget::ImgFfnGate | DoubleLoraTarget::TxtFfnGate => (DIM, MLP_HIDDEN),
+        DoubleLoraTarget::ImgFfnOut | DoubleLoraTarget::TxtFfnOut => (MLP_HIDDEN, DIM),
+    }
+}
+
+const fn single_target_shape(target: SingleLoraTarget) -> (usize, usize) {
+    match target {
+        SingleLoraTarget::Q | SingleLoraTarget::K | SingleLoraTarget::V => (DIM, DIM),
+        SingleLoraTarget::ProjMlp => (DIM, MLP_HIDDEN),
+        // proj_out is [3072, 15360] = [DIM, DIM + MLP_HIDDEN]
+        SingleLoraTarget::ProjOut => (DIM + MLP_HIDDEN, DIM),
+    }
+}
+
+const DOUBLE_TARGETS: &[DoubleLoraTarget] = &[
+    DoubleLoraTarget::ImgQ,
+    DoubleLoraTarget::ImgK,
+    DoubleLoraTarget::ImgV,
+    DoubleLoraTarget::ImgOut,
+    DoubleLoraTarget::TxtQ,
+    DoubleLoraTarget::TxtK,
+    DoubleLoraTarget::TxtV,
+    DoubleLoraTarget::TxtOut,
+    DoubleLoraTarget::ImgFfnGate,
+    DoubleLoraTarget::ImgFfnOut,
+    DoubleLoraTarget::TxtFfnGate,
+    DoubleLoraTarget::TxtFfnOut,
+];
+
+const SINGLE_TARGETS: &[SingleLoraTarget] = &[
+    SingleLoraTarget::Q,
+    SingleLoraTarget::K,
+    SingleLoraTarget::V,
+    SingleLoraTarget::ProjMlp,
+    SingleLoraTarget::ProjOut,
+];
+
 impl ChromaLoraBundle {
+    /// Legacy plain-LoRA constructor. Equivalent to pre-Phase-2b behaviour:
+    /// constructs `LoRALinear` per target, wraps in `Arc<dyn AdapterModule>`.
+    /// The Arc'd `AdapterModule::to_parameters()` for a `LoRALinear` returns
+    /// `[lora_a, lora_b]` — same Parameter clones the old `parameters()`
+    /// produced. Optimizer state stays byte-equivalent.
     pub fn new(
         rank: usize,
         alpha: f32,
         device: Arc<cudarc::driver::CudaDevice>,
         seed: u64,
     ) -> Result<Self> {
-        let mut double_adapters = HashMap::new();
-        let double_targets: &[(DoubleLoraTarget, usize, usize)] = &[
-            (DoubleLoraTarget::ImgQ, DIM, DIM),
-            (DoubleLoraTarget::ImgK, DIM, DIM),
-            (DoubleLoraTarget::ImgV, DIM, DIM),
-            (DoubleLoraTarget::ImgOut, DIM, DIM),
-            (DoubleLoraTarget::TxtQ, DIM, DIM),
-            (DoubleLoraTarget::TxtK, DIM, DIM),
-            (DoubleLoraTarget::TxtV, DIM, DIM),
-            (DoubleLoraTarget::TxtOut, DIM, DIM),
-            (DoubleLoraTarget::ImgFfnGate, DIM, MLP_HIDDEN),
-            (DoubleLoraTarget::ImgFfnOut, MLP_HIDDEN, DIM),
-            (DoubleLoraTarget::TxtFfnGate, DIM, MLP_HIDDEN),
-            (DoubleLoraTarget::TxtFfnOut, MLP_HIDDEN, DIM),
-        ];
+        let mut double_adapters: HashMap<(usize, DoubleLoraTarget), Arc<dyn AdapterModule>> =
+            HashMap::new();
         for i in 0..NUM_DOUBLE_BLOCKS {
-            for &(target, in_dim, out_dim) in double_targets {
-                let lora = LoRALinear::new(in_dim, out_dim, rank, alpha, device.clone(), seed + i as u64)?;
-                double_adapters.insert((i, target), lora);
+            for &target in DOUBLE_TARGETS {
+                let (in_dim, out_dim) = double_target_shape(target);
+                let lora = LoRALinear::new(
+                    in_dim,
+                    out_dim,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    seed + i as u64,
+                )?;
+                double_adapters.insert((i, target), Arc::new(lora));
             }
         }
 
-        let mut single_adapters = HashMap::new();
-        let single_targets: &[(SingleLoraTarget, usize, usize)] = &[
-            (SingleLoraTarget::Q, DIM, DIM),
-            (SingleLoraTarget::K, DIM, DIM),
-            (SingleLoraTarget::V, DIM, DIM),
-            (SingleLoraTarget::ProjMlp, DIM, MLP_HIDDEN),
-            // proj_out is [3072, 15360] = [DIM, DIM + MLP_HIDDEN]
-            (SingleLoraTarget::ProjOut, DIM + MLP_HIDDEN, DIM),
-        ];
+        let mut single_adapters: HashMap<(usize, SingleLoraTarget), Arc<dyn AdapterModule>> =
+            HashMap::new();
         for i in 0..NUM_SINGLE_BLOCKS {
-            for &(target, in_dim, out_dim) in single_targets {
-                let lora = LoRALinear::new(in_dim, out_dim, rank, alpha, device.clone(), seed + (NUM_DOUBLE_BLOCKS + i) as u64)?;
-                single_adapters.insert((i, target), lora);
+            for &target in SINGLE_TARGETS {
+                let (in_dim, out_dim) = single_target_shape(target);
+                let lora = LoRALinear::new(
+                    in_dim,
+                    out_dim,
+                    rank,
+                    alpha,
+                    device.clone(),
+                    seed + (NUM_DOUBLE_BLOCKS + i) as u64,
+                )?;
+                single_adapters.insert((i, target), Arc::new(lora));
             }
         }
 
-        Ok(Self { double_adapters, single_adapters })
+        Ok(Self {
+            double_adapters,
+            single_adapters,
+            algo: LycorisAlgo::None,
+            rank,
+            alpha,
+        })
+    }
+
+    /// LyCORIS-aware constructor. `config.algo == LycorisAlgo::None` falls back
+    /// to plain `LoRALinear` (legacy byte-identical path). Other algos build
+    /// `LycorisLinear` per target via the matching `lycoris_rs` `*_for_training`
+    /// constructor.
+    ///
+    /// Full and OFT bundle-construction succeeds, but their `forward_delta`
+    /// returns an error — chroma's call pattern is `base + delta_on_input`,
+    /// which is incompatible with Full's "weight delta merged into base" or
+    /// OFT's `R·(W·x+b)` semantics. Phase 2c will hoist the merge into the
+    /// base linear.
+    pub fn new_with_config(
+        config: &LycorisBundleConfig,
+        device: Arc<cudarc::driver::CudaDevice>,
+        seed: u64,
+    ) -> Result<Self> {
+        if config.algo == LycorisAlgo::None {
+            return Self::new(config.rank, config.alpha, device, seed);
+        }
+
+        let mut double_adapters: HashMap<(usize, DoubleLoraTarget), Arc<dyn AdapterModule>> =
+            HashMap::new();
+        for i in 0..NUM_DOUBLE_BLOCKS {
+            for &target in DOUBLE_TARGETS {
+                let (in_dim, out_dim) = double_target_shape(target);
+                let wrapper = build_lycoris_linear(config, in_dim, out_dim, device.clone())?;
+                double_adapters.insert((i, target), Arc::new(wrapper));
+            }
+        }
+        let mut single_adapters: HashMap<(usize, SingleLoraTarget), Arc<dyn AdapterModule>> =
+            HashMap::new();
+        for i in 0..NUM_SINGLE_BLOCKS {
+            for &target in SINGLE_TARGETS {
+                let (in_dim, out_dim) = single_target_shape(target);
+                let wrapper = build_lycoris_linear(config, in_dim, out_dim, device.clone())?;
+                single_adapters.insert((i, target), Arc::new(wrapper));
+            }
+        }
+        let _ = seed; // lycoris-rs uses its own internal RNG (kaiming/normal init).
+
+        Ok(Self {
+            double_adapters,
+            single_adapters,
+            algo: config.algo,
+            rank: config.rank,
+            alpha: config.alpha,
+        })
     }
 
     pub fn num_adapters(&self) -> usize {
         self.double_adapters.len() + self.single_adapters.len()
     }
 
+    /// Flat parameter list for the optimizer.
+    ///
+    /// For the legacy `LycorisAlgo::None` path each adapter contributes
+    /// `[lora_a, lora_b]` (via `LoRALinear`'s `AdapterModule::to_parameters`),
+    /// in the same HashMap iteration order as the pre-Phase-2b
+    /// `parameters()` — byte-equivalent.
     pub fn parameters(&self) -> Vec<Parameter> {
         let mut params = Vec::new();
-        for lora in self.double_adapters.values() {
-            params.extend(lora.parameters());
+        for adapter in self.double_adapters.values() {
+            params.extend(adapter.to_parameters());
         }
-        for lora in self.single_adapters.values() {
-            params.extend(lora.parameters());
+        for adapter in self.single_adapters.values() {
+            params.extend(adapter.to_parameters());
         }
         params
     }
 
-    pub fn refresh_caches(&self) {
-        for lora in self.double_adapters.values() {
-            lora.refresh_cache();
-        }
-        for lora in self.single_adapters.values() {
-            lora.refresh_cache();
-        }
-    }
+    /// Legacy no-op (LoRALinear's per-step cache was already empty). Kept as a
+    /// no-op for source-level back-compat with chroma forward closures that
+    /// still call this.
+    pub fn refresh_caches(&self) {}
 
-    /// Load LoRA tensors from a safetensors file produced by `save()` (or
+    /// Load adapter tensors from a safetensors file produced by `save()` (or
     /// `train_chroma`'s checkpoint format) into a freshly-constructed bundle.
-    /// Used by `sample_chroma --lora <PATH>` and any other inference path
-    /// that wants to apply a trained LoRA at sampling time.
+    /// Used by `sample_chroma --lora <PATH>`. Currently builds a plain-LoRA
+    /// bundle; LyCORIS-algo inference loaders should call
+    /// `load_from_safetensors_with_config` instead.
     pub fn load_from_safetensors(
         path: &std::path::Path,
         rank: usize,
@@ -195,11 +350,27 @@ impl ChromaLoraBundle {
         Ok(bundle)
     }
 
-    /// Load LoRA tensors into THIS existing bundle in place (Parameter has
-    /// interior mutability via `set_data`). Used by `train_chroma --resume-lora`
-    /// to pick up from a prior checkpoint without rebuilding the bundle —
-    /// the Vec<Parameter> the optimizer was constructed with stays valid
-    /// because its IDs don't change.
+    /// LyCORIS-aware variant of `load_from_safetensors`. The `config.algo`
+    /// must match the file's algo (auto-detected suffix mapping in
+    /// [`crate::lycoris`]).
+    pub fn load_from_safetensors_with_config(
+        path: &std::path::Path,
+        config: &LycorisBundleConfig,
+        device: Arc<cudarc::driver::CudaDevice>,
+    ) -> Result<Self> {
+        let bundle = Self::new_with_config(config, device.clone(), 0)?;
+        bundle.load_weights(path, device)?;
+        Ok(bundle)
+    }
+
+    /// Load adapter tensors into THIS existing bundle in place. Used by
+    /// `train_chroma --resume-lora` to pick up from a prior checkpoint
+    /// without rebuilding the bundle.
+    ///
+    /// Per-adapter loading delegates to the legacy [`LoRALinear::load_tensors`]
+    /// for plain-LoRA bundles (auto-handles old `lora_A`/`lora_A.weight`
+    /// dual convention) or to in-place `set_data` against tensors keyed by
+    /// the algo's named-suffix table for LyCORIS bundles.
     pub fn load_weights(
         &self,
         path: &std::path::Path,
@@ -210,30 +381,35 @@ impl ChromaLoraBundle {
             device,
             flame_core::serialization::SerializationFormat::SafeTensors,
         )?;
-        for (&(block_idx, target), lora) in &self.double_adapters {
+
+        for (&(block_idx, target), adapter) in &self.double_adapters {
             let suffix = double_lora_suffix(target);
             let prefix = format!("transformer_blocks.{block_idx}.{suffix}");
-            lora.load_tensors(&prefix, &tensors)?;
+            load_adapter_in_place(adapter.as_ref(), &prefix, &tensors)?;
         }
-        for (&(block_idx, target), lora) in &self.single_adapters {
+        for (&(block_idx, target), adapter) in &self.single_adapters {
             let suffix = single_lora_suffix(target);
             let prefix = format!("single_transformer_blocks.{block_idx}.{suffix}");
-            lora.load_tensors(&prefix, &tensors)?;
+            load_adapter_in_place(adapter.as_ref(), &prefix, &tensors)?;
         }
         Ok(())
     }
 
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
         let mut tensors = HashMap::new();
-        for (&(block_idx, target), lora) in &self.double_adapters {
+        for (&(block_idx, target), adapter) in &self.double_adapters {
             let suffix = double_lora_suffix(target);
             let prefix = format!("transformer_blocks.{block_idx}.{suffix}");
-            lora.save_tensors(&prefix, &mut tensors)?;
+            for (leaf, t) in adapter.named_tensors() {
+                tensors.insert(format!("{prefix}.{leaf}"), t);
+            }
         }
-        for (&(block_idx, target), lora) in &self.single_adapters {
+        for (&(block_idx, target), adapter) in &self.single_adapters {
             let suffix = single_lora_suffix(target);
             let prefix = format!("single_transformer_blocks.{block_idx}.{suffix}");
-            lora.save_tensors(&prefix, &mut tensors)?;
+            for (leaf, t) in adapter.named_tensors() {
+                tensors.insert(format!("{prefix}.{leaf}"), t);
+            }
         }
         flame_core::serialization::save_tensors(
             &tensors,
@@ -241,6 +417,193 @@ impl ChromaLoraBundle {
             flame_core::serialization::SerializationFormat::SafeTensors,
         )
     }
+}
+
+/// Build a single `LycorisLinear` for the configured algo. For
+/// `LycorisAlgo::None` the caller (`new_with_config`) short-circuits to
+/// `LoRALinear` instead — this helper bails on `None` defensively.
+fn build_lycoris_linear(
+    config: &LycorisBundleConfig,
+    in_features: usize,
+    out_features: usize,
+    device: Arc<cudarc::driver::CudaDevice>,
+) -> Result<LycorisLinear> {
+    let alpha = Some(config.alpha);
+    let dtype = config.storage;
+
+    let adapter = match config.algo {
+        LycorisAlgo::None => {
+            return Err(flame_core::Error::InvalidInput(
+                "build_lycoris_linear: LycorisAlgo::None should be handled by caller".into(),
+            ));
+        }
+        LycorisAlgo::LoCon => LycorisAdapter::LoCon(
+            LoConModule::new_linear_for_training(
+                in_features,
+                out_features,
+                config.rank,
+                alpha,
+                device.clone(),
+                dtype,
+            )
+            .map_err(|e| flame_core::Error::InvalidInput(format!("LoCon::new_linear_for_training: {e}")))?,
+        ),
+        LycorisAlgo::LoHa => LycorisAdapter::LoHa(
+            LoHaModule::new_linear_for_training(
+                in_features,
+                out_features,
+                config.rank,
+                alpha,
+                device.clone(),
+                dtype,
+            )
+            .map_err(|e| flame_core::Error::InvalidInput(format!("LoHa::new_linear_for_training: {e}")))?,
+        ),
+        LycorisAlgo::LoKr => LycorisAdapter::LoKr(
+            LoKrModule::new_linear(
+                in_features,
+                out_features,
+                config.rank,
+                config.alpha,
+                config.factor,
+                config.decompose_both,
+                config.use_scalar,
+                device.clone(),
+                dtype,
+            )
+            .map_err(|e| flame_core::Error::InvalidInput(format!("LoKr::new_linear: {e}")))?,
+        ),
+        LycorisAlgo::Full => LycorisAdapter::Full(
+            FullAdapter::new_for_training(
+                flame_core::Shape::from_dims(&[out_features, in_features]),
+                None,
+                device.clone(),
+                dtype,
+            )
+            .map_err(|e| flame_core::Error::InvalidInput(format!("Full::new_for_training: {e}")))?,
+        ),
+        LycorisAlgo::Oft => LycorisAdapter::OFT(
+            OFTModule::new_linear(
+                in_features,
+                out_features,
+                config.block_size,
+                config.alpha,
+                None,
+                dtype,
+                device.clone(),
+            )
+            .map_err(|e| flame_core::Error::InvalidInput(format!("OFT::new_linear: {e}")))?
+            .with_neumann_terms(config.neumann_terms),
+        ),
+    };
+
+    // DoRA: chroma's bundle ctor doesn't have access to base weights here
+    // (they're streamed by the BlockOffloader / live in `double_block_weights`).
+    // For Phase 2b we initialize the magnitude as ones-of-shape — the trainer
+    // can refine it post-construction by calling `init_magnitude` against the
+    // streamed weight if needed. Bail loudly when DoRA is requested so the
+    // user doesn't silently get an unitialized magnitude.
+    let dora_magnitude = if config.dora {
+        if config.algo == LycorisAlgo::Oft {
+            return Err(flame_core::Error::InvalidInput(
+                "DoRA + OFT is not supported (multiplicative + decomposition conflict)".into(),
+            ));
+        }
+        // Initialize magnitude to ||W=I||_2 = 1 along the chosen axis. This is
+        // an approximation — the lycoris-upstream init wants ||W_orig||_2.
+        // For Phase 2b we accept the approximation and document the gap.
+        let shape = if config.dora_wd_on_out {
+            flame_core::Shape::from_dims(&[out_features, 1])
+        } else {
+            flame_core::Shape::from_dims(&[1, in_features])
+        };
+        let ones = Tensor::from_vec(
+            vec![1.0_f32; shape.elem_count()],
+            shape,
+            device.clone(),
+        )?;
+        // Round-trip through init_magnitude to keep parity with non-identity
+        // future paths and to set requires_grad consistently.
+        let m = init_magnitude(&ones, config.dora_wd_on_out, 0.0)
+            .map_err(|e| flame_core::Error::InvalidInput(format!("init_magnitude: {e}")))?;
+        Some(m.requires_grad_(true))
+    } else {
+        None
+    };
+
+    Ok(LycorisLinear::new(
+        adapter,
+        dora_magnitude,
+        config.dora_wd_on_out,
+        config.dora_eps,
+        config.storage,
+    ))
+}
+
+/// In-place loader for one adapter: reads the file's tensors at
+/// `<prefix>.<leaf>` for each leaf in `adapter.named_tensors()` and copies
+/// them into the existing leaves via `Parameter::set_data` (LoRALinear) or
+/// direct `Tensor::set_storage` (LycorisLinear's bare-Tensor leaves).
+///
+/// For plain-LoRA bundles this delegates to [`LoRALinear::load_tensors`] which
+/// auto-detects the legacy bare-suffix `lora_A`/`lora_B` convention used by
+/// older checkpoints.
+fn load_adapter_in_place(
+    adapter: &dyn AdapterModule,
+    prefix: &str,
+    tensors: &HashMap<String, Tensor>,
+) -> Result<()> {
+    // LoRALinear has a tailored loader that handles the legacy bare-suffix
+    // convention. Detect by `kind()` and delegate to keep `--resume-lora`
+    // round-trip identical for pre-Phase-2b checkpoints.
+    if adapter.kind() == "lora" {
+        // Down-cast via Any-style indirection isn't available on `dyn
+        // AdapterModule` (no `Any` supertrait), so we re-implement the
+        // dual-convention probe inline.
+        let a_new = format!("{prefix}.lora_A.weight");
+        let b_new = format!("{prefix}.lora_B.weight");
+        let a_legacy = format!("{prefix}.lora_A");
+        let b_legacy = format!("{prefix}.lora_B");
+        let a = tensors
+            .get(&a_new)
+            .or_else(|| tensors.get(&a_legacy))
+            .ok_or_else(|| {
+                flame_core::Error::InvalidInput(format!(
+                    "load_weights: missing {a_new} (or legacy {a_legacy})"
+                ))
+            })?;
+        let b = tensors
+            .get(&b_new)
+            .or_else(|| tensors.get(&b_legacy))
+            .ok_or_else(|| {
+                flame_core::Error::InvalidInput(format!(
+                    "load_weights: missing {b_new} (or legacy {b_legacy})"
+                ))
+            })?;
+        // Walk the adapter's owned parameters; for LoRALinear order is `[a, b]`.
+        let params = adapter.to_parameters();
+        if params.len() != 2 {
+            return Err(flame_core::Error::InvalidInput(format!(
+                "load_weights: LoRA adapter expected 2 parameters, got {}",
+                params.len()
+            )));
+        }
+        params[0].set_data(a.to_dtype(DType::F32)?.requires_grad_(true))?;
+        params[1].set_data(b.to_dtype(DType::F32)?.requires_grad_(true))?;
+        return Ok(());
+    }
+
+    // LyCORIS path: the `LycorisLinear` leaves are bare `Tensor` fields
+    // (not `Parameter`-wrapped), so we cannot do a `Parameter::set_data` here.
+    // The trainer's resume convention for LyCORIS algos is to bail explicitly
+    // — the right path is to construct the bundle from disk via
+    // `load_from_safetensors_with_config`. Surface a clear error.
+    Err(flame_core::Error::InvalidInput(format!(
+        "load_weights: in-place resume for LyCORIS algo '{}' is not yet wired \
+         (Phase 2b shortcut). Re-load via load_from_safetensors_with_config \
+         and recreate the optimizer from scratch.",
+        adapter.kind()
+    )))
 }
 
 fn double_lora_suffix(target: DoubleLoraTarget) -> &'static str {

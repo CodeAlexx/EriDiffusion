@@ -40,6 +40,8 @@ use clap::Parser;
 use flame_core::{adam::AdamW, autograd::AutogradContext, DType, Shape, Tensor};
 use eridiffusion_core::config::{LrScheduler, TrainConfig, TrainingMethod};
 use eridiffusion_core::encoders::flux_vae::{SCALE, SHIFT};
+use eridiffusion_core::lycoris::{LycorisAlgo, LycorisBundleConfig};
+use eridiffusion_core::models::chroma::ChromaLoraBundle;
 use eridiffusion_core::models::ChromaTrainingModel;
 use eridiffusion_core::training::board::BoardWriter;
 use eridiffusion_core::training::ema::ParameterEma;
@@ -141,6 +143,44 @@ struct Args {
     #[arg(long, default_value = "constant")] lr_scheduler: String,
     #[arg(long, default_value_t = 0)] warmup_steps: usize,
     #[arg(long, default_value_t = 1.0)] lr_cycles: f32,
+
+    // ── LyCORIS algo selection (Phase 2b) ──
+    //
+    // `--algo lora` (default) keeps the legacy LoRALinear path — byte-identical
+    // training to pre-Phase-2b. Other values select LyCORIS algos via
+    // `LycorisBundleConfig::new_with_config`. `lora_alpha` and `rank` are
+    // shared with the legacy CLI flags above (no separate `--lycoris-rank`).
+    /// LyCORIS algo: `lora` (default, legacy path) | `locon` | `loha` | `lokr`
+    /// | `full` | `oft`. `full` and `oft` build successfully but their
+    /// `forward_delta` will error inside the chroma forward pass —
+    /// chroma's `base + delta_on_input` call pattern is incompatible with
+    /// Full/OFT semantics. Phase 2c will wire a `merge_into_base` path.
+    #[arg(long, default_value = "lora")] algo: String,
+    /// LoKr Kronecker split factor (ignored for non-LoKr).
+    #[arg(long, default_value_t = 16)] lokr_factor: i32,
+    /// OFT block size (ignored for non-OFT).
+    #[arg(long, default_value_t = 32)] oft_block_size: usize,
+    /// OFT Cayley-Neumann series term count (ignored for non-OFT).
+    #[arg(long, default_value_t = 5)] oft_neumann_terms: usize,
+    /// LoCon / LoHa / LoKr conv variant — Tucker decomposition for non-1×1
+    /// kernels. Chroma is linear-only so this is currently a no-op.
+    #[arg(long, default_value_t = false)] use_tucker: bool,
+    /// LoKr only: factorize both W1 *and* W2 (default false: only W2).
+    #[arg(long, default_value_t = false)] decompose_both: bool,
+    /// Enable DoRA (weight-decomposed LoRA). Applies to LoCon/LoHa/LoKr
+    /// (Full inherits, OFT errors).
+    ///
+    /// Phase 2b limitation: chroma's bundle ctor doesn't have access to the
+    /// streamed block weights at construction time, so DoRA's magnitude is
+    /// initialized from `||I||_2 = 1` rather than `||W_orig||_2`. The
+    /// trainer should still converge but will spend the first few hundred
+    /// steps adjusting the magnitude. Phase 2c will wire pre-load
+    /// magnitude init.
+    #[arg(long, default_value_t = false)] dora: bool,
+    /// DoRA magnitude axis. Default `true` matches lycoris-upstream
+    /// (norm over input dims, magnitude shape `[out, 1]`).
+    #[arg(long, default_value_t = true)] dora_wd_on_out: bool,
+    #[arg(long, default_value_t = 1e-6)] dora_eps: f32,
 }
 
 /// Resolution-dependent timestep shift (matches the chroma archive's
@@ -231,7 +271,42 @@ fn main() -> anyhow::Result<()> {
         args.offload,
     );
 
-    let model = if args.offload {
+    // Phase 2b: parse the LyCORIS algo selector. `lora` (default) keeps the
+    // legacy LoRALinear bundle constructed inside `ChromaTrainingModel::load`.
+    // Anything else swaps the bundle in-place after model construction so we
+    // don't have to re-plumb the per-trainer constructor signatures.
+    //
+    // NOTE: `LycorisAlgo::parse("lora")` aliases to `LycorisAlgo::LoCon`
+    // (since LoCon-Linear is the canonical LoRA decomposition). For chroma
+    // we need to distinguish LEGACY plain `LoRALinear` (byte-identical) from
+    // the new `LycorisAdapter::LoCon` path, so re-map `"lora"` → `None` here
+    // explicitly. Users who want the new LoCon path pass `--algo locon`.
+    let algo_str = args.algo.trim().to_ascii_lowercase();
+    let algo = if algo_str == "lora" || algo_str == "none" || algo_str.is_empty() {
+        LycorisAlgo::None
+    } else {
+        LycorisAlgo::parse(&args.algo).map_err(|e| anyhow::anyhow!("--algo: {e}"))?
+    };
+    // Default storage (F32) inherited from `LycorisBundleConfig::default()`.
+    // This matches the trainer-side AdamW state requirement; do NOT switch
+    // to BF16/FP8 — chroma trainer is BF16/F32-only (see top-of-file rule).
+    let lyc_config = LycorisBundleConfig {
+        algo,
+        rank: args.rank,
+        alpha: args.lora_alpha as f32,
+        factor: args.lokr_factor,
+        block_size: args.oft_block_size,
+        neumann_terms: args.oft_neumann_terms,
+        use_tucker: args.use_tucker,
+        decompose_both: args.decompose_both,
+        use_scalar: false,
+        dora: args.dora,
+        dora_wd_on_out: args.dora_wd_on_out,
+        dora_eps: args.dora_eps,
+        ..LycorisBundleConfig::default()
+    };
+
+    let mut model = if args.offload {
         ChromaTrainingModel::load_swapped(
             &args.transformer,
             &args.mode,
@@ -250,6 +325,36 @@ fn main() -> anyhow::Result<()> {
             SEED,
         )?
     };
+
+    // If a LyCORIS algo other than the legacy plain LoRA was requested, swap
+    // the bundle. Plain `--algo lora` (or `lora`/`none`) keeps the legacy
+    // bundle as-is so this branch is byte-equivalent to the pre-Phase-2b
+    // pipeline.
+    if algo != LycorisAlgo::None && args.mode == "lora" {
+        log::info!(
+            "[Chroma] LyCORIS algo='{}' rank={} alpha={} factor={} block_size={} dora={}",
+            algo.as_str(),
+            lyc_config.rank,
+            lyc_config.alpha,
+            lyc_config.factor,
+            lyc_config.block_size,
+            lyc_config.dora,
+        );
+        if matches!(algo, LycorisAlgo::Full | LycorisAlgo::Oft) {
+            log::warn!(
+                "[Chroma] algo='{}' selected — bundle construction will succeed, but \
+                 forward_delta will error inside chroma's `base + delta_on_input` call \
+                 pattern. Phase 2c will wire merge-into-base for these algos.",
+                algo.as_str()
+            );
+        }
+        let new_bundle = ChromaLoraBundle::new_with_config(&lyc_config, device.clone(), SEED)
+            .map_err(|e| anyhow::anyhow!("LyCORIS bundle construction: {e}"))?;
+        model.bundle = Some(new_bundle);
+    } else if algo == LycorisAlgo::None {
+        // Explicit log: legacy path — no swap.
+        log::info!("[Chroma] algo='lora' (legacy LoRALinear path, byte-identical)");
+    }
 
     let params = model.parameters();
     log::info!("[Chroma] {} trainable tensors", params.len());

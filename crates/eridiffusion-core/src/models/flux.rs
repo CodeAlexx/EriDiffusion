@@ -6,8 +6,10 @@ use std::sync::Arc;
 use cudarc::driver::CudaDevice;
 use flame_core::{parameter::Parameter, DType, Shape, Tensor};
 use flame_core::autograd::AutogradContext;
+use crate::adapter::AdapterModule;
 use crate::config::TrainConfig;
 use crate::lora::LoRALinear;
+use crate::lycoris::{AdapterStore, LycorisAlgo, LycorisBundleConfig};
 use crate::models::TrainableModel;
 use crate::Result;
 
@@ -80,8 +82,12 @@ pub struct FluxModel {
     pub double_block_weights: Vec<HashMap<String, Tensor>>,
     pub single_block_weights: Vec<HashMap<String, Tensor>>,
 
-    // LoRA
+    // LoRA — legacy plain-LoRA path. Byte-identical to pre-LyCORIS commits
+    // when this is `Some` and `lycoris_bundle` is `None`.
     pub bundle: Option<FluxLoraBundle>,
+    /// LyCORIS adapter store (`--algo locon|loha|lokr|full|oft`, optional DoRA).
+    /// Mutually exclusive with `bundle`.
+    pub lycoris_bundle: Option<FluxLycorisBundle>,
     pub fft_params: Option<HashMap<String, Parameter>>,
     pub is_full_finetune: bool,
 
@@ -183,11 +189,158 @@ impl FluxLoraBundle {
     }
 }
 
+// ── LyCORIS bundle (Phase 2b) ──────────────────────────────────────
+//
+// Wraps an `AdapterStore` keyed by per-target dotted names matching the
+// legacy `FluxLoraBundle` save format. Per-target adapter granularity is
+// identical to the legacy bundle (12 doubles/block × 19 + 5 singles/block × 38
+// = 418 adapters); only the leaf-tensor algo differs.
+//
+// **Mutual exclusion**: `FluxModel.bundle` (legacy LoRA) and
+// `FluxModel.lycoris_bundle` are mutually exclusive — the trainer picks one
+// based on `--algo` at construction time. The legacy path is byte-identical
+// for `--algo lora|none` (different `LoRALinear::new` seed strategy than
+// `AdapterStore::build_and_push_linear` would use, so we keep the original
+// `seed=42` constructor for parity).
+//
+// **Known infrastructure limitation** (NOT Phase 2b plumbing): the
+// lycoris-rs adapter modules cache leaf `Tensor` fields and the `flame_core`
+// `shared_storage` feature COWs the param storage at AdamW step time,
+// silently desyncing the cached field from the optimized weight. Real
+// LyCORIS training runs need the lycoris-rs forward path reworked
+// (round-trip through `param.tensor()` per call, matching
+// `LoRALinear::forward_delta`). Phase 2b is build-clean, review-ready —
+// not GPU-tested.
+pub struct FluxLycorisBundle {
+    pub config: LycorisBundleConfig,
+    pub store: AdapterStore,
+    double_index: HashMap<(usize, DoubleLoraTarget), usize>,
+    single_index: HashMap<(usize, SingleLoraTarget), usize>,
+    parameters: Vec<Parameter>,
+}
+
+impl FluxLycorisBundle {
+    /// Build the canonical 418-adapter LyCORIS bundle for FLUX.
+    pub fn new(config: LycorisBundleConfig, device: Arc<CudaDevice>) -> Result<Self> {
+        if config.algo == LycorisAlgo::None {
+            return Err(crate::EriDiffusionError::Lora(
+                "FluxLycorisBundle::new: algo=None — caller should use FluxLoraBundle".into(),
+            ));
+        }
+        let mut store = AdapterStore::new(config.clone(), device.clone());
+        let mut double_index: HashMap<(usize, DoubleLoraTarget), usize> = HashMap::new();
+        let mut single_index: HashMap<(usize, SingleLoraTarget), usize> = HashMap::new();
+
+        const DOUBLE_TARGETS: [DoubleLoraTarget; 12] = [
+            DoubleLoraTarget::ImgQ, DoubleLoraTarget::ImgK,
+            DoubleLoraTarget::ImgV, DoubleLoraTarget::ImgProj,
+            DoubleLoraTarget::TxtQ, DoubleLoraTarget::TxtK,
+            DoubleLoraTarget::TxtV, DoubleLoraTarget::TxtProj,
+            DoubleLoraTarget::ImgMlp0, DoubleLoraTarget::ImgMlp2,
+            DoubleLoraTarget::TxtMlp0, DoubleLoraTarget::TxtMlp2,
+        ];
+        const SINGLE_TARGETS: [SingleLoraTarget; 5] = [
+            SingleLoraTarget::Q, SingleLoraTarget::K, SingleLoraTarget::V,
+            SingleLoraTarget::ProjMlp, SingleLoraTarget::ProjOut,
+        ];
+
+        for i in 0..NUM_DOUBLE {
+            for &target in &DOUBLE_TARGETS {
+                let (in_f, out_f) = double_target_io(target);
+                let name = format!("double_blocks.{}.{}", i, double_target_suffix(target));
+                store.build_and_push_linear(&name, in_f, out_f, /*w_orig=*/ None)
+                    .map_err(|e| crate::EriDiffusionError::Lora(format!(
+                        "FluxLycorisBundle: build_and_push_linear({name}): {e}"
+                    )))?;
+                double_index.insert((i, target), store.adapters.len() - 1);
+            }
+        }
+        for i in 0..NUM_SINGLE {
+            for &target in &SINGLE_TARGETS {
+                let (in_f, out_f) = single_target_io(target);
+                let name = format!("single_blocks.{}.{}", i, single_target_suffix(target));
+                store.build_and_push_linear(&name, in_f, out_f, /*w_orig=*/ None)
+                    .map_err(|e| crate::EriDiffusionError::Lora(format!(
+                        "FluxLycorisBundle: build_and_push_linear({name}): {e}"
+                    )))?;
+                single_index.insert((i, target), store.adapters.len() - 1);
+            }
+        }
+        let parameters = store.to_parameters();
+        log::info!(
+            "[Flux] LyCORIS bundle: algo={} dora={} {} adapters {} parameters",
+            config.algo.as_str(), config.dora,
+            store.adapters.len(), parameters.len(),
+        );
+        Ok(Self { config, store, double_index, single_index, parameters })
+    }
+
+    pub fn parameters(&self) -> Vec<Parameter> {
+        self.parameters.clone()
+    }
+
+    pub fn lookup_double(&self, idx: usize, target: DoubleLoraTarget) -> Option<&dyn AdapterModule> {
+        self.double_index
+            .get(&(idx, target))
+            .map(|i| self.store.adapters[*i].as_ref())
+    }
+
+    pub fn lookup_single(&self, idx: usize, target: SingleLoraTarget) -> Option<&dyn AdapterModule> {
+        self.single_index
+            .get(&(idx, target))
+            .map(|i| self.store.adapters[*i].as_ref())
+    }
+
+    /// `(name, Parameter)` pairs for full-checkpoint save/resume. Names match
+    /// what `save_weights` writes: `<adapter_name>.<algo_suffix>`.
+    pub fn named_parameters(&self) -> Vec<(String, Parameter)> {
+        let mut out = Vec::with_capacity(self.parameters.len());
+        for (i, adapter) in self.store.adapters.iter().enumerate() {
+            let base = &self.store.names[i];
+            let pairs = adapter.to_parameters();
+            let names = adapter.named_tensors();
+            for (param, (suffix, _)) in pairs.into_iter().zip(names.into_iter()) {
+                out.push((format!("{base}.{suffix}"), param));
+            }
+        }
+        out
+    }
+}
+
+fn double_target_io(t: DoubleLoraTarget) -> (usize, usize) {
+    match t {
+        DoubleLoraTarget::ImgQ | DoubleLoraTarget::ImgK | DoubleLoraTarget::ImgV
+        | DoubleLoraTarget::ImgProj
+        | DoubleLoraTarget::TxtQ | DoubleLoraTarget::TxtK | DoubleLoraTarget::TxtV
+        | DoubleLoraTarget::TxtProj => (DIM, DIM),
+        DoubleLoraTarget::ImgMlp0 | DoubleLoraTarget::TxtMlp0 => (DIM, MLP_HIDDEN),
+        DoubleLoraTarget::ImgMlp2 | DoubleLoraTarget::TxtMlp2 => (MLP_HIDDEN, DIM),
+    }
+}
+
+fn single_target_io(t: SingleLoraTarget) -> (usize, usize) {
+    match t {
+        SingleLoraTarget::Q | SingleLoraTarget::K | SingleLoraTarget::V => (DIM, DIM),
+        SingleLoraTarget::ProjMlp => (DIM, 4 * DIM),
+        SingleLoraTarget::ProjOut => (5 * DIM, DIM),
+    }
+}
+
 impl FluxModel {
     pub fn load(
         model_path: &std::path::Path, config: &TrainConfig, device: Arc<CudaDevice>,
     ) -> Result<Self> {
-        Self::load_inner(model_path, config, device, /*skip_blocks=*/ false)
+        Self::load_inner(model_path, config, device, /*skip_blocks=*/ false, /*lyc_cfg=*/ None)
+    }
+
+    /// Phase 2b: same as `load` but with optional `LycorisBundleConfig`.
+    pub fn load_with_lycoris(
+        model_path: &std::path::Path,
+        config: &TrainConfig,
+        device: Arc<CudaDevice>,
+        lyc_cfg: Option<LycorisBundleConfig>,
+    ) -> Result<Self> {
+        Self::load_inner(model_path, config, device, /*skip_blocks=*/ false, lyc_cfg)
     }
 
     /// Like `load`, but skips per-block weights (`double_blocks.*` /
@@ -198,12 +351,23 @@ impl FluxModel {
     pub fn load_offload(
         model_path: &std::path::Path, config: &TrainConfig, device: Arc<CudaDevice>,
     ) -> Result<Self> {
-        Self::load_inner(model_path, config, device, /*skip_blocks=*/ true)
+        Self::load_inner(model_path, config, device, /*skip_blocks=*/ true, /*lyc_cfg=*/ None)
+    }
+
+    /// `load_offload` + LyCORIS — combinator for offload + lycoris-algo runs.
+    pub fn load_offload_with_lycoris(
+        model_path: &std::path::Path,
+        config: &TrainConfig,
+        device: Arc<CudaDevice>,
+        lyc_cfg: Option<LycorisBundleConfig>,
+    ) -> Result<Self> {
+        Self::load_inner(model_path, config, device, /*skip_blocks=*/ true, lyc_cfg)
     }
 
     fn load_inner(
         model_path: &std::path::Path, config: &TrainConfig, device: Arc<CudaDevice>,
         skip_blocks: bool,
+        lyc_cfg: Option<LycorisBundleConfig>,
     ) -> Result<Self> {
         log::info!(
             "[Flux] loading from {} (skip_blocks={})",
@@ -239,16 +403,33 @@ impl FluxModel {
         log::info!("[Flux] {} shared, {} double blocks, {} single blocks", shared.len(), db.len(), sb.len());
 
         let is_fft = !config.is_lora();
-        let (bundle, fft_params) = if is_fft {
+        // Resolve effective LyCORIS config: an explicit `algo=None` (or no
+        // config at all) takes the legacy `FluxLoraBundle` path. The two
+        // bundle paths are mutually exclusive at the trainer level.
+        let lyc_active: Option<LycorisBundleConfig> = lyc_cfg
+            .as_ref()
+            .filter(|c| c.algo != LycorisAlgo::None)
+            .cloned();
+        let (bundle, lycoris_bundle, fft_params) = if is_fft {
             let mut params = HashMap::new();
             for (k, t) in &shared { params.insert(k.clone(), Parameter::new(t.to_dtype(DType::F32)?.requires_grad_(true))); }
             for block in &db { for (k, t) in block { params.insert(k.clone(), Parameter::new(t.to_dtype(DType::F32)?.requires_grad_(true))); } }
             for block in &sb { for (k, t) in block { params.insert(k.clone(), Parameter::new(t.to_dtype(DType::F32)?.requires_grad_(true))); } }
-            (None, Some(params))
+            (None, None, Some(params))
+        } else if let Some(lyc) = lyc_active {
+            // LyCORIS path. Override rank/alpha with TrainConfig values so the
+            // CLI `--rank` / `--lora-alpha` flags propagate identically.
+            let lyc = LycorisBundleConfig {
+                rank: config.lora_rank as usize,
+                alpha: config.lora_alpha as f32,
+                ..lyc
+            };
+            let lb = FluxLycorisBundle::new(lyc, device.clone())?;
+            (None, Some(lb), None)
         } else {
             // SEED=42 (single fixed seed — see FluxLoraBundle::new for rationale).
             let b = FluxLoraBundle::new(config.lora_rank as usize, config.lora_alpha as f32, device.clone(), 42u64)?;
-            (Some(b), None)
+            (Some(b), None, None)
         };
 
         // Audit fix FLUX_VERIFY §H7 / SKEPTIC §H7: OT canonical training-time
@@ -259,7 +440,7 @@ impl FluxModel {
         // time shifted the guidance MLP's input distribution away from where
         // BFL distillation expects it.
         let guidance_value = 1.0;
-        Ok(Self { config: config.clone(), device, shared_weights: shared, double_block_weights: db, single_block_weights: sb, bundle, fft_params, is_full_finetune: is_fft, has_guidance, offloader: None, guidance_value })
+        Ok(Self { config: config.clone(), device, shared_weights: shared, double_block_weights: db, single_block_weights: sb, bundle, lycoris_bundle, fft_params, is_full_finetune: is_fft, has_guidance, offloader: None, guidance_value })
     }
 
     /// Drop double/single block weights from VRAM and build a `BlockOffloader`
@@ -449,9 +630,9 @@ impl FluxModel {
     fn add_split_qkv_lora(
         base: &Tensor,
         x_in: &Tensor,
-        lora_q: Option<&LoRALinear>,
-        lora_k: Option<&LoRALinear>,
-        lora_v: Option<&LoRALinear>,
+        lora_q: Option<&dyn AdapterModule>,
+        lora_k: Option<&dyn AdapterModule>,
+        lora_v: Option<&dyn AdapterModule>,
     ) -> Result<Tensor> {
         if lora_q.is_none() && lora_k.is_none() && lora_v.is_none() {
             return Ok(base.clone());
@@ -462,11 +643,43 @@ impl FluxModel {
             *shape.last_mut().unwrap() = DIM;
             Ok(Tensor::zeros_dtype(Shape::from_dims(&shape), base.dtype(), base.device().clone())?)
         };
-        let dq = match lora_q { Some(a) => a.forward_delta(x_in)?, None => zeros_dim()? };
-        let dk = match lora_k { Some(a) => a.forward_delta(x_in)?, None => zeros_dim()? };
-        let dv = match lora_v { Some(a) => a.forward_delta(x_in)?, None => zeros_dim()? };
+        // `AdapterModule::forward_delta` returns `flame_core::Result`; map back
+        // to the EDv2 `Result` so callsites stay typed against `crate::Result`.
+        let call = |a: &dyn AdapterModule, x: &Tensor| -> Result<Tensor> {
+            a.forward_delta(x)
+                .map_err(|e| crate::EriDiffusionError::Lora(format!("AdapterModule::forward_delta: {e}")))
+        };
+        let dq = match lora_q { Some(a) => call(a, x_in)?, None => zeros_dim()? };
+        let dk = match lora_k { Some(a) => call(a, x_in)?, None => zeros_dim()? };
+        let dv = match lora_v { Some(a) => call(a, x_in)?, None => zeros_dim()? };
         let delta = Tensor::cat(&[&dq, &dk, &dv], 2)?.contiguous()?;
         base.add(&delta).map_err(Into::into)
+    }
+
+    /// Per-call adapter lookup. Returns `Some(&dyn AdapterModule)` from
+    /// whichever bundle is active. Mutually exclusive at construction time.
+    fn lookup_double_adapter(&self, idx: usize, target: DoubleLoraTarget) -> Option<&dyn AdapterModule> {
+        if let Some(ref b) = self.bundle {
+            if let Some(l) = b.double_adapters.get(&(idx, target)) {
+                return Some(l as &dyn AdapterModule);
+            }
+        }
+        if let Some(ref lb) = self.lycoris_bundle {
+            return lb.lookup_double(idx, target);
+        }
+        None
+    }
+
+    fn lookup_single_adapter(&self, idx: usize, target: SingleLoraTarget) -> Option<&dyn AdapterModule> {
+        if let Some(ref b) = self.bundle {
+            if let Some(l) = b.single_adapters.get(&(idx, target)) {
+                return Some(l as &dyn AdapterModule);
+            }
+        }
+        if let Some(ref lb) = self.lycoris_bundle {
+            return lb.lookup_single(idx, target);
+        }
+        None
     }
 
     fn double_block_forward(&self, img: &Tensor, txt: &Tensor, vec: &Tensor, cos: &Tensor, sin: &Tensor, idx: usize) -> Result<(Tensor, Tensor)> {
@@ -485,17 +698,15 @@ impl FluxModel {
         let (txt_s1, txt_scale1, txt_g1) = (&txt_mods[0], &txt_mods[1], &txt_mods[2]);
         let (txt_s2, txt_scale2, txt_g2) = (&txt_mods[3], &txt_mods[4], &txt_mods[5]);
 
-        let bundle = self.bundle.as_ref();
-
         // --- Img attention --- (split Q/K/V LoRA; H4/H5)
         let img_norm = flame_core::layer_norm::layer_norm(img, &[DIM], None, None, NORM_EPS)?;
         let img_mod_in = img_norm.mul(&img_scale1.add_scalar(1.0)?)?.add(img_s1)?;
         let img_qkv = Self::linear(&img_mod_in, self.dw(idx, "img_attn.qkv.weight")?, self.dw(idx, "img_attn.qkv.bias")?)?;
         let img_qkv = Self::add_split_qkv_lora(
             &img_qkv, &img_mod_in,
-            bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::ImgQ))),
-            bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::ImgK))),
-            bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::ImgV))),
+            self.lookup_double_adapter(idx, DoubleLoraTarget::ImgQ),
+            self.lookup_double_adapter(idx, DoubleLoraTarget::ImgK),
+            self.lookup_double_adapter(idx, DoubleLoraTarget::ImgV),
         )?;
         let c = img_qkv.chunk(3, 2)?;
         let (img_q, img_k, img_v) = (c[0].clone(), c[1].clone(), c[2].clone());
@@ -506,9 +717,9 @@ impl FluxModel {
         let txt_qkv = Self::linear(&txt_mod_in, self.dw(idx, "txt_attn.qkv.weight")?, self.dw(idx, "txt_attn.qkv.bias")?)?;
         let txt_qkv = Self::add_split_qkv_lora(
             &txt_qkv, &txt_mod_in,
-            bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::TxtQ))),
-            bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::TxtK))),
-            bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::TxtV))),
+            self.lookup_double_adapter(idx, DoubleLoraTarget::TxtQ),
+            self.lookup_double_adapter(idx, DoubleLoraTarget::TxtK),
+            self.lookup_double_adapter(idx, DoubleLoraTarget::TxtV),
         )?;
         let c = txt_qkv.chunk(3, 2)?;
         let (txt_q, txt_k, txt_v) = (c[0].clone(), c[1].clone(), c[2].clone());
@@ -541,10 +752,18 @@ impl FluxModel {
         // identical speckle output. Restoring the fused kernel.
         let (txt_attn, img_attn) = flame_core::bf16_ops::attn_split_txt_img_bf16(&attn, n_txt, n_img)?;
 
+        // Adapter-delta helper: dispatches `forward_delta` through the
+        // AdapterModule trait. `LoRALinear` impls AdapterModule directly so
+        // the legacy path still hits its tape-recording matmul fast path.
+        let apply_delta = |a: &dyn AdapterModule, x: &Tensor| -> Result<Tensor> {
+            a.forward_delta(x)
+                .map_err(|e| crate::EriDiffusionError::Lora(format!("AdapterModule::forward_delta: {e}")))
+        };
+
         // Output proj + gate + residual
         let img_proj = Self::linear(&img_attn, self.dw(idx, "img_attn.proj.weight")?, self.dw(idx, "img_attn.proj.bias")?)?;
-        let img_proj = if let Some(lora) = bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::ImgProj))) {
-            img_proj.add(&lora.forward_delta(&img_attn)?)?
+        let img_proj = if let Some(lora) = self.lookup_double_adapter(idx, DoubleLoraTarget::ImgProj) {
+            img_proj.add(&apply_delta(lora, &img_attn)?)?
         } else { img_proj };
         // FLUX speckle bisect (2026-05-07): replace manual mul+add with the
         // fused gate_residual_fused_bf16 kernel (the OLD inference path the
@@ -553,8 +772,8 @@ impl FluxModel {
         let img = flame_core::bf16_ops::gate_residual_fused_bf16(&img, &img_g1.squeeze(Some(1))?, &img_proj)?;
 
         let txt_proj = Self::linear(&txt_attn, self.dw(idx, "txt_attn.proj.weight")?, self.dw(idx, "txt_attn.proj.bias")?)?;
-        let txt_proj = if let Some(lora) = bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::TxtProj))) {
-            txt_proj.add(&lora.forward_delta(&txt_attn)?)?
+        let txt_proj = if let Some(lora) = self.lookup_double_adapter(idx, DoubleLoraTarget::TxtProj) {
+            txt_proj.add(&apply_delta(lora, &txt_attn)?)?
         } else { txt_proj };
         let txt = flame_core::bf16_ops::gate_residual_fused_bf16(&txt, &txt_g1.squeeze(Some(1))?, &txt_proj)?;
 
@@ -562,26 +781,26 @@ impl FluxModel {
         let img_norm2 = flame_core::layer_norm::layer_norm(&img, &[DIM], None, None, NORM_EPS)?;
         let img_mlp_in = img_norm2.mul(&img_scale2.add_scalar(1.0)?)?.add(img_s2)?;
         let img_mlp_h_base = Self::linear(&img_mlp_in, self.dw(idx, "img_mlp.0.weight")?, self.dw(idx, "img_mlp.0.bias")?)?;
-        let img_mlp_h = if let Some(lora) = bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::ImgMlp0))) {
-            img_mlp_h_base.add(&lora.forward_delta(&img_mlp_in)?)?
+        let img_mlp_h = if let Some(lora) = self.lookup_double_adapter(idx, DoubleLoraTarget::ImgMlp0) {
+            img_mlp_h_base.add(&apply_delta(lora, &img_mlp_in)?)?
         } else { img_mlp_h_base };
         let img_mlp_h = img_mlp_h.gelu()?;
         let img_mlp_out_base = Self::linear(&img_mlp_h, self.dw(idx, "img_mlp.2.weight")?, self.dw(idx, "img_mlp.2.bias")?)?;
-        let img_mlp_out = if let Some(lora) = bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::ImgMlp2))) {
-            img_mlp_out_base.add(&lora.forward_delta(&img_mlp_h)?)?
+        let img_mlp_out = if let Some(lora) = self.lookup_double_adapter(idx, DoubleLoraTarget::ImgMlp2) {
+            img_mlp_out_base.add(&apply_delta(lora, &img_mlp_h)?)?
         } else { img_mlp_out_base };
         let img = flame_core::bf16_ops::gate_residual_fused_bf16(&img, &img_g2.squeeze(Some(1))?, &img_mlp_out)?;
 
         let txt_norm2 = flame_core::layer_norm::layer_norm(&txt, &[DIM], None, None, NORM_EPS)?;
         let txt_mlp_in = txt_norm2.mul(&txt_scale2.add_scalar(1.0)?)?.add(txt_s2)?;
         let txt_mlp_h_base = Self::linear(&txt_mlp_in, self.dw(idx, "txt_mlp.0.weight")?, self.dw(idx, "txt_mlp.0.bias")?)?;
-        let txt_mlp_h = if let Some(lora) = bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::TxtMlp0))) {
-            txt_mlp_h_base.add(&lora.forward_delta(&txt_mlp_in)?)?
+        let txt_mlp_h = if let Some(lora) = self.lookup_double_adapter(idx, DoubleLoraTarget::TxtMlp0) {
+            txt_mlp_h_base.add(&apply_delta(lora, &txt_mlp_in)?)?
         } else { txt_mlp_h_base };
         let txt_mlp_h = txt_mlp_h.gelu()?;
         let txt_mlp_out_base = Self::linear(&txt_mlp_h, self.dw(idx, "txt_mlp.2.weight")?, self.dw(idx, "txt_mlp.2.bias")?)?;
-        let txt_mlp_out = if let Some(lora) = bundle.and_then(|b| b.double_adapters.get(&(idx, DoubleLoraTarget::TxtMlp2))) {
-            txt_mlp_out_base.add(&lora.forward_delta(&txt_mlp_h)?)?
+        let txt_mlp_out = if let Some(lora) = self.lookup_double_adapter(idx, DoubleLoraTarget::TxtMlp2) {
+            txt_mlp_out_base.add(&apply_delta(lora, &txt_mlp_h)?)?
         } else { txt_mlp_out_base };
         let txt = flame_core::bf16_ops::gate_residual_fused_bf16(&txt, &txt_g2.squeeze(Some(1))?, &txt_mlp_out)?;
 
@@ -593,7 +812,12 @@ impl FluxModel {
     fn single_block_forward(&self, x: &Tensor, vec: &Tensor, cos: &Tensor, sin: &Tensor, _txt_len: usize, idx: usize) -> Result<Tensor> {
         let dims = x.shape().dims().to_vec();
         let (b, n) = (dims[0], dims[1]);
-        let bundle = self.bundle.as_ref();
+
+        // Adapter-delta helper (see double_block_forward for rationale).
+        let apply_delta = |a: &dyn AdapterModule, xx: &Tensor| -> Result<Tensor> {
+            a.forward_delta(xx)
+                .map_err(|e| crate::EriDiffusionError::Lora(format!("AdapterModule::forward_delta: {e}")))
+        };
 
         // Modulation: Linear(vec.silu()) → 3*DIM
         let m = Self::linear(&vec.silu()?, self.singw(idx, "modulation.lin.weight")?, self.singw(idx, "modulation.lin.bias")?)?;
@@ -612,15 +836,15 @@ impl FluxModel {
         // fused QKV output — Klein parity).
         let qkv = Self::add_split_qkv_lora(
             &qkv, &x_mod,
-            bundle.and_then(|b| b.single_adapters.get(&(idx, SingleLoraTarget::Q))),
-            bundle.and_then(|b| b.single_adapters.get(&(idx, SingleLoraTarget::K))),
-            bundle.and_then(|b| b.single_adapters.get(&(idx, SingleLoraTarget::V))),
+            self.lookup_single_adapter(idx, SingleLoraTarget::Q),
+            self.lookup_single_adapter(idx, SingleLoraTarget::K),
+            self.lookup_single_adapter(idx, SingleLoraTarget::V),
         )?;
 
         // ProjMlp LoRA on the MLP-up half of the fused linear1 (H5: previously
         // the entire MLP-up branch had no LoRA correction).
-        let mlp_in = if let Some(lora) = bundle.and_then(|b| b.single_adapters.get(&(idx, SingleLoraTarget::ProjMlp))) {
-            mlp_in_base.add(&lora.forward_delta(&x_mod)?)?
+        let mlp_in = if let Some(lora) = self.lookup_single_adapter(idx, SingleLoraTarget::ProjMlp) {
+            mlp_in_base.add(&apply_delta(lora, &x_mod)?)?
         } else { mlp_in_base };
 
         let c = qkv.chunk(3, 2)?;
@@ -644,8 +868,8 @@ impl FluxModel {
         // DIM, matching BFL's actual `linear2` shape. Pre-fix this was a
         // phantom `DIM→DIM` adapter receiving only `attn` (1/5 of the input)
         // — silently shape-checked, MLP-up half got no correction.
-        let l2 = if let Some(lora) = bundle.and_then(|b| b.single_adapters.get(&(idx, SingleLoraTarget::ProjOut))) {
-            l2.add(&lora.forward_delta(&fused)?)?
+        let l2 = if let Some(lora) = self.lookup_single_adapter(idx, SingleLoraTarget::ProjOut) {
+            l2.add(&apply_delta(lora, &fused)?)?
         } else { l2 };
 
         flame_core::bf16_ops::gate_residual_fused_bf16(x, &gate.squeeze(Some(1))?, &l2)
@@ -842,6 +1066,7 @@ impl TrainableModel for FluxModel {
     fn parameters(&self) -> Vec<Parameter> {
         if let Some(ref fft) = self.fft_params { return fft.values().cloned().collect(); }
         if let Some(ref b) = self.bundle { return b.parameters(); }
+        if let Some(ref lb) = self.lycoris_bundle { return lb.parameters(); }
         Vec::new()
     }
 
@@ -850,6 +1075,10 @@ impl TrainableModel for FluxModel {
             for l in b.double_adapters.values() { l.refresh_cache(); }
             for l in b.single_adapters.values() { l.refresh_cache(); }
         }
+        // LyCORIS adapters do not currently expose a `refresh_cache()` analog
+        // (lycoris-rs leaves are bare Tensors, not `LoRALinear`-style cached
+        // matrices); no-op here. See the `FluxLycorisBundle` doc comment for
+        // the shared_storage / COW concern that motivates the future fix.
         if let Some(ref fft) = self.fft_params {
             // Sync FFT weights back to BF16 for forward pass
             for (key, param) in fft {
@@ -896,14 +1125,6 @@ impl TrainableModel for FluxModel {
     /// is always emitted (matches SDXL's recently-landed pattern).
     fn save_weights(&self, path: &str) -> Result<()> {
         let mut tensors = HashMap::new();
-        let bundle = match &self.bundle {
-            Some(b) => b,
-            None => {
-                return Err(crate::EriDiffusionError::Model(
-                    "Flux save_weights requires LoRA mode".into(),
-                ));
-            }
-        };
         let emit_alpha = |prefix: &str, alpha: f32, out: &mut HashMap<String, Tensor>| -> Result<()> {
             let alpha_t = Tensor::from_vec(
                 vec![alpha],
@@ -916,15 +1137,35 @@ impl TrainableModel for FluxModel {
             out.insert(format!("{prefix}.alpha"), alpha_t);
             Ok(())
         };
-        for (&(idx, target), lora) in &bundle.double_adapters {
-            let prefix = format!("double_blocks.{}.{}", idx, double_target_suffix(target));
-            lora.save_tensors(&prefix, &mut tensors)?;
-            emit_alpha(&prefix, lora.alpha, &mut tensors)?;
-        }
-        for (&(idx, target), lora) in &bundle.single_adapters {
-            let prefix = format!("single_blocks.{}.{}", idx, single_target_suffix(target));
-            lora.save_tensors(&prefix, &mut tensors)?;
-            emit_alpha(&prefix, lora.alpha, &mut tensors)?;
+        if let Some(ref bundle) = self.bundle {
+            // Legacy LoRA save — byte-identical to pre-LyCORIS commits.
+            for (&(idx, target), lora) in &bundle.double_adapters {
+                let prefix = format!("double_blocks.{}.{}", idx, double_target_suffix(target));
+                lora.save_tensors(&prefix, &mut tensors)?;
+                emit_alpha(&prefix, lora.alpha, &mut tensors)?;
+            }
+            for (&(idx, target), lora) in &bundle.single_adapters {
+                let prefix = format!("single_blocks.{}.{}", idx, single_target_suffix(target));
+                lora.save_tensors(&prefix, &mut tensors)?;
+                emit_alpha(&prefix, lora.alpha, &mut tensors)?;
+            }
+        } else if let Some(ref lb) = self.lycoris_bundle {
+            // LyCORIS save: per-adapter `<adapter_name>.<algo_suffix>` + alpha.
+            // `AdapterStore.names[i]` already includes the full block-prefixed
+            // path (e.g. `double_blocks.0.img_attn.to_q`); the algo suffix
+            // (e.g. `lora_A.weight`, `hada_w1_a`) comes from
+            // `AdapterModule::named_tensors`.
+            for (i, adapter) in lb.store.adapters.iter().enumerate() {
+                let prefix = &lb.store.names[i];
+                for (suffix, t) in adapter.named_tensors() {
+                    tensors.insert(format!("{prefix}.{suffix}"), t);
+                }
+                emit_alpha(prefix, lb.config.alpha, &mut tensors)?;
+            }
+        } else {
+            return Err(crate::EriDiffusionError::Model(
+                "Flux save_weights requires LoRA or LyCORIS mode".into(),
+            ));
         }
         let p = std::path::Path::new(path);
         flame_core::serialization::save_tensors(&tensors, p, flame_core::serialization::SerializationFormat::SafeTensors)?;
@@ -932,20 +1173,43 @@ impl TrainableModel for FluxModel {
     }
 
     fn load_weights(&mut self, path: &str) -> Result<()> {
-        let bundle = self.bundle.as_ref()
-            .ok_or_else(|| crate::EriDiffusionError::Model("Flux load_weights requires LoRA mode".into()))?;
         let source = flame_core::serialization::load_file(
             std::path::Path::new(path), &self.device,
         ).map_err(|e| crate::EriDiffusionError::Safetensors(format!("load_file: {e}")))?;
-        for (&(idx, target), lora) in &bundle.double_adapters {
-            let prefix = format!("double_blocks.{}.{}", idx, double_target_suffix(target));
-            lora.load_tensors(&prefix, &source)?;
+        if let Some(ref bundle) = self.bundle {
+            for (&(idx, target), lora) in &bundle.double_adapters {
+                let prefix = format!("double_blocks.{}.{}", idx, double_target_suffix(target));
+                lora.load_tensors(&prefix, &source)?;
+            }
+            for (&(idx, target), lora) in &bundle.single_adapters {
+                let prefix = format!("single_blocks.{}.{}", idx, single_target_suffix(target));
+                lora.load_tensors(&prefix, &source)?;
+            }
+            Ok(())
+        } else if let Some(ref lb) = self.lycoris_bundle {
+            // LyCORIS in-place load: validation-only stub for Phase 2b. The
+            // underlying `AdapterStore::load_safetensors` validates that the
+            // file's algo + DoRA match the bundle's config and bails on
+            // mismatch. Per-algo tensor population requires lycoris-rs setter
+            // APIs that don't exist yet (see `lycoris.rs::load_safetensors`
+            // doc comment) — same contract as the legacy
+            // `LycorisBundle::load_safetensors` stub.
+            let mut tmp = AdapterStore::new(lb.config.clone(), self.device.clone());
+            tmp.load_safetensors("", std::path::Path::new(path))
+                .map_err(|e| crate::EriDiffusionError::Safetensors(format!(
+                    "FluxLycorisBundle::load (validation-only stub): {e}"
+                )))?;
+            log::warn!(
+                "[Flux] load_weights: LyCORIS in-place load is a validation-only stub \
+                 — file algo/DoRA matched bundle config; per-algo tensor population \
+                 requires lycoris-rs setter API (Phase 2b follow-up)"
+            );
+            Ok(())
+        } else {
+            Err(crate::EriDiffusionError::Model(
+                "Flux load_weights requires LoRA or LyCORIS mode".into(),
+            ))
         }
-        for (&(idx, target), lora) in &bundle.single_adapters {
-            let prefix = format!("single_blocks.{}.{}", idx, single_target_suffix(target));
-            lora.load_tensors(&prefix, &source)?;
-        }
-        Ok(())
     }
 }
 
