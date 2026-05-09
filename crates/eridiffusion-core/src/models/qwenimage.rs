@@ -95,6 +95,21 @@ impl QwenImageLoraBundle {
         params
     }
 
+    /// Names parallel to `parameters()`. Each adapter contributes
+    /// `(prefix.lora_A, prefix.lora_B)` in order — matches `LoRALinear::parameters`.
+    pub fn parameter_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for ((block_idx, target), _) in self.adapters.iter() {
+            let prefix = format!(
+                "transformer_blocks.{block_idx}.{}",
+                Self::target_suffix(*target),
+            );
+            names.push(format!("{prefix}.lora_A"));
+            names.push(format!("{prefix}.lora_B"));
+        }
+        names
+    }
+
     pub fn refresh_caches(&self) {
         for lora in self.adapters.values() {
             lora.refresh_cache();
@@ -1396,10 +1411,28 @@ fn dual_stream_block_standalone(
     let txt_norm1 = flame_core::layer_norm::layer_norm(txt, &[DIM], None, None, NORM_EPS)?;
     let txt_normed = txt_norm1.mul(&txt_chunks[1].add_scalar(1.0)?)?.add(&txt_chunks[0])?;
 
+    // DIAG: bisect where the magnitude blows up
+    let diag = block_idx <= 2 && std::env::var("QWEN_DIAG_BISECT").ok().as_deref() == Some("1");
+    let dump = |name: &str, t: &Tensor| -> Result<()> {
+        if !diag { return Ok(()); }
+        let v = t.to_dtype(DType::F32)?.to_vec()?;
+        let max_abs = v.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let mean_abs: f32 = v.iter().map(|x| x.abs()).sum::<f32>() / v.len() as f32;
+        log::warn!("[DIAG b{block_idx}] {name}: max={max_abs:.2} mean={mean_abs:.4} numel={}", v.len());
+        Ok(())
+    };
+    dump("img_in", img)?;
+    dump("img_norm1", &img_norm1)?;
+    dump("img_normed", &img_normed)?;
+    dump("img_chunks[1]_scale", &img_chunks[1])?;
+    dump("img_chunks[0]_shift", &img_chunks[0])?;
+
     // Q/K/V with LoRA
     let img_q = add_lora(matmul_bias(&img_normed, bw("attn.to_q.weight")?, Some(bw("attn.to_q.bias")?))?, &img_normed, LoraTarget::ImgQ)?;
     let img_k = add_lora(matmul_bias(&img_normed, bw("attn.to_k.weight")?, Some(bw("attn.to_k.bias")?))?, &img_normed, LoraTarget::ImgK)?;
     let img_v = add_lora(matmul_bias(&img_normed, bw("attn.to_v.weight")?, Some(bw("attn.to_v.bias")?))?, &img_normed, LoraTarget::ImgV)?;
+    dump("img_q", &img_q)?;
+    dump("img_v", &img_v)?;
     let txt_q = add_lora(matmul_bias(&txt_normed, bw("attn.add_q_proj.weight")?, Some(bw("attn.add_q_proj.bias")?))?, &txt_normed, LoraTarget::TxtQ)?;
     let txt_k = add_lora(matmul_bias(&txt_normed, bw("attn.add_k_proj.weight")?, Some(bw("attn.add_k_proj.bias")?))?, &txt_normed, LoraTarget::TxtK)?;
     let txt_v = add_lora(matmul_bias(&txt_normed, bw("attn.add_v_proj.weight")?, Some(bw("attn.add_v_proj.bias")?))?, &txt_normed, LoraTarget::TxtV)?;
@@ -1429,12 +1462,16 @@ fn dual_stream_block_standalone(
         let txt_v_4d = txt_v.reshape(&[b, txt_seq, NUM_HEADS, HEAD_DIM])?;
         Tensor::cat(&[&img_v_4d, &txt_v_4d], 1)?.permute(&[0, 2, 1, 3])?
     };
+    dump("v", &v)?;
     let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
+    dump("attn_out_pre_perm", &attn_out)?;
     let attn_out = attn_out.permute(&[0, 2, 1, 3])?.reshape(&[b, total_seq, DIM])?;
+    dump("attn_out_post_reshape", &attn_out)?;
 
     // Split img/txt
     let img_attn = attn_out.narrow(1, 0, img_seq)?;
     let txt_attn = attn_out.narrow(1, img_seq, txt_seq)?;
+    dump("img_attn (post-narrow)", &img_attn)?;
 
     // Output projections with LoRA
     let img_attn_out = add_lora(

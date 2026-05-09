@@ -712,10 +712,49 @@ fn main() -> anyhow::Result<()> {
 
         // Backward.
         let grads = loss.backward()?;
-        for param in &params {
+        // Per-tensor non-finite-grad guard.  Some early-step / extreme-sigma
+        // combinations push `attn.to_out.0` post-SDPA activations to BF16-
+        // overflow magnitudes (block 1's `img_attn` saw max_abs=4096 in
+        // boxjana 512² runs).  The corresponding lora_B gradient blows up
+        // (lora_B grad = (input @ A^T)^T @ grad_out, A is large-init), and
+        // the upstream gradient that feeds block 0's lora_B picks up NaN.
+        // Without per-tensor zeroing, the global-norm clipper still passes
+        // NaN-element grads through (clamp leaves NaN → NaN), poisoning the
+        // AdamW first/second moments forever.  Mirrors PyTorch's
+        // `clip_grad_norm_(error_if_nonfinite=False)` behavior of dropping
+        // the non-finite tensor's update for that step.
+        let mut nan_skipped = 0usize;
+        let mut nan_names: Vec<String> = Vec::new();
+        let names = if step == 0 || step % 100 == 99 {
+            Some(model.bundle.parameter_names())
+        } else {
+            None
+        };
+        for (i, param) in params.iter().enumerate() {
             if let Some(g) = grads.get(param.id()) {
                 let g = if g.dtype() == DType::F32 { g.clone() } else { g.to_dtype(DType::F32)? };
-                param.set_grad(g)?;
+                let g_vec = g.to_vec()?;
+                let any_bad = g_vec.iter().any(|x| !x.is_finite());
+                if any_bad {
+                    nan_skipped += 1;
+                    if let Some(ref ns) = names {
+                        if let Some(n) = ns.get(i) { nan_names.push(n.clone()); }
+                    }
+                    let zero_g = g.zeros_like_with_dtype(DType::F32)?;
+                    param.set_grad(zero_g)?;
+                } else {
+                    param.set_grad(g)?;
+                }
+            }
+        }
+        if nan_skipped > 0 {
+            if let Some(_) = names {
+                log::warn!(
+                    "[grad-guard] step={} zeroed {} non-finite-grad params: {:?}",
+                    step + 1, nan_skipped, nan_names
+                );
+            } else {
+                log::warn!("[grad-guard] step={} zeroed {} non-finite-grad params", step + 1, nan_skipped);
             }
         }
 
