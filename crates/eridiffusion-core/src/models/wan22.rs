@@ -226,6 +226,11 @@ impl LoraTarget {
 /// Flat table of LoRA adapters keyed by `(block_idx, target)`. One bundle
 /// per expert; the trainer holds two of these for the 14B dual-expert
 /// path.
+///
+/// `Clone` so the bundle can be `Arc::new(b.clone())`-wrapped and captured
+/// into the `AutogradContext::checkpoint_offload` closure (required for the
+/// BlockOffloader path — same pattern as `ChromaLoraBundle`).
+#[derive(Clone)]
 pub struct Wan22LoraBundle {
     pub adapters: HashMap<(usize, LoraTarget), LoRALinear>,
     pub rank: usize,
@@ -273,16 +278,94 @@ impl Wan22LoraBundle {
         self.adapters.len()
     }
 
-    /// Save trained LoRA tensors to a single safetensors file. Naming
-    /// matches archive `model.rs::WanLoraBundle::save`:
-    /// `lora_wan_blocks_{i}_{target_key_with_dots_to_underscores}.{lora_A,lora_B,alpha}`.
+    /// Per-adapter key prefix for the modern PEFT-compliant save format
+    /// (audit H5, 2026-05-09):
+    ///   `blocks.{i}.{target.key()}.{lora_A,lora_B}.weight`
+    /// where `target.key()` is e.g. `self_attn.q` / `cross_attn.o` —
+    /// native Wan key paths, dot-separated, no underscore mangling.
+    /// Matches the Diffusers/PEFT convention chroma uses; cross-loads
+    /// with SimpleTuner / Comfy / diffusers consumers that read native-Wan
+    /// keys.
+    pub fn key_prefix(&self, block_idx: usize, target: LoraTarget) -> String {
+        format!("blocks.{block_idx}.{}", target.key())
+    }
+
+    /// Legacy archive format key prefix:
+    ///   `lora_wan_blocks_{i}_{target_key_with_dots_to_underscores}.{lora_A,lora_B}.weight`
+    /// Kept for backwards-compat reads of LoRAs trained before the
+    /// 2026-05-09 audit-H5 fix. New saves use [`Self::key_prefix`].
+    pub fn key_prefix_legacy(&self, block_idx: usize, target: LoraTarget) -> String {
+        format!(
+            "lora_wan_blocks_{block_idx}_{}",
+            target.key().replace('.', "_")
+        )
+    }
+
+    /// Load saved LoRA tensors INTO this existing bundle in place.
+    /// Tries the modern PEFT format first (`blocks.{i}.{target}.lora_*`)
+    /// then falls back to the legacy `lora_wan_blocks_*` format. Used by
+    /// `train_wan22 --resume-low-lora/--resume-high-lora` and by
+    /// `sample_wan22 --low-lora/--high-lora`. Returns `(hits, total)`.
+    pub fn rehydrate(
+        &self,
+        tensors: &HashMap<String, Tensor>,
+    ) -> Result<(usize, usize)> {
+        let mut hits = 0usize;
+        let mut legacy_hits = 0usize;
+        for ((block_idx, target), lora) in &self.adapters {
+            // Try modern PEFT keys first.
+            let prefix = self.key_prefix(*block_idx, *target);
+            let a_key = format!("{prefix}.lora_A.weight");
+            let b_key = format!("{prefix}.lora_B.weight");
+            let mut loaded = false;
+            if let (Some(a), Some(b)) = (tensors.get(&a_key), tensors.get(&b_key)) {
+                lora.lora_a().set_data(a.clone())?;
+                lora.lora_b().set_data(b.clone())?;
+                hits += 1;
+                loaded = true;
+            }
+            if !loaded {
+                // Fall back to legacy `lora_wan_blocks_*` mangled format.
+                let lp = self.key_prefix_legacy(*block_idx, *target);
+                let la = format!("{lp}.lora_A.weight");
+                let lb = format!("{lp}.lora_B.weight");
+                if let (Some(a), Some(b)) = (tensors.get(&la), tensors.get(&lb)) {
+                    lora.lora_a().set_data(a.clone())?;
+                    lora.lora_b().set_data(b.clone())?;
+                    hits += 1;
+                    legacy_hits += 1;
+                }
+            }
+        }
+        if legacy_hits > 0 {
+            log::warn!(
+                "[wan22] {legacy_hits} adapters loaded from LEGACY `lora_wan_blocks_*` keys. \
+                 Re-save (continue training to next save_every) to migrate to the modern \
+                 `blocks.{{i}}.{{target}}.lora_*.weight` PEFT format."
+            );
+        }
+        Ok((hits, self.adapters.len()))
+    }
+
+    /// Convenience: load + rehydrate from a safetensors path.
+    pub fn rehydrate_from_path(
+        &self,
+        path: &Path,
+        device: Arc<cudarc::driver::CudaDevice>,
+    ) -> Result<(usize, usize)> {
+        let tensors = flame_core::serialization::load_file(path, &device)?;
+        self.rehydrate(&tensors)
+    }
+
+    /// Save trained LoRA tensors to a single safetensors file using the
+    /// modern PEFT-compliant key format
+    /// (`blocks.{i}.{target.key()}.{lora_A,lora_B}.weight`). Cross-loads
+    /// with SimpleTuner / Comfy / diffusers consumers that read native
+    /// Wan key paths. 2026-05-09 audit H5.
     pub fn save(&self, path: &Path) -> Result<()> {
         let mut out: HashMap<String, Tensor> = HashMap::new();
         for ((idx, target), lora) in &self.adapters {
-            let prefix = format!(
-                "lora_wan_blocks_{idx}_{}",
-                target.key().replace('.', "_")
-            );
+            let prefix = self.key_prefix(*idx, *target);
             let a = lora.lora_a().tensor()?;
             let b = lora.lora_b().tensor()?;
             out.insert(format!("{prefix}.lora_A.weight"), a);
@@ -296,18 +379,42 @@ impl Wan22LoraBundle {
 // Wan22Model — single-expert wrapper
 // ---------------------------------------------------------------------------
 
+/// `BlockFacilitator` impl for the Wan 2.2 transformer block layout.
+/// Block keys all start with `blocks.{i}.` — that prefix classifies
+/// every per-block weight; everything else is shared.
+pub struct Wan22Facilitator {
+    pub num_blocks: usize,
+}
+
+impl crate::training::block_offload::BlockFacilitator for Wan22Facilitator {
+    fn block_count(&self) -> usize {
+        self.num_blocks
+    }
+    fn classify_key(&self, name: &str) -> Option<usize> {
+        let rest = name.strip_prefix("blocks.")?;
+        rest.split('.').next()?.parse::<usize>().ok()
+    }
+}
+
 /// Single-expert Wan 2.2 transformer wrapper. The trainer instantiates
 /// ONE of these for TI2V-5B, or TWO of these (high+low) for T2V/I2V-14B.
 pub struct Wan22Model {
     pub config: Wan22Config,
     pub device: Arc<CudaDevice>,
-    /// Frozen base weights. For 14B the trainer SHOULD load these in
-    /// FP8 (`weight_dtype=fp8_scaled`) per
-    /// `feedback_wan22_quant_exception.md` so 28B params fit on 24 GB.
-    /// LoRA params remain F32.
+    /// Resident weights. Without offload: ALL keys (shared + block).
+    /// With offload: shared (non-block) keys only — block weights live
+    /// in `block_offloader`.
     pub weights: HashMap<String, Tensor>,
     pub lora: Wan22LoraBundle,
     pub expert_label: &'static str,
+    /// Optional BlockOffloader. When Some, per-block weights stream from
+    /// pinned CPU memory via `ensure_block(i)` inside the forward path,
+    /// freeing ~num_layers × block_bytes of GPU memory at the cost of
+    /// host-to-device copies (overlapped with compute on the prefetch
+    /// stream). Required for fitting T2V/I2V-A14B on 24 GB; optional but
+    /// useful for TI2V-5B.
+    pub block_offloader:
+        Option<std::sync::Arc<std::sync::Mutex<crate::training::block_offload::BlockOffloader>>>,
 }
 
 impl Wan22Model {
@@ -367,6 +474,70 @@ impl Wan22Model {
             weights,
             lora,
             expert_label,
+            block_offloader: None,
+        })
+    }
+
+    /// Load with BlockOffloader: block weights live in pinned CPU memory,
+    /// streamed to a 2-slot GPU ring per forward step. Shared weights
+    /// (`patch_embedding.*`, `text_embedding.*`, `time_embedding.*`,
+    /// `time_projection.*`, `head.*`) stay resident. Mirrors
+    /// `ChromaTrainingModel::load_swapped` — same checkpoint_offload
+    /// closure pattern in the trainer.
+    pub fn load_swapped(
+        ckpt_path: &Path,
+        cfg: Wan22Config,
+        rank: usize,
+        alpha: f32,
+        weight_dtype: DType,
+        device: Arc<CudaDevice>,
+        seed: u64,
+        expert_label: &'static str,
+    ) -> Result<Self> {
+        log::info!(
+            "[wan22:{expert_label}] loading variant={} from {} via BlockOffloader",
+            cfg.variant.as_str(),
+            ckpt_path.display()
+        );
+
+        // BlockOffloader needs &[&str] shard paths.
+        let shard_path = ckpt_path.to_string_lossy().into_owned();
+        let path_refs: Vec<&str> = vec![shard_path.as_str()];
+
+        let facilitator = Wan22Facilitator { num_blocks: cfg.num_layers };
+        let offloader = crate::training::block_offload::BlockOffloader::load(
+            &path_refs, &facilitator, device.clone(),
+        ).map_err(|e| crate::EriDiffusionError::Model(format!("BlockOffloader load: {e}")))?;
+
+        // Load shared (non-block) weights resident, casting to weight_dtype.
+        let shared_raw = flame_core::serialization::load_file_filtered(
+            ckpt_path, &device, |key| !key.starts_with("blocks."),
+        )?;
+        let mut weights = HashMap::with_capacity(shared_raw.len());
+        for (k, v) in shared_raw {
+            let cast = if v.dtype() == weight_dtype { v } else { v.to_dtype(weight_dtype)? };
+            weights.insert(k, cast);
+        }
+
+        log::info!(
+            "[wan22:{expert_label}] offloader: {} shared weights resident, {} blocks in {:.1} MB pinned",
+            weights.len(), cfg.num_layers,
+            offloader.pinned_bytes() as f64 / (1024.0 * 1024.0),
+        );
+
+        let lora = Wan22LoraBundle::new(&cfg, rank, alpha, device.clone(), seed, expert_label)?;
+        log::info!(
+            "[wan22:{expert_label}] LoRA bundle: rank={rank} alpha={alpha} adapters={}",
+            lora.num_adapters()
+        );
+
+        Ok(Self {
+            config: cfg,
+            device,
+            weights,
+            lora,
+            expert_label,
+            block_offloader: Some(std::sync::Arc::new(std::sync::Mutex::new(offloader))),
         })
     }
 
@@ -387,29 +558,63 @@ impl Wan22Model {
     /// Training forward.
     ///
     /// Inputs:
-    /// - `x`: noised latent `[B, C, F, H, W]` BF16
-    /// - `timestep`: `[B]` F32 in `0..NUM_TRAIN_TIMESTEPS`
-    /// - `context`: UMT5 text embedding `[B, text_len, text_dim]` BF16
+    /// - `x`: noised latent `[C, F, H, W]` BF16 (single sample, B=1 implicit)
+    /// - `timestep`: `[1]` F32 in `0..NUM_TRAIN_TIMESTEPS`
+    /// - `context`: UMT5 text embedding `[1, text_len, text_dim]` BF16
+    /// - `text_mask`: optional `[1, text_len]` F32 (1=real, 0=pad). When
+    ///   set, threads through to cross-attention as a padding mask
+    ///   (audit H1). When None, padded positions contribute to attention.
     ///
-    /// Returns the predicted velocity `[B, C, F, H, W]`.
+    /// Returns the predicted velocity `[C_out, F, H, W]` BF16.
     ///
-    /// **Status:** not yet implemented. The block-level forward needs
-    /// porting from `flame-diffusion-archive/wan-trainer/src/forward_impl/`
-    /// (block.rs, head.rs, rope.rs, forward.rs) onto EDv2's tensor ops.
-    /// Until then, every training step will hit this error and the
-    /// dual-expert dispatch can be exercised with `--max-steps 0` /
-    /// dry-run paths only.
+    /// Implementation: dispatches to `super::wan22_fwd::forward_with_lora`
+    /// (port of the archive's `forward_impl`). The training contract is
+    /// `seq_len == n_patches` — no inference-style padding.
     pub fn forward(
         &mut self,
-        _x: &Tensor,
-        _timestep: &Tensor,
-        _context: &Tensor,
+        x: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        text_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        Err(crate::EriDiffusionError::Model(format!(
-            "Wan22Model::forward[{}] not yet ported — see crates/eridiffusion-core/src/models/wan22.rs \
-             module docs and flame-diffusion-archive/wan-trainer/src/forward_impl/ for the work \
-             items (block.rs, head.rs, rope.rs, forward.rs).",
-            self.expert_label
-        )))
+        // Read scalar timestep off the host (Wan's modulation tables are
+        // scalar-time; timestep ∈ [0, 1000]). For B=1 training the [1]
+        // shape collapses to a single value.
+        let t_vals = timestep.to_dtype(DType::F32)?.to_vec()?;
+        if t_vals.is_empty() {
+            return Err(crate::EriDiffusionError::Model(
+                "Wan22Model::forward: timestep tensor is empty".into(),
+            ));
+        }
+        let t_scalar = t_vals[0];
+
+        // seq_len = (F/p_t) * (H/p_h) * (W/p_w) for the training contract.
+        let x_dims = x.shape().dims();
+        if x_dims.len() != 4 {
+            return Err(crate::EriDiffusionError::Model(format!(
+                "Wan22Model::forward expects x as [C, F, H, W], got {:?}",
+                x_dims
+            )));
+        }
+        let (_c, f_in, h_in, w_in) = (x_dims[0], x_dims[1], x_dims[2], x_dims[3]);
+        let (pt, ph, pw) = (
+            self.config.patch_size[0],
+            self.config.patch_size[1],
+            self.config.patch_size[2],
+        );
+        let seq_len = (f_in / pt) * (h_in / ph) * (w_in / pw);
+
+        super::wan22_fwd::forward_with_lora(
+            &self.config,
+            &self.weights,
+            &self.lora,
+            x,
+            t_scalar,
+            context,
+            seq_len,
+            text_mask,
+            self.block_offloader.as_ref(),
+        )
+        .map_err(Into::into)
     }
 }

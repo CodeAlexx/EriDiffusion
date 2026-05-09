@@ -3,6 +3,7 @@ pub mod board;
 pub mod checkpoint;
 pub mod ema;
 pub mod features;
+pub mod grad_coverage;
 pub mod logging;
 pub mod offload;
 pub mod progress;

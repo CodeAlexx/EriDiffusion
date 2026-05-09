@@ -25,12 +25,24 @@
 //! work item; surfaced here for the bug-fixer to flag.
 //!
 //! ## Status
-//! The Wan 2.2 transformer forward is NOT yet ported (see
-//! `crates/eridiffusion-core/src/models/wan22.rs` module docstring).
-//! This binary builds, parses CLI, loads both experts, decides the
-//! dispatch correctly, and wires the modern feature surface — but every
-//! `forward` call hits a typed `not yet ported` error. Use
-//! `--max-steps 0` to dry-run wiring.
+//! ## Forward status (2026-05-09)
+//!
+//! The Wan 2.2 transformer forward IS now ported — see
+//! `crates/eridiffusion-core/src/models/wan22_fwd/` (mod, rope, head,
+//! block, forward — ~960 LOC ported from
+//! `flame-diffusion-archive/wan-trainer/src/forward_impl/`). The binary
+//! end-to-end path is:
+//!   * load both experts via `Wan22Model::load`
+//!   * dual-expert dispatch by sampled `t_continuous`
+//!   * `Wan22Model::forward` → `wan22_fwd::forward_with_lora`
+//!   * loss + backward via standard EDv2 autograd path
+//!
+//! Optional `FLAME_ACTIVATION_OFFLOAD` checkpointing is NOT wired (the
+//! archive's path requires `Wan22LoraBundle: Clone`, which we don't
+//! derive yet). Standard non-checkpointed path only.
+//!
+//! Remaining work tracked in `PARITY_SIMPLETUNER.md` and the wan-audit
+//! doc (planned).
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -53,6 +65,35 @@ use flame_core::{DType, Shape, Tensor};
 
 const SEED: u64 = 42;
 const NUM_TRAIN_TIMESTEPS: f32 = 1000.0;
+
+/// Optimizer variant — wraps AdamW + AdamW8bit so the trainer's per-step
+/// step()/set_lr()/zero_grad() loop can dispatch by variant.
+/// 2026-05-09 audit M4 (Wan2.2 quant exception per `feedback_wan22_quant_exception`).
+enum WanOpt {
+    AdamW(AdamW),
+    AdamW8bit(eridiffusion_core::training::training_features::AdamW8bit),
+}
+
+impl WanOpt {
+    fn step(&mut self, params: &[flame_core::parameter::Parameter]) -> flame_core::Result<()> {
+        match self {
+            WanOpt::AdamW(o) => o.step(params),
+            WanOpt::AdamW8bit(o) => o.step(params),
+        }
+    }
+    fn zero_grad(&self, params: &[flame_core::parameter::Parameter]) {
+        match self {
+            WanOpt::AdamW(o) => o.zero_grad(params),
+            WanOpt::AdamW8bit(o) => o.zero_grad(params),
+        }
+    }
+    fn set_lr(&mut self, lr: f32) {
+        match self {
+            WanOpt::AdamW(o) => o.set_lr(lr),
+            WanOpt::AdamW8bit(o) => o.lr = lr,
+        }
+    }
+}
 
 #[derive(Parser)]
 struct Args {
@@ -136,6 +177,25 @@ struct Args {
     #[arg(long, default_value_t = 0.0)] gamma_input_perturbation: f32,
     #[arg(long, default_value_t = 0.0)] huber_strength: f32,
     #[arg(long, default_value_t = 0.0)] lr_min_factor: f32,
+    /// Global gradient L2 clip threshold. Default 1.0 matches the prior
+    /// hardcoded constant; SimpleTuner's example wan-2.2 configs use 0.1
+    /// (steadier convergence on video). 2026-05-09 audit H7.
+    #[arg(long, default_value_t = 1.0)] max_grad_norm: f32,
+    /// Run the grad-coverage diagnostic every N steps (and at step 1 and
+    /// the final step). Catches the chroma-pattern partial-gradient bug
+    /// at step 1 instead of at step 500. Cost: ~50-150 ms per call. 0 to
+    /// disable. 2026-05-09 audit H10.
+    #[arg(long, default_value_t = 50)] grad_coverage_every: usize,
+    /// Warn level for grad-coverage. If the fraction of LoRA params with
+    /// non-zero grad is below this, emit `log::warn!`. Default 0.95.
+    #[arg(long, default_value_t = 0.95)] grad_coverage_warn_below: f32,
+    /// Stream block weights from pinned CPU memory to a 2-slot GPU ring
+    /// instead of holding all blocks resident. Frees ~num_layers ×
+    /// block_bytes of GPU memory at the cost of host-to-device copies
+    /// per step (overlapped with compute). Required for fitting 14B+14B
+    /// dual-expert on 24 GB once flame-core grows real FP8; useful but
+    /// optional for TI2V-5B at image-mode resolutions. 2026-05-09 audit M1.
+    #[arg(long, default_value_t = false)] offload: bool,
     #[arg(long)] validation_dataset_dir: Option<PathBuf>,
     #[arg(long, default_value_t = 0)] validation_every_steps: u64,
     #[arg(long, num_args = 0..)] multi_backend_weights: Vec<f32>,
@@ -268,16 +328,29 @@ fn main() -> anyhow::Result<()> {
         weight_dtype,
     );
 
-    let mut low_model = Wan22Model::load(
-        &args.low_noise,
-        cfg.clone(),
-        args.rank,
-        args.lora_alpha as f32,
-        weight_dtype,
-        device.clone(),
-        SEED,
-        "low",
-    )?;
+    let mut low_model = if args.offload {
+        Wan22Model::load_swapped(
+            &args.low_noise,
+            cfg.clone(),
+            args.rank,
+            args.lora_alpha as f32,
+            weight_dtype,
+            device.clone(),
+            SEED,
+            "low",
+        )?
+    } else {
+        Wan22Model::load(
+            &args.low_noise,
+            cfg.clone(),
+            args.rank,
+            args.lora_alpha as f32,
+            weight_dtype,
+            device.clone(),
+            SEED,
+            "low",
+        )?
+    };
     if let Some(p) = &args.resume_low_lora {
         log::info!("[wan22:low] resume LoRA <- {}", p.display());
         // LoRA bundles save as flat safetensors; loading is a per-file
@@ -287,16 +360,29 @@ fn main() -> anyhow::Result<()> {
     }
 
     let mut high_model: Option<Wan22Model> = if dual {
-        let mut hm = Wan22Model::load(
-            args.high_noise.as_ref().unwrap(),
-            cfg.clone(),
-            args.rank,
-            args.lora_alpha as f32,
-            weight_dtype,
-            device.clone(),
-            SEED ^ 0xA14B_A14B,
-            "high",
-        )?;
+        let mut hm = if args.offload {
+            Wan22Model::load_swapped(
+                args.high_noise.as_ref().unwrap(),
+                cfg.clone(),
+                args.rank,
+                args.lora_alpha as f32,
+                weight_dtype,
+                device.clone(),
+                SEED ^ 0xA14B_A14B,
+                "high",
+            )?
+        } else {
+            Wan22Model::load(
+                args.high_noise.as_ref().unwrap(),
+                cfg.clone(),
+                args.rank,
+                args.lora_alpha as f32,
+                weight_dtype,
+                device.clone(),
+                SEED ^ 0xA14B_A14B,
+                "high",
+            )?
+        };
         if let Some(p) = &args.resume_high_lora {
             log::info!("[wan22:high] resume LoRA <- {}", p.display());
             let map = flame_core::serialization::load_file(p, &device)?;
@@ -308,23 +394,29 @@ fn main() -> anyhow::Result<()> {
     };
 
     // ── Optimizer per expert ────────────────────────────────────────────
-    // Each expert gets its OWN AdamW: per-step we step ONLY the
-    // optimizer of the active expert. This matches the gradient flow
-    // (only one expert sees gradient per step).
-    match OptimizerKind::parse(&args.optimizer) {
-        Ok(OptimizerKind::AdamW) => {}
-        Ok(other) => log::warn!(
-            "non-AdamW optimizer {} — Phase 1 falls back to AdamW",
-            other.as_str()
-        ),
-        Err(e) => log::warn!("--optimizer parse: {e} — falling back to AdamW"),
-    }
-    let mut opt_low = AdamW::new(args.lr, 0.9, 0.999, 1e-8, 0.01);
-    let mut opt_high: Option<AdamW> = if dual {
-        Some(AdamW::new(args.lr, 0.9, 0.999, 1e-8, 0.01))
-    } else {
-        None
+    // 2026-05-09 audit M4: AdamW8bit is now wired (was warn-and-fallback).
+    // Per `feedback_wan22_quant_exception` 8bit is the supported quant
+    // exception for Wan; saves ~3× optimizer state vs F32 AdamW.
+    let opt_kind = OptimizerKind::parse(&args.optimizer)
+        .map_err(|e| anyhow::anyhow!("--optimizer parse: {e}"))?;
+    let make_opt = || -> WanOpt {
+        match opt_kind {
+            OptimizerKind::AdamW    => WanOpt::AdamW(AdamW::new(args.lr, 0.9, 0.999, 1e-8, 0.01)),
+            OptimizerKind::AdamW8bit => WanOpt::AdamW8bit(eridiffusion_core::training::training_features::AdamW8bit::new(
+                args.lr, 0.9, 0.999, 1e-8, 0.01,
+            )),
+            other => {
+                log::warn!(
+                    "optimizer {} not implemented for wan trainer; falling back to AdamW",
+                    other.as_str()
+                );
+                WanOpt::AdamW(AdamW::new(args.lr, 0.9, 0.999, 1e-8, 0.01))
+            }
+        }
     };
+    log::info!("[wan22] optimizer={}", opt_kind.as_str());
+    let mut opt_low = make_opt();
+    let mut opt_high: Option<WanOpt> = if dual { Some(make_opt()) } else { None };
 
     let params_low = low_model.parameters();
     log::info!("[wan22:low] {} trainable LoRA tensors", params_low.len());
@@ -338,6 +430,7 @@ fn main() -> anyhow::Result<()> {
 
     // ── Caption dropout (null text cache) ───────────────────────────────
     let mut effective_caption_dropout_prob = args.caption_dropout_probability;
+    let mut null_text_mask: Option<Tensor> = None;
     let null_text: Option<Tensor> = if effective_caption_dropout_prob > 0.0 {
         match args.null_text_cache.as_ref() {
             Some(p) => match flame_core::serialization::load_file(p, &device) {
@@ -345,10 +438,15 @@ fn main() -> anyhow::Result<()> {
                     let nt = s.get("text_embedding")
                         .ok_or_else(|| anyhow::anyhow!("--null-text-cache missing 'text_embedding'"))?
                         .to_dtype(DType::BF16)?;
+                    // text_mask is best-effort: missing means "no padding mask
+                    // for null text" which is fine — null caption is short and
+                    // the model has seen padded null at training time anyway.
+                    null_text_mask = s.get("text_mask").and_then(|t| t.to_dtype(DType::F32).ok());
                     log::info!(
-                        "[caption-dropout] WIRED — prob={:.3} (null_text_embedding={:?})",
+                        "[caption-dropout] WIRED — prob={:.3} (null_text_embedding={:?}, mask={})",
                         effective_caption_dropout_prob,
-                        nt.shape().dims()
+                        nt.shape().dims(),
+                        if null_text_mask.is_some() { "present" } else { "absent" }
                     );
                     Some(nt)
                 }
@@ -480,6 +578,9 @@ fn main() -> anyhow::Result<()> {
         // --- 1. Sample one batch (B=1 for first pass; archive matched)
         let mut batch_latents: Vec<Tensor> = Vec::with_capacity(args.batch_size);
         let mut batch_texts: Vec<Tensor> = Vec::with_capacity(args.batch_size);
+        // Audit H1: text_mask is best-effort; older caches won't have it,
+        // so per-sample is Option<Tensor> and we pass None if any is absent.
+        let mut batch_text_masks: Vec<Option<Tensor>> = Vec::with_capacity(args.batch_size);
         for bi in 0..args.batch_size {
             let cache_idx = (step * args.batch_size + bi) % cache_files.len();
             let sample = flame_core::serialization::load_file(&cache_files[cache_idx], &device)?;
@@ -503,17 +604,26 @@ fn main() -> anyhow::Result<()> {
                     dims[3], dims[4], cache_files[cache_idx].display()
                 );
             }
-            // Caption dropout
-            let txt = if let Some(ref nt) = null_text {
+            // Read optional text_mask (audit H1). Missing in old caches.
+            let txt_mask = sample.get("text_mask").and_then(|t| t.to_dtype(DType::F32).ok());
+            // Caption dropout: swap to null embedding (and its mask) when fired.
+            let dropout_fired = if let Some(_) = null_text {
                 use rand::Rng;
-                if rng.r#gen::<f32>() < effective_caption_dropout_prob {
-                    nt.clone()
-                } else {
-                    txt
-                }
-            } else { txt };
+                rng.r#gen::<f32>() < effective_caption_dropout_prob
+            } else {
+                false
+            };
+            let (txt, txt_mask) = if dropout_fired {
+                (
+                    null_text.as_ref().unwrap().clone(),
+                    null_text_mask.clone(),
+                )
+            } else {
+                (txt, txt_mask)
+            };
             batch_latents.push(latent);
             batch_texts.push(txt);
+            batch_text_masks.push(txt_mask);
         }
         let latent = if args.batch_size == 1 {
             batch_latents.pop().unwrap()
@@ -526,6 +636,14 @@ fn main() -> anyhow::Result<()> {
         } else {
             let refs: Vec<&Tensor> = batch_texts.iter().collect();
             Tensor::cat(&refs, 0)?.contiguous()?
+        };
+        // Audit H1: per-batch text_mask. For B=1 just take the single
+        // optional mask. For B>1 we'd need to concatenate; punt to None
+        // (B>1 is open per audit H2 anyway).
+        let text_mask: Option<Tensor> = if args.batch_size == 1 {
+            batch_text_masks.pop().unwrap()
+        } else {
+            None
         };
 
         // --- 2. Per-batch-element timestep + Wan time shift
@@ -557,12 +675,25 @@ fn main() -> anyhow::Result<()> {
         // --- 4. Build noisy + velocity target (matches archive pipeline.rs)
         //   x_t = (1 - t) * x_1 + t * x_0   (x_1 = clean, x_0 = noise)
         //   target = x_0 - x_1
-        let noise = Tensor::randn(latent.shape().clone(), 0.0, 1.0, device.clone())?
+        // 2026-05-09 (audit C1): for B=1 squeeze the leading batch dim so
+        // shapes match `Wan22Model::forward`'s [C, F, H, W] contract. Cache
+        // latents are 5D [1, C, F, H, W]; the archive's main.rs:186 does
+        // the same `narrow(0,0,1).squeeze(0)` here and EDv2 had forgotten.
+        // 2026-05-09 audit H8: seed the noise so training is reproducible.
+        // (Tensor::randn uses a global RNG that is never seeded; switching
+        // to randn_seeded with a derived per-step seed makes the run
+        // bit-identical across re-launches.)
+        let noise_seed = SEED.wrapping_add((step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let noise = Tensor::randn_seeded(latent.shape().clone(), 0.0, 1.0, noise_seed, device.clone())?
             .to_dtype(DType::BF16)?;
         let (noisy, target) = if args.batch_size == 1 {
             let t = t_continuous[0];
-            let noisy = noise.mul_scalar(t)?.add(&latent.mul_scalar(1.0 - t)?)?;
-            let target = noise.sub(&latent)?;
+            let noisy_5d = noise.mul_scalar(t)?.add(&latent.mul_scalar(1.0 - t)?)?;
+            let target_5d = noise.sub(&latent)?;
+            // Squeeze leading B dim → [C, F, H, W] for the forward and the
+            // 4D pred output.
+            let noisy = noisy_5d.squeeze(Some(0))?;
+            let target = target_5d.squeeze(Some(0))?;
             (noisy, target)
         } else {
             let t_tensor = Tensor::from_vec(
@@ -591,31 +722,20 @@ fn main() -> anyhow::Result<()> {
             );
         }
 
-        // --- 5. Forward through chosen expert (currently errors)
+        // --- 5. Forward through chosen expert
+        let text_mask_ref = text_mask.as_ref();
         let pred_res = match chosen {
             Expert::High => match high_model.as_mut() {
-                Some(hm) => hm.forward(&noisy, &timestep, &txt),
+                Some(hm) => hm.forward(&noisy, &timestep, &txt, text_mask_ref),
                 None => Err(eridiffusion_core::EriDiffusionError::Model(
                     "high-noise expert requested but not loaded".into(),
                 )),
             },
-            Expert::Low => low_model.forward(&noisy, &timestep, &txt),
+            Expert::Low => low_model.forward(&noisy, &timestep, &txt, text_mask_ref),
         };
         let pred = match pred_res {
             Ok(p) => p,
-            Err(e) => {
-                // The forward is intentionally not yet ported. Surface a
-                // clear error and bail so the dual-expert dispatch
-                // remains testable via --max-steps 0 and the model loader
-                // smoke-tests without silently producing zeros.
-                anyhow::bail!(
-                    "step {step} expert={:?}: {e}\n\
-                     (see crates/eridiffusion-core/src/models/wan22.rs and \
-                     flame-diffusion-archive/wan-trainer/src/forward_impl/ \
-                     for the deferred forward port)",
-                    chosen
-                );
-            }
+            Err(e) => anyhow::bail!("step {step} expert={:?} forward failed: {e}", chosen),
         };
 
         if pred.shape().dims() != target.shape().dims() {
@@ -646,7 +766,24 @@ fn main() -> anyhow::Result<()> {
 
         // --- 7. Backward + clip-grad-norm + step (only the active expert)
         let grads = loss.backward()?;
-        const CLIP_GRAD_NORM: f32 = 1.0;
+        // Audit H10: at step 1 (and every save_every), check what fraction
+        // of the active expert's LoRA params have non-zero gradient. <95%
+        // is the chroma-bug signature.
+        let do_grad_coverage = args.grad_coverage_every > 0
+            && (step == 0 || step + 1 == steps || (step + 1) % args.grad_coverage_every == 0);
+        if do_grad_coverage {
+            let active_for_cov = match chosen {
+                Expert::High => &params_high,
+                Expert::Low  => &params_low,
+            };
+            let label = match chosen { Expert::High => "wan22-high", Expert::Low => "wan22-low" };
+            match eridiffusion_core::training::grad_coverage::GradCoverage::measure(
+                active_for_cov, &grads,
+            ) {
+                Ok(cov) => cov.report_warn_below(args.grad_coverage_warn_below, label),
+                Err(e)  => log::warn!("[grad-coverage] measure failed at step {step}: {e}"),
+            }
+        }
         let active_params = match chosen {
             Expert::High => &params_high,
             Expert::Low  => &params_low,
@@ -660,7 +797,8 @@ fn main() -> anyhow::Result<()> {
         } else {
             flame_core::ops::grad_norm::global_l2_norm(&grad_refs)?.item()? as f32
         };
-        let scale = if total_norm > CLIP_GRAD_NORM { CLIP_GRAD_NORM / total_norm } else { 1.0 };
+        // 2026-05-09 audit H7: --max-grad-norm now CLI-configurable.
+        let scale = if total_norm > args.max_grad_norm { args.max_grad_norm / total_norm } else { 1.0 };
         for param in active_params {
             if let Some(g) = grads.get(param.id()) {
                 let g_scaled = if scale < 1.0 { g.mul_scalar(scale)? } else { g.clone() };
@@ -753,27 +891,11 @@ fn rehydrate_bundle(
     model: &mut Wan22Model,
     map: &std::collections::HashMap<String, Tensor>,
 ) -> anyhow::Result<()> {
-    let mut hits = 0usize;
-    let mut misses = 0usize;
-    for ((idx, target), lora) in &model.lora.adapters {
-        let prefix = format!(
-            "lora_wan_blocks_{idx}_{}",
-            target.key().replace('.', "_")
-        );
-        let a_key = format!("{prefix}.lora_A.weight");
-        let b_key = format!("{prefix}.lora_B.weight");
-        match (map.get(&a_key), map.get(&b_key)) {
-            (Some(a), Some(b)) => {
-                lora.lora_a().set_data(a.clone())?;
-                lora.lora_b().set_data(b.clone())?;
-                hits += 1;
-            }
-            _ => {
-                misses += 1;
-            }
-        }
-        let _ = (idx, target); // silence unused lint
-    }
+    // 2026-05-09 audit H5: now delegates to `Wan22LoraBundle::rehydrate`,
+    // which is shared with `sample_wan22 --low-lora/--high-lora`.
+    let (hits, total) = model.lora.rehydrate(map)
+        .map_err(|e| anyhow::anyhow!("rehydrate: {e}"))?;
+    let misses = total.saturating_sub(hits);
     log::info!("[wan22:{}] rehydrated {} adapters ({} missing)", model.expert_label, hits, misses);
     if hits == 0 {
         anyhow::bail!("no LoRA adapters matched in resume file (key prefix mismatch)");

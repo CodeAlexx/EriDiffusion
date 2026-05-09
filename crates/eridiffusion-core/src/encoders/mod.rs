@@ -14,4 +14,6 @@ pub mod gemma3;
 pub mod ltx2_vae;
 pub mod wan21_encoder;
 pub mod wan21_decoder;
+pub mod wan22_vae;
+pub mod umt5;
 pub mod qwen25vl;

@@ -1,7 +1,7 @@
 use flame_core::{parameter::Parameter, Tensor};
 use crate::Result;
 
-pub mod acestep; pub mod chroma; pub mod flux; pub mod ernie; pub mod klein; pub mod qwenimage; pub mod sdxl; pub mod sd35; pub mod zimage; pub mod ltx2; pub mod anima; pub mod wan22;
+pub mod acestep; pub mod chroma; pub mod flux; pub mod ernie; pub mod klein; pub mod qwenimage; pub mod sdxl; pub mod sd35; pub mod zimage; pub mod ltx2; pub mod anima; pub mod wan22; pub mod wan22_fwd;
 pub use acestep::AceStepLoRAModel;
 pub use chroma::ChromaTrainingModel;
 pub use qwenimage::QwenImageTrainingModel;

@@ -10,6 +10,7 @@ pub mod training;
 pub mod utils;
 pub mod encoders;
 pub mod sampler;
+pub mod video;
 
 use thiserror::Error;
 

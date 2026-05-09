@@ -81,6 +81,16 @@ struct Args {
     #[arg(long, default_value = "euler")] sampler: String,
     /// Use BlockOffloader (recommended for 24 GB cards — keeps ~3 GB free).
     #[arg(long)] offload: bool,
+    /// Optional path to a LoRA safetensors file produced by `train_chroma`
+    /// (or `ChromaLoraBundle::save`). When set, the LoRA is attached to the
+    /// transformer before sampling. Use this to inspect a trained LoRA:
+    ///   sample_chroma --lora /path/to/chroma_lora_step1500.safetensors \
+    ///                 --prompt "..." --output sample.png --offload
+    #[arg(long)] lora: Option<PathBuf>,
+    /// LoRA rank — must match the rank used at training time. Default 16.
+    #[arg(long, default_value_t = 16)] lora_rank: usize,
+    /// LoRA alpha — must match training time. Default = rank (effective scale 1.0).
+    #[arg(long)] lora_alpha: Option<f32>,
 }
 
 fn tokenize_t5(
@@ -177,12 +187,20 @@ fn main() -> anyhow::Result<()> {
     // Stage 2: Load Chroma transformer
     // ------------------------------------------------------------------
     log::info!("[2/4] Loading Chroma transformer (offload={})...", args.offload);
-    let model = if args.offload {
+    // When a LoRA is requested, build the model with the matching rank/alpha
+    // so the bundle's adapter shapes line up; otherwise the trivial rank=1
+    // shapes are fine (bundle weights will be replaced on load).
+    let (init_rank, init_alpha) = if args.lora.is_some() {
+        (args.lora_rank, args.lora_alpha.unwrap_or(args.lora_rank as f32))
+    } else {
+        (1usize, 1.0f32)
+    };
+    let mut model = if args.offload {
         ChromaTrainingModel::load_swapped(
             &args.transformer,
-            "lora", // mode=lora means no FFT params, just frozen weights
-            1,      // lora_rank (not used in inference)
-            1.0,    // lora_alpha (not used)
+            "lora",
+            init_rank,
+            init_alpha,
             device.clone(),
             args.seed,
         )
@@ -191,13 +209,30 @@ fn main() -> anyhow::Result<()> {
         ChromaTrainingModel::load(
             &args.transformer,
             "lora",
-            1,
-            1.0,
+            init_rank,
+            init_alpha,
             device.clone(),
             args.seed,
         )
         .map_err(|e| anyhow::anyhow!("Chroma load: {e}"))?
     };
+
+    // If --lora is set, replace the bundle's zero-init adapters with the
+    // trained tensors loaded from disk. This swaps the entire ChromaLoraBundle
+    // (rather than mutating per-adapter via load_tensors) so sampling sees
+    // the trained weights end-to-end.
+    if let Some(lora_path) = args.lora.as_ref() {
+        let alpha = args.lora_alpha.unwrap_or(args.lora_rank as f32);
+        log::info!(
+            "[2.5/4] Loading LoRA from {} (rank={}, alpha={})",
+            lora_path.display(), args.lora_rank, alpha
+        );
+        let bundle = eridiffusion_core::models::chroma::ChromaLoraBundle::load_from_safetensors(
+            lora_path, args.lora_rank, alpha, device.clone(),
+        ).map_err(|e| anyhow::anyhow!("LoRA load: {e}"))?;
+        model.bundle = Some(bundle);
+        log::info!("[2.5/4] LoRA attached: {} adapters", model.bundle.as_ref().unwrap().num_adapters());
+    }
 
     // ------------------------------------------------------------------
     // Stage 3: Denoise

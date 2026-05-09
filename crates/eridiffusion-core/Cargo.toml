@@ -27,6 +27,8 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # `ureq` is a sync HTTP client — chosen over `reqwest` to avoid pulling tokio.
 nvml-wrapper = "0.10"
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+# Used by encoders/umt5.rs for FP16-on-disk → BF16 conversion path.
+half = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

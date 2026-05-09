@@ -180,34 +180,58 @@ impl ChromaLoraBundle {
         }
     }
 
+    /// Load LoRA tensors from a safetensors file produced by `save()` (or
+    /// `train_chroma`'s checkpoint format) into a freshly-constructed bundle.
+    /// Used by `sample_chroma --lora <PATH>` and any other inference path
+    /// that wants to apply a trained LoRA at sampling time.
+    pub fn load_from_safetensors(
+        path: &std::path::Path,
+        rank: usize,
+        alpha: f32,
+        device: Arc<cudarc::driver::CudaDevice>,
+    ) -> Result<Self> {
+        let bundle = Self::new(rank, alpha, device.clone(), 0)?;
+        bundle.load_weights(path, device)?;
+        Ok(bundle)
+    }
+
+    /// Load LoRA tensors into THIS existing bundle in place (Parameter has
+    /// interior mutability via `set_data`). Used by `train_chroma --resume-lora`
+    /// to pick up from a prior checkpoint without rebuilding the bundle —
+    /// the Vec<Parameter> the optimizer was constructed with stays valid
+    /// because its IDs don't change.
+    pub fn load_weights(
+        &self,
+        path: &std::path::Path,
+        device: Arc<cudarc::driver::CudaDevice>,
+    ) -> Result<()> {
+        let tensors = flame_core::serialization::load_tensors(
+            path,
+            device,
+            flame_core::serialization::SerializationFormat::SafeTensors,
+        )?;
+        for (&(block_idx, target), lora) in &self.double_adapters {
+            let suffix = double_lora_suffix(target);
+            let prefix = format!("transformer_blocks.{block_idx}.{suffix}");
+            lora.load_tensors(&prefix, &tensors)?;
+        }
+        for (&(block_idx, target), lora) in &self.single_adapters {
+            let suffix = single_lora_suffix(target);
+            let prefix = format!("single_transformer_blocks.{block_idx}.{suffix}");
+            lora.load_tensors(&prefix, &tensors)?;
+        }
+        Ok(())
+    }
+
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
         let mut tensors = HashMap::new();
         for (&(block_idx, target), lora) in &self.double_adapters {
-            let suffix = match target {
-                DoubleLoraTarget::ImgQ => "attn.to_q",
-                DoubleLoraTarget::ImgK => "attn.to_k",
-                DoubleLoraTarget::ImgV => "attn.to_v",
-                DoubleLoraTarget::ImgOut => "attn.to_out.0",
-                DoubleLoraTarget::TxtQ => "attn.add_q_proj",
-                DoubleLoraTarget::TxtK => "attn.add_k_proj",
-                DoubleLoraTarget::TxtV => "attn.add_v_proj",
-                DoubleLoraTarget::TxtOut => "attn.to_add_out",
-                DoubleLoraTarget::ImgFfnGate => "ff.net.0.proj",
-                DoubleLoraTarget::ImgFfnOut => "ff.net.2",
-                DoubleLoraTarget::TxtFfnGate => "ff_context.net.0.proj",
-                DoubleLoraTarget::TxtFfnOut => "ff_context.net.2",
-            };
+            let suffix = double_lora_suffix(target);
             let prefix = format!("transformer_blocks.{block_idx}.{suffix}");
             lora.save_tensors(&prefix, &mut tensors)?;
         }
         for (&(block_idx, target), lora) in &self.single_adapters {
-            let suffix = match target {
-                SingleLoraTarget::Q => "attn.to_q",
-                SingleLoraTarget::K => "attn.to_k",
-                SingleLoraTarget::V => "attn.to_v",
-                SingleLoraTarget::ProjMlp => "proj_mlp",
-                SingleLoraTarget::ProjOut => "proj_out",
-            };
+            let suffix = single_lora_suffix(target);
             let prefix = format!("single_transformer_blocks.{block_idx}.{suffix}");
             lora.save_tensors(&prefix, &mut tensors)?;
         }
@@ -216,6 +240,33 @@ impl ChromaLoraBundle {
             path,
             flame_core::serialization::SerializationFormat::SafeTensors,
         )
+    }
+}
+
+fn double_lora_suffix(target: DoubleLoraTarget) -> &'static str {
+    match target {
+        DoubleLoraTarget::ImgQ => "attn.to_q",
+        DoubleLoraTarget::ImgK => "attn.to_k",
+        DoubleLoraTarget::ImgV => "attn.to_v",
+        DoubleLoraTarget::ImgOut => "attn.to_out.0",
+        DoubleLoraTarget::TxtQ => "attn.add_q_proj",
+        DoubleLoraTarget::TxtK => "attn.add_k_proj",
+        DoubleLoraTarget::TxtV => "attn.add_v_proj",
+        DoubleLoraTarget::TxtOut => "attn.to_add_out",
+        DoubleLoraTarget::ImgFfnGate => "ff.net.0.proj",
+        DoubleLoraTarget::ImgFfnOut => "ff.net.2",
+        DoubleLoraTarget::TxtFfnGate => "ff_context.net.0.proj",
+        DoubleLoraTarget::TxtFfnOut => "ff_context.net.2",
+    }
+}
+
+fn single_lora_suffix(target: SingleLoraTarget) -> &'static str {
+    match target {
+        SingleLoraTarget::Q => "attn.to_q",
+        SingleLoraTarget::K => "attn.to_k",
+        SingleLoraTarget::V => "attn.to_v",
+        SingleLoraTarget::ProjMlp => "proj_mlp",
+        SingleLoraTarget::ProjOut => "proj_out",
     }
 }
 

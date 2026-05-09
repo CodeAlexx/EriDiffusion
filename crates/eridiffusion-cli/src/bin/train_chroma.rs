@@ -351,15 +351,19 @@ fn main() -> anyhow::Result<()> {
     };
 
     if let Some(resume_path) = args.resume_lora.as_ref() {
-        log::info!("Resuming LoRA weights only from {}", resume_path.display());
-        // ChromaTrainingModel doesn't expose a load_weights helper yet; the
-        // bundle's save round-trips through `flame_core::serialization`.
-        // For v1 we bail with a clear error if --resume-lora is requested
-        // until that wiring lands. Mirrors the "no full-resume" stance below.
-        anyhow::bail!(
-            "--resume-lora not yet wired for chroma (bundle lacks load_weights). \
-             For v1, restart from scratch or wait for the resume hook."
-        );
+        log::info!("Resuming LoRA weights from {}", resume_path.display());
+        // 2026-05-09: wired. `ChromaLoraBundle::load_weights` mutates the
+        // existing bundle's adapters in-place via Parameter::set_data, so
+        // the AdamW optimizer's parameter list (already built below) keeps
+        // referencing the same Parameter IDs.
+        match model.bundle.as_ref() {
+            Some(bundle) => {
+                bundle.load_weights(resume_path, device.clone())
+                    .map_err(|e| anyhow::anyhow!("--resume-lora load: {e}"))?;
+                log::info!("Resumed {} LoRA adapters", bundle.num_adapters());
+            }
+            None => anyhow::bail!("--resume-lora requires LoRA mode (--mode lora), not full"),
+        }
     }
 
     let save_mode_full = match args.save_mode.as_str() {
