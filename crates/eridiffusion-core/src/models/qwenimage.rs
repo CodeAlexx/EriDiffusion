@@ -1605,25 +1605,21 @@ fn dual_stream_block_iflame(
         out.reshape(&dims)
     };
 
-    // LayerNorm without affine — F32 manual path for autograd correctness.
-    // 2026-05-09 fix: same chroma-pattern as rms_norm above. Was using
-    // `cuda_ops_bf16::layer_norm_bf16` (inference-only); switched to a
-    // hand-rolled F32 mean/var/rstd path that uses only autograd-aware
-    // primitives. Mirrors `wan22_fwd/block.rs::layer_norm_no_affine` exactly.
+    // LayerNorm without affine.  Use the canonical
+    // `flame_core::layer_norm::layer_norm` directly — same wrapper the
+    // sibling `dual_stream_block_standalone` and the rest of qwen forward
+    // already use (lines 982/985/1044/1055/etc).
+    //
+    // 2026-05-09 fix history: an earlier version of this fix hand-rolled
+    // a BF16→F32 manual mean/var/rstd path mirroring
+    // `wan22_fwd/block.rs::layer_norm_no_affine`.  That path NaN'd the
+    // first-step gradients in 50-step GPU validation (grad_norm = NaN at
+    // step 1, inf at step 3, 3.57e14 at step 4) — same shape as the
+    // F32-sub-tape problem fixed in lycoris-rs ac5350d.  Switching to
+    // the canonical wrapper avoids the F32 sub-tape entirely.
     let layer_norm_no_affine = |x: &Tensor, eps: f32| -> Result<Tensor> {
-        let x_f32 = x.to_dtype(DType::F32)?;
-        let dims = x_f32.shape().dims().to_vec();
-        let hidden = *dims.last().unwrap();
-        let batch: usize = dims[..dims.len() - 1].iter().product();
-        let x_flat = x_f32.reshape(&[batch, hidden])?;
-        let mean = x_flat.sum_dim_keepdim(1)?.mul_scalar(1.0 / hidden as f32)?;
-        let centered = x_flat.sub(&mean)?;
-        let var = centered.mul(&centered)?
-            .sum_dim_keepdim(1)?
-            .mul_scalar(1.0 / hidden as f32)?;
-        let rstd = var.add_scalar(eps)?.sqrt()?.reciprocal()?;
-        let normed = centered.mul(&rstd)?;
-        normed.reshape(&dims)?.to_dtype(DType::BF16)
+        let hidden = *x.shape().dims().last().unwrap();
+        flame_core::layer_norm::layer_norm(x, &[hidden], None, None, eps)
     };
 
     let b = img.shape().dims()[0];
