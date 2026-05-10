@@ -178,6 +178,8 @@ fn main() -> anyhow::Result<()> {
             device: device.clone(),
             weights: all_weights,
             lora_adapters: Vec::new(),
+            lycoris_adapters: Vec::new(),
+            algo: eridiffusion_core::lycoris::LycorisAlgo::None,
             parameters: Vec::new(),
             is_lora: false,
             offloader: None,

@@ -57,8 +57,10 @@ use std::sync::Arc;
 use cudarc::driver::CudaDevice;
 use flame_core::{parameter::Parameter, DType, Tensor};
 
+use crate::adapter::{AdapterModule, LycorisLinear};
 use crate::config::TrainConfig;
 use crate::lora::LoRALinear;
+use crate::lycoris::{LycorisAlgo, LycorisBundleConfig};
 use crate::Result;
 
 // ---------------------------------------------------------------------------
@@ -232,7 +234,17 @@ impl LoraTarget {
 /// BlockOffloader path — same pattern as `ChromaLoraBundle`).
 #[derive(Clone)]
 pub struct Wan22LoraBundle {
+    /// Legacy plain-LoRA adapters. Empty when a LyCORIS algo is active.
     pub adapters: HashMap<(usize, LoraTarget), LoRALinear>,
+    /// LyCORIS adapters (LoCon/LoHa/LoKr/Full/OFT). Empty when
+    /// `algo == LycorisAlgo::None`. Wrapped in `Arc` so the bundle's `Clone`
+    /// (used by `wan22_fwd::forward.rs::bundle_arc.clone()` for the
+    /// BlockOffloader checkpoint path) stays cheap (refcount bump per
+    /// adapter rather than re-cloning leaves).
+    pub lycoris_adapters: HashMap<(usize, LoraTarget), Arc<LycorisLinear>>,
+    /// Currently active algo. `LycorisAlgo::None` means the legacy
+    /// `LoRALinear` path is in use (see `adapters` above).
+    pub algo: LycorisAlgo,
     pub rank: usize,
     pub alpha: f32,
     pub expert_label: &'static str,
@@ -260,22 +272,146 @@ impl Wan22LoraBundle {
         }
         Ok(Self {
             adapters,
+            lycoris_adapters: HashMap::new(),
+            algo: LycorisAlgo::None,
             rank,
             alpha,
             expert_label,
         })
     }
 
+    /// LyCORIS-aware constructor. `config.algo == LycorisAlgo::None` falls
+    /// back to plain `LoRALinear` (legacy byte-identical path). Other algos
+    /// build `LycorisLinear` per target via the matching `lycoris_rs`
+    /// `*_for_training` constructor and store them in `lycoris_adapters`.
+    ///
+    /// `Full` and `OFT` bundle-construction succeeds, but their
+    /// `forward_delta` returns an error — wan22's call pattern is
+    /// `base + delta_on_input`, which is incompatible with Full's
+    /// "weight delta merged into base" or OFT's `R·(W·x+b)` semantics.
+    /// Phase 2c will wire merge-into-base for those algos.
+    pub fn new_with_config(
+        cfg: &Wan22Config,
+        lyc: &LycorisBundleConfig,
+        device: Arc<CudaDevice>,
+        seed: u64,
+        expert_label: &'static str,
+    ) -> Result<Self> {
+        if lyc.algo == LycorisAlgo::None {
+            return Self::new(cfg, lyc.rank, lyc.alpha, device, seed, expert_label);
+        }
+        let dim = cfg.dim;
+        let mut lycoris_adapters: HashMap<(usize, LoraTarget), Arc<LycorisLinear>> =
+            HashMap::new();
+        for block_idx in 0..cfg.num_layers {
+            for &target in LoraTarget::all() {
+                let wrapper = build_wan22_lycoris_linear(lyc, dim, dim, device.clone())?;
+                lycoris_adapters.insert((block_idx, target), Arc::new(wrapper));
+            }
+        }
+        let _ = seed; // lycoris-rs uses its own internal RNG (kaiming/normal init).
+        Ok(Self {
+            adapters: HashMap::new(),
+            lycoris_adapters,
+            algo: lyc.algo,
+            rank: lyc.rank,
+            alpha: lyc.alpha,
+            expert_label,
+        })
+    }
+
+    /// SimpleTuner-style perturbed-normal init for LoKr.
+    ///
+    /// Phase 2b limitation: wan22's per-block weights are streamed via
+    /// `BlockOffloader` and may not be resident at bundle-construction
+    /// time, so this method (mirroring `qwenimage::apply_init_perturbed_normal`)
+    /// logs a warning and returns Ok(()) without touching adapters when
+    /// the resident base-weight map isn't available. Phase 2c will plumb
+    /// the resident `block_weights` map into this method.
+    pub fn apply_init_perturbed_normal(
+        &self,
+        _base_weights: &HashMap<String, Tensor>,
+        scale: f32,
+    ) -> Result<()> {
+        if self.algo != LycorisAlgo::LoKr || scale <= 0.0 {
+            return Ok(());
+        }
+        log::warn!(
+            "[wan22:{}] init_lokr_norm={scale} requested but trainer-side base-weight \
+             access is not yet wired for wan22 (block weights are streamed via \
+             BlockOffloader and not always resident at bundle-construction time). \
+             LoKr magnitude will use its lycoris-rs default init for this run. \
+             Phase 2c will plumb the resident `block_weights` map into this method.",
+            self.expert_label,
+        );
+        Ok(())
+    }
+
+    /// Look up the active adapter for `(block_idx, target)`. Prefers the
+    /// LyCORIS map when populated; falls back to the legacy plain-LoRA map.
+    /// Returns `None` when neither has an entry. Mirrors
+    /// `QwenImageLoraBundle::adapter_for`.
+    pub fn adapter_for(
+        &self,
+        block_idx: usize,
+        target: LoraTarget,
+    ) -> Option<&dyn AdapterModule> {
+        if let Some(lyc) = self.lycoris_adapters.get(&(block_idx, target)) {
+            return Some(lyc.as_ref());
+        }
+        if let Some(legacy) = self.adapters.get(&(block_idx, target)) {
+            return Some(legacy);
+        }
+        None
+    }
+
     pub fn parameters(&self) -> Vec<Parameter> {
-        let mut out = Vec::with_capacity(self.adapters.len() * 2);
+        let mut out =
+            Vec::with_capacity(self.adapters.len() * 2 + self.lycoris_adapters.len() * 2);
         for lora in self.adapters.values() {
             out.extend(lora.parameters());
+        }
+        for adapter in self.lycoris_adapters.values() {
+            out.extend(adapter.to_parameters());
+        }
+        out
+    }
+
+    /// `(name, Parameter)` pairs in the same iteration order as `parameters()`.
+    /// Used by `flame_core::diagnostics::assert_grad_flow` to report dead-grad
+    /// params by their on-disk name. Mirrors `ChromaLoraBundle::named_parameters`
+    /// — for the legacy `LoRALinear` path each adapter contributes
+    /// `(prefix.lora_A.weight, prefix.lora_B.weight)`; for the LyCORIS path
+    /// each adapter contributes `prefix.<leaf>` for every entry returned by
+    /// [`AdapterModule::named_tensors`] (zipped with `to_parameters` order).
+    pub fn named_parameters(&self) -> Vec<(String, Parameter)> {
+        let mut out = Vec::new();
+        for ((block_idx, target), lora) in &self.adapters {
+            let prefix = self.key_prefix(*block_idx, *target);
+            let params = lora.parameters();
+            // LoRALinear::parameters() returns [lora_a, lora_b].
+            if params.len() == 2 {
+                out.push((format!("{prefix}.lora_A.weight"), params[0].clone()));
+                out.push((format!("{prefix}.lora_B.weight"), params[1].clone()));
+            } else {
+                for p in params {
+                    out.push((prefix.clone(), p));
+                }
+            }
+        }
+        for ((block_idx, target), adapter) in &self.lycoris_adapters {
+            let prefix = self.key_prefix(*block_idx, *target);
+            let params = adapter.to_parameters();
+            let names = adapter.named_tensors();
+            for (param, (leaf, _)) in params.into_iter().zip(names.into_iter()) {
+                out.push((format!("{prefix}.{leaf}"), param));
+            }
         }
         out
     }
 
     pub fn num_adapters(&self) -> usize {
-        self.adapters.len()
+        self.adapters.len() + self.lycoris_adapters.len()
     }
 
     /// Per-adapter key prefix for the modern PEFT-compliant save format
@@ -310,6 +446,29 @@ impl Wan22LoraBundle {
         &self,
         tensors: &HashMap<String, Tensor>,
     ) -> Result<(usize, usize)> {
+        // LyCORIS-adapter rehydrate path: per-leaf `set_data` keyed by
+        // `{prefix}.{leaf}` (modern PEFT convention), no legacy fallback.
+        if !self.lycoris_adapters.is_empty() {
+            let mut hits = 0usize;
+            for ((block_idx, target), adapter) in &self.lycoris_adapters {
+                let prefix = self.key_prefix(*block_idx, *target);
+                let names = adapter.named_tensors();
+                let params = adapter.to_parameters();
+                let mut all_loaded = true;
+                for ((leaf, _), param) in names.into_iter().zip(params.into_iter()) {
+                    let key = format!("{prefix}.{leaf}");
+                    if let Some(t) = tensors.get(&key) {
+                        param.set_data(t.clone())?;
+                    } else {
+                        all_loaded = false;
+                    }
+                }
+                if all_loaded {
+                    hits += 1;
+                }
+            }
+            return Ok((hits, self.lycoris_adapters.len()));
+        }
         let mut hits = 0usize;
         let mut legacy_hits = 0usize;
         for ((block_idx, target), lora) in &self.adapters {
@@ -371,8 +530,35 @@ impl Wan22LoraBundle {
             out.insert(format!("{prefix}.lora_A.weight"), a);
             out.insert(format!("{prefix}.lora_B.weight"), b);
         }
+        for ((idx, target), adapter) in &self.lycoris_adapters {
+            let prefix = self.key_prefix(*idx, *target);
+            for (leaf, t) in adapter.named_tensors() {
+                out.insert(format!("{prefix}.{leaf}"), t);
+            }
+        }
         flame_core::serialization::save_file(&out, path).map_err(Into::into)
     }
+}
+
+/// Build a single `LycorisLinear` for the configured algo. Mirrors
+/// `chroma::build_lycoris_linear` byte-for-byte; only the docstring/log
+/// site differs. For `LycorisAlgo::None` the caller (`new_with_config`)
+/// short-circuits to `LoRALinear` instead — this helper bails on `None`
+/// defensively. Wan22 attention projections are all square `[dim, dim]`
+/// linears (no Conv, no MLP gate split), so we delegate to chroma's
+/// `pub(crate)` helper.
+fn build_wan22_lycoris_linear(
+    config: &LycorisBundleConfig,
+    in_features: usize,
+    out_features: usize,
+    device: Arc<CudaDevice>,
+) -> Result<LycorisLinear> {
+    Ok(crate::models::chroma::build_lycoris_linear(
+        config,
+        in_features,
+        out_features,
+        device,
+    )?)
 }
 
 // ---------------------------------------------------------------------------
@@ -549,6 +735,8 @@ impl Wan22Model {
         for lora in self.lora.adapters.values() {
             lora.refresh_cache();
         }
+        // LyCORIS adapters don't carry a transposed-BF16 cache — `forward_delta`
+        // on `LycorisLinear` reads its leaves live each call. No-op here.
     }
 
     pub fn save_weights(&self, path: &Path) -> Result<()> {

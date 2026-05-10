@@ -127,8 +127,13 @@ fn add_lora_delta(
     block_idx: usize,
     target: LoraTarget,
 ) -> Result<Tensor> {
-    if let Some(lora) = bundle.adapters.get(&(block_idx, target)) {
-        let delta = lora.forward_delta(input)?;
+    // Phase 2b: dispatch through `adapter_for` so LyCORIS adapters
+    // (LoCon/LoHa/LoKr/Full/OFT) and the legacy plain-LoRA path both
+    // contribute the delta. `adapter_for` checks `lycoris_adapters`
+    // first, then falls back to the legacy `adapters` map; returns
+    // `None` only when neither has an entry.
+    if let Some(adapter) = bundle.adapter_for(block_idx, target) {
+        let delta = adapter.forward_delta(input)?;
         return base.add(&delta);
     }
     Ok(base)

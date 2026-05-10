@@ -395,6 +395,89 @@ impl ChromaLoraBundle {
         Ok(())
     }
 
+    /// `(name, Parameter)` pairs in the same iteration order as
+    /// [`parameters`].  Used by `flame_core::diagnostics::assert_grad_flow`
+    /// to report dead-grad params by their on-disk name (the same name
+    /// `save` writes).  Relies on `to_parameters()` and `named_tensors()`
+    /// returning per-adapter tensors in matching order — true for every
+    /// `AdapterModule` impl in this crate.
+    pub fn named_parameters(&self) -> Vec<(String, Parameter)> {
+        let mut out = Vec::new();
+        for (&(block_idx, target), adapter) in &self.double_adapters {
+            let suffix = double_lora_suffix(target);
+            let prefix = format!("transformer_blocks.{block_idx}.{suffix}");
+            let params = adapter.to_parameters();
+            let names = adapter.named_tensors();
+            for (param, (leaf, _)) in params.into_iter().zip(names.into_iter()) {
+                out.push((format!("{prefix}.{leaf}"), param));
+            }
+        }
+        for (&(block_idx, target), adapter) in &self.single_adapters {
+            let suffix = single_lora_suffix(target);
+            let prefix = format!("single_transformer_blocks.{block_idx}.{suffix}");
+            let params = adapter.to_parameters();
+            let names = adapter.named_tensors();
+            for (param, (leaf, _)) in params.into_iter().zip(names.into_iter()) {
+                out.push((format!("{prefix}.{leaf}"), param));
+            }
+        }
+        out
+    }
+
+    /// SimpleTuner-parity perturbed-normal LoKr init.  Walks every
+    /// adapter, looks up its base weight in `weights` by the same
+    /// `<prefix>.weight` key the safetensors loader produced, and
+    /// dispatches `AdapterModule::init_perturbed_normal_lokr`.  The
+    /// trait default-impl no-ops on non-LoKr adapters; LycorisLinear
+    /// delegates to `LoKrModule::init_perturbed_normal` when
+    /// applicable.
+    ///
+    /// Chroma streams base weights via BlockOffloader, so `weights` is
+    /// expected to hold whatever's resident at swap time.  Missing
+    /// slots are logged but not fatal — the adapter just keeps its
+    /// canonical zero/kaiming init for that target.
+    ///
+    /// Returns the count of slots whose init was skipped (missing
+    /// weight, factored LoKr, or non-LoKr algo).
+    pub fn apply_init_perturbed_normal(
+        &self,
+        weights: &HashMap<String, Tensor>,
+        scale: f32,
+    ) -> Result<usize> {
+        if scale <= 0.0 {
+            return Ok(0);
+        }
+        let mut skipped = 0usize;
+        let mut applied = 0usize;
+        let mut try_one = |prefix: &str, adapter: &dyn AdapterModule| -> Result<()> {
+            let key = format!("{prefix}.weight");
+            let Some(base) = weights.get(&key) else {
+                log::warn!("[chroma][init_lokr_norm] missing base weight `{key}` — skipping");
+                skipped += 1;
+                return Ok(());
+            };
+            let did = adapter.init_perturbed_normal_lokr(base, scale).map_err(|e| {
+                flame_core::Error::InvalidInput(format!("init_perturbed_normal_lokr({prefix}): {e}"))
+            })?;
+            if did { applied += 1; } else { skipped += 1; }
+            Ok(())
+        };
+        for (&(block_idx, target), adapter) in &self.double_adapters {
+            let suffix = double_lora_suffix(target);
+            let prefix = format!("transformer_blocks.{block_idx}.{suffix}");
+            try_one(&prefix, adapter.as_ref())?;
+        }
+        for (&(block_idx, target), adapter) in &self.single_adapters {
+            let suffix = single_lora_suffix(target);
+            let prefix = format!("single_transformer_blocks.{block_idx}.{suffix}");
+            try_one(&prefix, adapter.as_ref())?;
+        }
+        log::info!(
+            "[chroma][init_lokr_norm] applied={applied} skipped={skipped} scale={scale}"
+        );
+        Ok(skipped)
+    }
+
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
         let mut tensors = HashMap::new();
         for (&(block_idx, target), adapter) in &self.double_adapters {
@@ -422,7 +505,10 @@ impl ChromaLoraBundle {
 /// Build a single `LycorisLinear` for the configured algo. For
 /// `LycorisAlgo::None` the caller (`new_with_config`) short-circuits to
 /// `LoRALinear` instead — this helper bails on `None` defensively.
-fn build_lycoris_linear(
+///
+/// `pub(crate)` so the other model bundles (zimage, qwenimage, etc.) can
+/// reuse the same algo dispatch without copy-pasting the match.
+pub(crate) fn build_lycoris_linear(
     config: &LycorisBundleConfig,
     in_features: usize,
     out_features: usize,
@@ -964,6 +1050,15 @@ impl ChromaTrainingModel {
             .ok_or_else(|| flame_core::Error::InvalidInput(format!("missing weight: {key}")))
     }
 
+    /// Borrow the resident base-weight map.  Used by
+    /// `ChromaLoraBundle::apply_init_perturbed_normal` to look up base
+    /// weights at LyCORIS-bundle swap time.  Some weights may be
+    /// streamed via `BlockOffloader` and absent from this map at the
+    /// moment of init — the helper logs them and continues.
+    pub fn resident_weights(&self) -> &HashMap<String, Tensor> {
+        &self.resident_weights
+    }
+
     fn dw(&self, block_idx: usize, key: &str) -> Result<&Tensor> {
         let full_key = format!("transformer_blocks.{block_idx}.{key}");
         self.double_block_weights[block_idx].get(&full_key)
@@ -1047,6 +1142,22 @@ impl ChromaTrainingModel {
     fn add_double_lora_delta(&self, base: Tensor, input: &Tensor, block_idx: usize, target: DoubleLoraTarget) -> Result<Tensor> {
         if let Some(ref bundle) = self.bundle {
             if let Some(lora) = bundle.double_adapters.get(&(block_idx, target)) {
+                if lora.is_input_rotation() {
+                    // OFT/BOFT: `output = base_linear(R · x)`.  Express
+                    // as a residual on the existing `base` output by
+                    // pushing `(R - I)·x` through the SAME base linear:
+                    // `delta = base_linear((R - I)·x)`, then `base + delta
+                    //  == base_linear(x) + base_linear((R - I)·x)
+                    //  == base_linear(R · x)`.
+                    let in3d = ensure_3d(input)?;
+                    let rx = lora.apply_input(&in3d)?;
+                    let delta_x = rx.sub(&in3d)?;
+                    let suffix = double_lora_suffix(target);
+                    let weight_key = format!("transformer_blocks.{block_idx}.{suffix}.weight");
+                    let weight = self.w(&weight_key)?;
+                    let delta = self.block_linear_no_bias(&delta_x, weight, false)?;
+                    return base.add(&delta);
+                }
                 let delta = lora.forward_delta(&ensure_3d(input)?)?;
                 return base.add(&delta);
             }
@@ -1057,6 +1168,16 @@ impl ChromaTrainingModel {
     fn add_single_lora_delta(&self, base: Tensor, input: &Tensor, block_idx: usize, target: SingleLoraTarget) -> Result<Tensor> {
         if let Some(ref bundle) = self.bundle {
             if let Some(lora) = bundle.single_adapters.get(&(block_idx, target)) {
+                if lora.is_input_rotation() {
+                    let in3d = ensure_3d(input)?;
+                    let rx = lora.apply_input(&in3d)?;
+                    let delta_x = rx.sub(&in3d)?;
+                    let suffix = single_lora_suffix(target);
+                    let weight_key = format!("single_transformer_blocks.{block_idx}.{suffix}.weight");
+                    let weight = self.w(&weight_key)?;
+                    let delta = self.block_linear_no_bias(&delta_x, weight, false)?;
+                    return base.add(&delta);
+                }
                 let delta = lora.forward_delta(&ensure_3d(input)?)?;
                 return base.add(&delta);
             }
@@ -1985,10 +2106,23 @@ fn get_w<'a>(weights: &'a HashMap<String, Tensor>, prefix: &str, block_idx: usiz
 
 fn add_lora_delta_double(
     base: Tensor, input: &Tensor, bundle: &Option<Arc<ChromaLoraBundle>>,
+    weights: &HashMap<String, Tensor>,
     block_idx: usize, target: DoubleLoraTarget,
 ) -> Result<Tensor> {
     if let Some(ref b) = bundle {
         if let Some(lora) = b.double_adapters.get(&(block_idx, target)) {
+            if lora.is_input_rotation() {
+                let in3d = ensure_3d(input)?;
+                let rx = lora.apply_input(&in3d)?;
+                let delta_x = rx.sub(&in3d)?;
+                let suffix = double_lora_suffix(target);
+                let key = format!("transformer_blocks.{block_idx}.{suffix}.weight");
+                let weight = weights.get(&key).ok_or_else(|| {
+                    flame_core::Error::InvalidInput(format!("OFT: missing base weight `{key}`"))
+                })?;
+                let delta = standalone_block_linear_no_bias(&delta_x, weight)?;
+                return base.add(&delta);
+            }
             let delta = lora.forward_delta(&ensure_3d(input)?)?;
             return base.add(&delta);
         }
@@ -1998,15 +2132,46 @@ fn add_lora_delta_double(
 
 fn add_lora_delta_single(
     base: Tensor, input: &Tensor, bundle: &Option<Arc<ChromaLoraBundle>>,
+    weights: &HashMap<String, Tensor>,
     block_idx: usize, target: SingleLoraTarget,
 ) -> Result<Tensor> {
     if let Some(ref b) = bundle {
         if let Some(lora) = b.single_adapters.get(&(block_idx, target)) {
+            if lora.is_input_rotation() {
+                let in3d = ensure_3d(input)?;
+                let rx = lora.apply_input(&in3d)?;
+                let delta_x = rx.sub(&in3d)?;
+                let suffix = single_lora_suffix(target);
+                let key = format!("single_transformer_blocks.{block_idx}.{suffix}.weight");
+                let weight = weights.get(&key).ok_or_else(|| {
+                    flame_core::Error::InvalidInput(format!("OFT: missing base weight `{key}`"))
+                })?;
+                let delta = standalone_block_linear_no_bias(&delta_x, weight)?;
+                return base.add(&delta);
+            }
             let delta = lora.forward_delta(&ensure_3d(input)?)?;
             return base.add(&delta);
         }
     }
     Ok(base)
+}
+
+/// Free-function variant of `block_linear_no_bias` used by the
+/// standalone checkpoint closures.  Standalone-closure weights ARE
+/// pre-transposed (stored `[in, out]`) per chroma's swap loader
+/// (`double_block_fwd::pt = true`), so this matmuls directly without
+/// a transpose.
+fn standalone_block_linear_no_bias(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
+    let dims = x.dims().to_vec();
+    let in_feat = *dims.last().unwrap();
+    // Weight is `[in, out]` (pre-transposed) — out_feat is dim 1.
+    let out_feat = weight.dims()[1];
+    let batch: usize = dims[..dims.len() - 1].iter().product();
+    let x_2d = x.reshape(&[batch, in_feat])?;
+    let out_2d = x_2d.matmul(weight)?;
+    let mut out_shape = dims[..dims.len() - 1].to_vec();
+    out_shape.push(out_feat);
+    out_2d.reshape(&out_shape)
 }
 
 /// Standalone double block forward for checkpoint closures.
@@ -2050,21 +2215,21 @@ fn double_block_fwd(
     let n_img = img.shape().dims()[1];
 
     let mut img_q = linear_bias_pt(&img_norm, get_w(weights, pfx, block_idx, "attn.to_q.weight")?, get_w(weights, pfx, block_idx, "attn.to_q.bias")?, pt)?;
-    img_q = add_lora_delta_double(img_q, &img_norm, bundle, block_idx, DoubleLoraTarget::ImgQ)?;
+    img_q = add_lora_delta_double(img_q, &img_norm, bundle, weights, block_idx, DoubleLoraTarget::ImgQ)?;
     let mut img_k = linear_bias_pt(&img_norm, get_w(weights, pfx, block_idx, "attn.to_k.weight")?, get_w(weights, pfx, block_idx, "attn.to_k.bias")?, pt)?;
-    img_k = add_lora_delta_double(img_k, &img_norm, bundle, block_idx, DoubleLoraTarget::ImgK)?;
+    img_k = add_lora_delta_double(img_k, &img_norm, bundle, weights, block_idx, DoubleLoraTarget::ImgK)?;
     let mut img_v = linear_bias_pt(&img_norm, get_w(weights, pfx, block_idx, "attn.to_v.weight")?, get_w(weights, pfx, block_idx, "attn.to_v.bias")?, pt)?;
-    img_v = add_lora_delta_double(img_v, &img_norm, bundle, block_idx, DoubleLoraTarget::ImgV)?;
+    img_v = add_lora_delta_double(img_v, &img_norm, bundle, weights, block_idx, DoubleLoraTarget::ImgV)?;
 
     let txt_norm = modulate_pre(txt, &txt_shift1, &txt_scale1)?;
     let n_t = txt.shape().dims()[1];
 
     let mut txt_q = linear_bias_pt(&txt_norm, get_w(weights, pfx, block_idx, "attn.add_q_proj.weight")?, get_w(weights, pfx, block_idx, "attn.add_q_proj.bias")?, pt)?;
-    txt_q = add_lora_delta_double(txt_q, &txt_norm, bundle, block_idx, DoubleLoraTarget::TxtQ)?;
+    txt_q = add_lora_delta_double(txt_q, &txt_norm, bundle, weights, block_idx, DoubleLoraTarget::TxtQ)?;
     let mut txt_k = linear_bias_pt(&txt_norm, get_w(weights, pfx, block_idx, "attn.add_k_proj.weight")?, get_w(weights, pfx, block_idx, "attn.add_k_proj.bias")?, pt)?;
-    txt_k = add_lora_delta_double(txt_k, &txt_norm, bundle, block_idx, DoubleLoraTarget::TxtK)?;
+    txt_k = add_lora_delta_double(txt_k, &txt_norm, bundle, weights, block_idx, DoubleLoraTarget::TxtK)?;
     let mut txt_v = linear_bias_pt(&txt_norm, get_w(weights, pfx, block_idx, "attn.add_v_proj.weight")?, get_w(weights, pfx, block_idx, "attn.add_v_proj.bias")?, pt)?;
-    txt_v = add_lora_delta_double(txt_v, &txt_norm, bundle, block_idx, DoubleLoraTarget::TxtV)?;
+    txt_v = add_lora_delta_double(txt_v, &txt_norm, bundle, weights, block_idx, DoubleLoraTarget::TxtV)?;
 
     let img_q = img_q.reshape(&[b, n_img, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
     let img_k = img_k.reshape(&[b, n_img, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
@@ -2106,9 +2271,9 @@ fn double_block_fwd(
         .reshape(&[b, n_img, NUM_HEADS * HEAD_DIM])?;
 
     let mut img_out = linear_bias_pt(&img_attn, get_w(weights, pfx, block_idx, "attn.to_out.0.weight")?, get_w(weights, pfx, block_idx, "attn.to_out.0.bias")?, pt)?;
-    img_out = add_lora_delta_double(img_out, &img_attn, bundle, block_idx, DoubleLoraTarget::ImgOut)?;
+    img_out = add_lora_delta_double(img_out, &img_attn, bundle, weights, block_idx, DoubleLoraTarget::ImgOut)?;
     let mut txt_out = linear_bias_pt(&txt_attn, get_w(weights, pfx, block_idx, "attn.to_add_out.weight")?, get_w(weights, pfx, block_idx, "attn.to_add_out.bias")?, pt)?;
-    txt_out = add_lora_delta_double(txt_out, &txt_attn, bundle, block_idx, DoubleLoraTarget::TxtOut)?;
+    txt_out = add_lora_delta_double(txt_out, &txt_attn, bundle, weights, block_idx, DoubleLoraTarget::TxtOut)?;
 
     // gate_residual_fused_bf16 records autograd (2026-04 fix); safe for training.
     let img_r = flame_core::bf16_ops::gate_residual_fused_bf16(img, &img_gate1, &img_out)?;
@@ -2117,19 +2282,19 @@ fn double_block_fwd(
     // FFN img
     let img_ffn_norm = modulate_pre(&img_r, &img_shift2, &img_scale2)?;
     let mut img_ffn_h = linear_bias_pt(&img_ffn_norm, get_w(weights, pfx, block_idx, "ff.net.0.proj.weight")?, get_w(weights, pfx, block_idx, "ff.net.0.proj.bias")?, pt)?;
-    img_ffn_h = add_lora_delta_double(img_ffn_h, &img_ffn_norm, bundle, block_idx, DoubleLoraTarget::ImgFfnGate)?;
+    img_ffn_h = add_lora_delta_double(img_ffn_h, &img_ffn_norm, bundle, weights, block_idx, DoubleLoraTarget::ImgFfnGate)?;
     let img_ffn_h = img_ffn_h.gelu()?;
     let mut img_ffn_out = linear_bias_pt(&img_ffn_h, get_w(weights, pfx, block_idx, "ff.net.2.weight")?, get_w(weights, pfx, block_idx, "ff.net.2.bias")?, pt)?;
-    img_ffn_out = add_lora_delta_double(img_ffn_out, &img_ffn_h, bundle, block_idx, DoubleLoraTarget::ImgFfnOut)?;
+    img_ffn_out = add_lora_delta_double(img_ffn_out, &img_ffn_h, bundle, weights, block_idx, DoubleLoraTarget::ImgFfnOut)?;
     let img_final = flame_core::bf16_ops::gate_residual_fused_bf16(&img_r, &img_gate2, &img_ffn_out)?;
 
     // FFN txt
     let txt_ffn_norm = modulate_pre(&txt_r, &txt_shift2, &txt_scale2)?;
     let mut txt_ffn_h = linear_bias_pt(&txt_ffn_norm, get_w(weights, pfx, block_idx, "ff_context.net.0.proj.weight")?, get_w(weights, pfx, block_idx, "ff_context.net.0.proj.bias")?, pt)?;
-    txt_ffn_h = add_lora_delta_double(txt_ffn_h, &txt_ffn_norm, bundle, block_idx, DoubleLoraTarget::TxtFfnGate)?;
+    txt_ffn_h = add_lora_delta_double(txt_ffn_h, &txt_ffn_norm, bundle, weights, block_idx, DoubleLoraTarget::TxtFfnGate)?;
     let txt_ffn_h = txt_ffn_h.gelu()?;
     let mut txt_ffn_out = linear_bias_pt(&txt_ffn_h, get_w(weights, pfx, block_idx, "ff_context.net.2.weight")?, get_w(weights, pfx, block_idx, "ff_context.net.2.bias")?, pt)?;
-    txt_ffn_out = add_lora_delta_double(txt_ffn_out, &txt_ffn_h, bundle, block_idx, DoubleLoraTarget::TxtFfnOut)?;
+    txt_ffn_out = add_lora_delta_double(txt_ffn_out, &txt_ffn_h, bundle, weights, block_idx, DoubleLoraTarget::TxtFfnOut)?;
     let txt_final = flame_core::bf16_ops::gate_residual_fused_bf16(&txt_r, &txt_gate2, &txt_ffn_out)?;
 
     Ok((img_final, txt_final))
@@ -2161,14 +2326,14 @@ fn single_block_fwd(
     let seq = x.shape().dims()[1];
 
     let mut q = linear_bias_pt(&x_norm, get_w(weights, pfx, block_idx, "attn.to_q.weight")?, get_w(weights, pfx, block_idx, "attn.to_q.bias")?, pt)?;
-    q = add_lora_delta_single(q, &x_norm, bundle, block_idx, SingleLoraTarget::Q)?;
+    q = add_lora_delta_single(q, &x_norm, bundle, weights, block_idx, SingleLoraTarget::Q)?;
     let mut k = linear_bias_pt(&x_norm, get_w(weights, pfx, block_idx, "attn.to_k.weight")?, get_w(weights, pfx, block_idx, "attn.to_k.bias")?, pt)?;
-    k = add_lora_delta_single(k, &x_norm, bundle, block_idx, SingleLoraTarget::K)?;
+    k = add_lora_delta_single(k, &x_norm, bundle, weights, block_idx, SingleLoraTarget::K)?;
     let mut v = linear_bias_pt(&x_norm, get_w(weights, pfx, block_idx, "attn.to_v.weight")?, get_w(weights, pfx, block_idx, "attn.to_v.bias")?, pt)?;
-    v = add_lora_delta_single(v, &x_norm, bundle, block_idx, SingleLoraTarget::V)?;
+    v = add_lora_delta_single(v, &x_norm, bundle, weights, block_idx, SingleLoraTarget::V)?;
 
     let mut mlp_h = linear_bias_pt(&x_norm, get_w(weights, pfx, block_idx, "proj_mlp.weight")?, get_w(weights, pfx, block_idx, "proj_mlp.bias")?, pt)?;
-    mlp_h = add_lora_delta_single(mlp_h, &x_norm, bundle, block_idx, SingleLoraTarget::ProjMlp)?;
+    mlp_h = add_lora_delta_single(mlp_h, &x_norm, bundle, weights, block_idx, SingleLoraTarget::ProjMlp)?;
     let mlp_h = mlp_h.gelu()?;
 
     let q = q.reshape(&[b, seq, NUM_HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
@@ -2188,7 +2353,7 @@ fn single_block_fwd(
 
     let combined = Tensor::cat(&[&attn_flat, &mlp_h], 2)?;
     let mut proj = linear_bias_pt(&combined, get_w(weights, pfx, block_idx, "proj_out.weight")?, get_w(weights, pfx, block_idx, "proj_out.bias")?, pt)?;
-    proj = add_lora_delta_single(proj, &combined, bundle, block_idx, SingleLoraTarget::ProjOut)?;
+    proj = add_lora_delta_single(proj, &combined, bundle, weights, block_idx, SingleLoraTarget::ProjOut)?;
 
     // gate_residual_fused_bf16 records autograd — safe for training.
     flame_core::bf16_ops::gate_residual_fused_bf16(x, &gate, &proj)

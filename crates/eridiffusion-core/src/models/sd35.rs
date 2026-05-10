@@ -77,8 +77,11 @@ use flame_core::{
     DType, Shape, Tensor,
 };
 
+use crate::adapter::{AdapterModule, LycorisLinear};
 use crate::config::TrainConfig;
 use crate::lora::LoRALinear;
+use crate::lycoris::{LycorisAlgo, LycorisBundleConfig};
+use crate::models::chroma::build_lycoris_linear;
 use crate::models::TrainableModel;
 use crate::{EriDiffusionError, Result};
 
@@ -104,6 +107,41 @@ pub struct SD35Config {
 // ---------------------------------------------------------------------------
 // Per-joint-block LoRA adapters
 // ---------------------------------------------------------------------------
+
+/// Per-block LoRA target. Matches the suffix strings used by
+/// [`JointBlockAdapters::iter_with_keys`] one-to-one — used as the `target`
+/// argument to [`SD35Model::adapter_for`] for LyCORIS dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Sd35LoraTarget {
+    XAttnQkv,
+    XAttnProj,
+    XMlpFc1,
+    XMlpFc2,
+    CtxAttnQkv,
+    CtxAttnProj,
+    CtxMlpFc1,
+    CtxMlpFc2,
+    XAttn2Qkv,
+    XAttn2Proj,
+}
+
+impl Sd35LoraTarget {
+    /// Save-key suffix matching `JointBlockAdapters::iter_with_keys` strings.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Sd35LoraTarget::XAttnQkv    => "x_block.attn.qkv",
+            Sd35LoraTarget::XAttnProj   => "x_block.attn.proj",
+            Sd35LoraTarget::XMlpFc1     => "x_block.mlp.fc1",
+            Sd35LoraTarget::XMlpFc2     => "x_block.mlp.fc2",
+            Sd35LoraTarget::CtxAttnQkv  => "context_block.attn.qkv",
+            Sd35LoraTarget::CtxAttnProj => "context_block.attn.proj",
+            Sd35LoraTarget::CtxMlpFc1   => "context_block.mlp.fc1",
+            Sd35LoraTarget::CtxMlpFc2   => "context_block.mlp.fc2",
+            Sd35LoraTarget::XAttn2Qkv   => "x_block.attn2.qkv",
+            Sd35LoraTarget::XAttn2Proj  => "x_block.attn2.proj",
+        }
+    }
+}
 
 struct JointBlockAdapters {
     x_attn_qkv: LoRALinear,
@@ -138,6 +176,24 @@ impl JointBlockAdapters {
     fn all(&self) -> Vec<&LoRALinear> {
         self.iter_with_keys().into_iter().map(|(_, l)| l).collect()
     }
+
+    /// Look up the legacy plain-LoRA adapter by target. Returns `None` for
+    /// targets that don't exist on this block (e.g. `CtxAttnQkv` on `is_last`,
+    /// or `XAttn2*` on a non-dual block).
+    fn get(&self, target: Sd35LoraTarget) -> Option<&LoRALinear> {
+        match target {
+            Sd35LoraTarget::XAttnQkv    => Some(&self.x_attn_qkv),
+            Sd35LoraTarget::XAttnProj   => Some(&self.x_attn_proj),
+            Sd35LoraTarget::XMlpFc1     => Some(&self.x_mlp_fc1),
+            Sd35LoraTarget::XMlpFc2     => Some(&self.x_mlp_fc2),
+            Sd35LoraTarget::CtxAttnQkv  => self.ctx_attn_qkv.as_ref(),
+            Sd35LoraTarget::CtxAttnProj => self.ctx_attn_proj.as_ref(),
+            Sd35LoraTarget::CtxMlpFc1   => self.ctx_mlp_fc1.as_ref(),
+            Sd35LoraTarget::CtxMlpFc2   => self.ctx_mlp_fc2.as_ref(),
+            Sd35LoraTarget::XAttn2Qkv   => self.x_attn2_qkv.as_ref(),
+            Sd35LoraTarget::XAttn2Proj  => self.x_attn2_proj.as_ref(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -157,6 +213,18 @@ pub struct SD35Model {
     /// non-LoRA load (full-FT not supported in this minimal port — would need
     /// promoting every weight to F32 trainable, ~40 GB on SD3.5-large).
     pub block_adapters: Option<Vec<JointBlockAdapters>>,
+
+    /// LyCORIS adapters (LoCon/LoHa/LoKr/Full/OFT). Empty when `algo == None`.
+    /// When [`SD35Model::install_lycoris_bundle`] swaps in a LyCORIS algo,
+    /// `block_adapters` is dropped and this map is populated instead. The
+    /// per-block-target geometry mirrors `JointBlockAdapters` (i.e. ctx_*
+    /// keys are skipped on `is_last`, x_attn2_* keys are gated by
+    /// `has_dual_attention[i]`).
+    pub lycoris_adapters: HashMap<(usize, Sd35LoraTarget), Arc<LycorisLinear>>,
+
+    /// Currently active algo. `LycorisAlgo::None` means the legacy plain
+    /// `LoRALinear` path is in use (`block_adapters`).
+    pub algo: LycorisAlgo,
 
     /// Flattened parameter list (returned by `parameters()`).
     pub parameters: Vec<Parameter>,
@@ -271,9 +339,123 @@ impl SD35Model {
             weights,
             mmdit_config,
             block_adapters,
+            lycoris_adapters: HashMap::new(),
+            algo: LycorisAlgo::None,
             parameters,
             is_lora,
         })
+    }
+
+    /// Phase 2b: swap the legacy plain-LoRA `block_adapters` for a fresh
+    /// LyCORIS-algo bundle (LoCon/LoHa/LoKr/Full/OFT). Drops `block_adapters`,
+    /// populates `lycoris_adapters` keyed by `(block_idx, Sd35LoraTarget)`,
+    /// and rebuilds `parameters`. Caller must invoke this BEFORE reading
+    /// [`Self::parameters`] (the trainer's optimizer captures Parameter IDs
+    /// at construction time).
+    ///
+    /// Per-block target gating mirrors the legacy ctor: `Ctx*` skipped on
+    /// `is_last`, `XAttn2*` gated by `has_dual_attention[i]`.
+    ///
+    /// `Full` and `OFT` bundle-construction succeeds, but their
+    /// `forward_delta` errors inside the `base + delta_on_input` call
+    /// pattern. Phase 2c will wire merge-into-base.
+    pub fn install_lycoris_bundle(
+        &mut self,
+        config: &LycorisBundleConfig,
+        device: Arc<CudaDevice>,
+        seed: u64,
+    ) -> Result<()> {
+        if config.algo == LycorisAlgo::None {
+            return Ok(());
+        }
+        if !self.is_lora {
+            return Err(EriDiffusionError::Model(
+                "install_lycoris_bundle requires LoRA mode (is_lora=true)".into(),
+            ));
+        }
+        let _ = seed; // lycoris-rs uses its own internal RNG.
+
+        let h = self.mmdit_config.hidden_size;
+        let mlp_h = (h as f32 * self.mmdit_config.mlp_ratio) as usize;
+        let depth = self.mmdit_config.depth;
+
+        let mut adapters: HashMap<(usize, Sd35LoraTarget), Arc<LycorisLinear>> =
+            HashMap::new();
+        for i in 0..depth {
+            let is_last = i == depth - 1;
+            let has_dual = self.mmdit_config.has_dual_attention[i];
+
+            // Per-target (in_dim, out_dim) — mirrors the legacy
+            // `JointBlockAdapters` ctor exactly.
+            let mut targets: Vec<(Sd35LoraTarget, usize, usize)> = vec![
+                (Sd35LoraTarget::XAttnQkv,  h,     3 * h),
+                (Sd35LoraTarget::XAttnProj, h,     h),
+                (Sd35LoraTarget::XMlpFc1,   h,     mlp_h),
+                (Sd35LoraTarget::XMlpFc2,   mlp_h, h),
+            ];
+            if !is_last {
+                targets.extend([
+                    (Sd35LoraTarget::CtxAttnQkv,  h,     3 * h),
+                    (Sd35LoraTarget::CtxAttnProj, h,     h),
+                    (Sd35LoraTarget::CtxMlpFc1,   h,     mlp_h),
+                    (Sd35LoraTarget::CtxMlpFc2,   mlp_h, h),
+                ]);
+            }
+            if has_dual {
+                targets.extend([
+                    (Sd35LoraTarget::XAttn2Qkv,  h, 3 * h),
+                    (Sd35LoraTarget::XAttn2Proj, h, h),
+                ]);
+            }
+
+            for (target, in_dim, out_dim) in targets {
+                let wrapper = build_lycoris_linear(config, in_dim, out_dim, device.clone())
+                    .map_err(|e| EriDiffusionError::Lora(format!(
+                        "build_lycoris_linear({:?}): {e}", target,
+                    )))?;
+                adapters.insert((i, target), Arc::new(wrapper));
+            }
+        }
+
+        log::info!(
+            "[SD3.5] LyCORIS algo='{}' installed: {} adapters across {} blocks",
+            config.algo.as_str(),
+            adapters.len(),
+            depth,
+        );
+
+        // Rebuild parameter list from the LyCORIS adapters. Drop
+        // `block_adapters` so the legacy path doesn't double-count.
+        let mut parameters: Vec<Parameter> = Vec::new();
+        for adapter in adapters.values() {
+            parameters.extend(adapter.to_parameters());
+        }
+
+        self.block_adapters = None;
+        self.lycoris_adapters = adapters;
+        self.algo = config.algo;
+        self.parameters = parameters;
+        Ok(())
+    }
+
+    /// Look up the active adapter for `(block_idx, target)`. Prefers the
+    /// LyCORIS map when populated; falls back to the legacy plain-LoRA
+    /// `block_adapters`. Returns `None` when neither has an entry (e.g.
+    /// non-LoRA load, or a target that doesn't exist on the given block).
+    pub fn adapter_for(
+        &self,
+        block_idx: usize,
+        target: Sd35LoraTarget,
+    ) -> Option<&dyn AdapterModule> {
+        if let Some(lyc) = self.lycoris_adapters.get(&(block_idx, target)) {
+            return Some(lyc.as_ref());
+        }
+        if let Some(blocks) = self.block_adapters.as_ref() {
+            if let Some(legacy) = blocks[block_idx].get(target) {
+                return Some(legacy);
+            }
+        }
+        None
     }
 
     /// Auto-detect MMDiT shape from the loaded weights.
@@ -369,20 +551,23 @@ impl SD35Model {
         out.reshape(&out_shape).map_err(Into::into)
     }
 
-    /// `linear` + LoRA delta when an adapter is provided. The delta uses
-    /// `LoRALinear::forward_delta` (BF16, autograd-aware).
+    /// `linear` + adapter delta when an adapter is provided. Accepts any
+    /// [`AdapterModule`] — plain `LoRALinear` (legacy) or `LycorisLinear`
+    /// (LoCon / LoHa / LoKr / DoRA, etc.). Dispatch happens through the
+    /// `forward_delta` trait method so a `--algo locon` swap works
+    /// transparently in every call site.
     fn linear_lora(
         &self,
         weight_key: &str,
         bias_key: &str,
         x: &Tensor,
-        lora: Option<&LoRALinear>,
+        adapter: Option<&dyn AdapterModule>,
     ) -> Result<Tensor> {
         let base = self.linear(weight_key, bias_key, x)?;
-        match lora {
+        match adapter {
             None => Ok(base),
-            Some(l) => {
-                let delta = l.forward_delta(x)?;
+            Some(a) => {
+                let delta = a.forward_delta(x)?;
                 // forward_delta returns a tensor whose final dim is out_features;
                 // reshape to base's exact shape (it always matches since
                 // LoRA in/out match the base linear).
@@ -503,7 +688,7 @@ impl SD35Model {
         x: &Tensor,
         prefix: &str,
         attn_name: &str,
-        lora: Option<&LoRALinear>,
+        adapter: Option<&dyn AdapterModule>,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let b = x.dims()[0];
         let n = x.dims()[1];
@@ -513,7 +698,7 @@ impl SD35Model {
         let qkv = self.linear_lora(
             &format!("{prefix}.{attn_name}.qkv.weight"),
             &format!("{prefix}.{attn_name}.qkv.bias"),
-            x, lora,
+            x, adapter,
         )?;
 
         let qkv = qkv.reshape(&[b, n, 3, nh, hd])?
@@ -550,22 +735,27 @@ impl SD35Model {
         x: &Tensor,
         block_prefix: &str,
         is_ctx: bool,
-        adapters: Option<&JointBlockAdapters>,
+        block_idx: usize,
     ) -> Result<Tensor> {
         let fc1_w = format!("{block_prefix}.mlp.fc1.weight");
         let fc1_b = format!("{block_prefix}.mlp.fc1.bias");
         let fc2_w = format!("{block_prefix}.mlp.fc2.weight");
         let fc2_b = format!("{block_prefix}.mlp.fc2.bias");
 
-        let (fc1_lora, fc2_lora) = match adapters {
-            Some(a) if is_ctx => (a.ctx_mlp_fc1.as_ref(), a.ctx_mlp_fc2.as_ref()),
-            Some(a)           => (Some(&a.x_mlp_fc1),    Some(&a.x_mlp_fc2)),
-            None              => (None, None),
+        // Phase 2b: dispatch via the unified `adapter_for` accessor so the
+        // LyCORIS-swapped path picks up `lycoris_adapters` entries while the
+        // default `--algo lora` path keeps reading `block_adapters`.
+        let (fc1_target, fc2_target) = if is_ctx {
+            (Sd35LoraTarget::CtxMlpFc1, Sd35LoraTarget::CtxMlpFc2)
+        } else {
+            (Sd35LoraTarget::XMlpFc1, Sd35LoraTarget::XMlpFc2)
         };
+        let fc1_adapter = self.adapter_for(block_idx, fc1_target);
+        let fc2_adapter = self.adapter_for(block_idx, fc2_target);
 
-        let h = self.linear_lora(&fc1_w, &fc1_b, x, fc1_lora)?;
+        let h = self.linear_lora(&fc1_w, &fc1_b, x, fc1_adapter)?;
         let h = h.gelu()?;
-        self.linear_lora(&fc2_w, &fc2_b, &h, fc2_lora)
+        self.linear_lora(&fc2_w, &fc2_b, &h, fc2_adapter)
     }
 
     /// One MMDiT joint block. Returns `(new_context, new_x)`. On the last
@@ -582,7 +772,6 @@ impl SD35Model {
         let x_prefix = format!("{prefix}.x_block");
         let ctx_prefix = format!("{prefix}.context_block");
         let hidden = self.mmdit_config.hidden_size;
-        let adapters = self.block_adapters.as_ref().map(|a| &a[block_idx]);
 
         // ---- Context stream pre-attention ----
         let ctx_mods = {
@@ -601,7 +790,7 @@ impl SD35Model {
             let ctx_mod = self.modulate(&ctx_norm, &chunks[0], &chunks[1])?;
             let (q, k, v) = self.pre_attn_qkv(
                 &ctx_mod, &ctx_prefix, "attn",
-                adapters.and_then(|a| a.ctx_attn_qkv.as_ref()),
+                self.adapter_for(block_idx, Sd35LoraTarget::CtxAttnQkv),
             )?;
             (q, k, v, None)
         } else {
@@ -610,7 +799,7 @@ impl SD35Model {
             let ctx_mod = self.modulate(&ctx_norm, &chunks[0], &chunks[1])?;
             let (q, k, v) = self.pre_attn_qkv(
                 &ctx_mod, &ctx_prefix, "attn",
-                adapters.and_then(|a| a.ctx_attn_qkv.as_ref()),
+                self.adapter_for(block_idx, Sd35LoraTarget::CtxAttnQkv),
             )?;
             (
                 q, k, v,
@@ -640,7 +829,7 @@ impl SD35Model {
         let x_mod = self.modulate(&x_norm, &x_chunks[0], &x_chunks[1])?;
         let (x_q, x_k, x_v) = self.pre_attn_qkv(
             &x_mod, &x_prefix, "attn",
-            adapters.map(|a| &a.x_attn_qkv),
+            self.adapter_for(block_idx, Sd35LoraTarget::XAttnQkv),
         )?;
 
         // ---- Joint attention: concat over token dim, single SDPA call ----
@@ -665,13 +854,13 @@ impl SD35Model {
                 &format!("{ctx_prefix}.attn.proj.weight"),
                 &format!("{ctx_prefix}.attn.proj.bias"),
                 &ctx_attn,
-                adapters.and_then(|a| a.ctx_attn_proj.as_ref()),
+                self.adapter_for(block_idx, Sd35LoraTarget::CtxAttnProj),
             )?;
             let gated = gate_msa.unsqueeze(1)?.mul(&ctx_proj)?;
             let ctx_out = ctx_res.add(&gated)?;
             let ctx_norm2 = self.layer_norm_no_affine(&ctx_out)?;
             let ctx_mlp_in = self.modulate(&ctx_norm2, &shift_mlp, &scale_mlp)?;
-            let ctx_mlp = self.gelu_mlp(&ctx_mlp_in, &ctx_prefix, true, adapters)?;
+            let ctx_mlp = self.gelu_mlp(&ctx_mlp_in, &ctx_prefix, true, block_idx)?;
             let ctx_gated = gate_mlp.unsqueeze(1)?.mul(&ctx_mlp)?;
             Some(ctx_out.add(&ctx_gated)?)
         } else {
@@ -683,7 +872,7 @@ impl SD35Model {
             &format!("{x_prefix}.attn.proj.weight"),
             &format!("{x_prefix}.attn.proj.bias"),
             &x_attn,
-            adapters.map(|a| &a.x_attn_proj),
+            self.adapter_for(block_idx, Sd35LoraTarget::XAttnProj),
         )?;
         let x_gated = x_chunks[2].unsqueeze(1)?.mul(&x_proj)?;
         let mut x_out = x.add(&x_gated)?;
@@ -693,7 +882,7 @@ impl SD35Model {
             let x_mod2 = self.modulate(&x_norm, &x_chunks[6], &x_chunks[7])?;
             let (q2, k2, v2) = self.pre_attn_qkv(
                 &x_mod2, &x_prefix, "attn2",
-                adapters.and_then(|a| a.x_attn2_qkv.as_ref()),
+                self.adapter_for(block_idx, Sd35LoraTarget::XAttn2Qkv),
             )?;
             let attn2_out = sdpa(&q2, &k2, &v2, None)?;
             let attn2_flat = attn2_out.permute(&[0, 2, 1, 3])?.reshape(&[batch, n_x, hidden])?;
@@ -701,7 +890,7 @@ impl SD35Model {
                 &format!("{x_prefix}.attn2.proj.weight"),
                 &format!("{x_prefix}.attn2.proj.bias"),
                 &attn2_flat,
-                adapters.and_then(|a| a.x_attn2_proj.as_ref()),
+                self.adapter_for(block_idx, Sd35LoraTarget::XAttn2Proj),
             )?;
             let attn2_gated = x_chunks[8].unsqueeze(1)?.mul(&attn2_proj)?;
             x_out = x_out.add(&attn2_gated)?;
@@ -710,7 +899,7 @@ impl SD35Model {
         // ---- X MLP ----
         let x_norm2 = self.layer_norm_no_affine(&x_out)?;
         let x_mlp_in = self.modulate(&x_norm2, &x_chunks[3], &x_chunks[4])?;
-        let x_mlp = self.gelu_mlp(&x_mlp_in, &x_prefix, false, adapters)?;
+        let x_mlp = self.gelu_mlp(&x_mlp_in, &x_prefix, false, block_idx)?;
         let x_mlp_gated = x_chunks[5].unsqueeze(1)?.mul(&x_mlp)?;
         let x_out = x_out.add(&x_mlp_gated)?;
 
@@ -786,6 +975,7 @@ impl TrainableModel for SD35Model {
     }
 
     fn post_optimizer_step(&mut self) {
+        // Legacy path: refresh per-LoRA transposed BF16 cache.
         if let Some(ref blocks) = self.block_adapters {
             for b in blocks {
                 for l in b.all() {
@@ -793,6 +983,8 @@ impl TrainableModel for SD35Model {
                 }
             }
         }
+        // LyCORIS path: `LycorisLinear::forward_delta` re-reads its leaves
+        // live each call — no per-step cache to refresh.
     }
 
     /// Save LoRA adapters in PEFT/diffusers convention with a per-module
@@ -816,24 +1008,40 @@ impl TrainableModel for SD35Model {
             return Err(EriDiffusionError::Model(
                 "SD3.5 non-LoRA save not implemented".into()));
         }
-        let blocks = self.block_adapters.as_ref().unwrap();
         let mut out: HashMap<String, Tensor> = HashMap::new();
-        for (i, block) in blocks.iter().enumerate() {
-            for (suffix, lora) in block.iter_with_keys() {
-                let prefix = format!("joint_blocks.{i}.{suffix}");
-                lora.save_tensors(&prefix, &mut out)
-                    .map_err(|e| EriDiffusionError::Lora(format!(
-                        "save {prefix}: {e}")))?;
-                // Per-module .alpha — what every downstream loader expects.
-                let alpha_t = Tensor::from_vec(
-                    vec![lora.alpha],
-                    Shape::from_dims(&[]),
-                    self.device.clone(),
-                ).and_then(|t| t.to_dtype(DType::BF16))
-                 .map_err(|e| EriDiffusionError::Lora(format!(
-                     "alpha tensor for {prefix}: {e}")))?;
-                out.insert(format!("{prefix}.alpha"), alpha_t);
+        if let Some(blocks) = self.block_adapters.as_ref() {
+            // Legacy plain-LoRA path — preserved byte-for-byte.
+            for (i, block) in blocks.iter().enumerate() {
+                for (suffix, lora) in block.iter_with_keys() {
+                    let prefix = format!("joint_blocks.{i}.{suffix}");
+                    lora.save_tensors(&prefix, &mut out)
+                        .map_err(|e| EriDiffusionError::Lora(format!(
+                            "save {prefix}: {e}")))?;
+                    // Per-module .alpha — what every downstream loader expects.
+                    let alpha_t = Tensor::from_vec(
+                        vec![lora.alpha],
+                        Shape::from_dims(&[]),
+                        self.device.clone(),
+                    ).and_then(|t| t.to_dtype(DType::BF16))
+                     .map_err(|e| EriDiffusionError::Lora(format!(
+                         "alpha tensor for {prefix}: {e}")))?;
+                    out.insert(format!("{prefix}.alpha"), alpha_t);
+                }
             }
+        } else if !self.lycoris_adapters.is_empty() {
+            // LyCORIS path — emit each adapter's `named_tensors()` under the
+            // same `joint_blocks.{i}.{suffix}.` prefix scheme. No `.alpha`
+            // scalar (LyCORIS adapters carry alpha internally).
+            for (&(block_idx, target), adapter) in &self.lycoris_adapters {
+                let prefix = format!("joint_blocks.{block_idx}.{}", target.suffix());
+                for (leaf, t) in adapter.named_tensors() {
+                    out.insert(format!("{prefix}.{leaf}"), t);
+                }
+            }
+        } else {
+            return Err(EriDiffusionError::Model(
+                "SD3.5 save_weights: no adapters present (block_adapters=None, \
+                 lycoris_adapters empty)".into()));
         }
         flame_core::serialization::save_file(&out, Path::new(path))
             .map_err(|e| EriDiffusionError::Safetensors(format!("save_file: {e}")))?;
@@ -847,14 +1055,19 @@ impl TrainableModel for SD35Model {
         }
         let source = flame_core::serialization::load_file(Path::new(path), &self.device)
             .map_err(|e| EriDiffusionError::Safetensors(format!("load_file: {e}")))?;
-        let blocks = self.block_adapters.as_ref().unwrap();
-        for (i, block) in blocks.iter().enumerate() {
-            for (suffix, lora) in block.iter_with_keys() {
-                let prefix = format!("joint_blocks.{i}.{suffix}");
-                lora.load_tensors(&prefix, &source)
-                    .map_err(|e| EriDiffusionError::Lora(format!(
-                        "load {prefix}: {e}")))?;
+        if let Some(blocks) = self.block_adapters.as_ref() {
+            for (i, block) in blocks.iter().enumerate() {
+                for (suffix, lora) in block.iter_with_keys() {
+                    let prefix = format!("joint_blocks.{i}.{suffix}");
+                    lora.load_tensors(&prefix, &source)
+                        .map_err(|e| EriDiffusionError::Lora(format!(
+                            "load {prefix}: {e}")))?;
+                }
             }
+        } else if !self.lycoris_adapters.is_empty() {
+            return Err(EriDiffusionError::Model(
+                "SD3.5 LyCORIS load_weights not yet wired (Phase 2c). Use \
+                 plain `--algo lora` resume for now.".into()));
         }
         Ok(())
     }
@@ -870,14 +1083,25 @@ impl SD35Model {
     /// Returns an empty Vec if the model isn't in LoRA mode.
     pub fn named_parameters(&self) -> Vec<(String, Parameter)> {
         let mut out = Vec::new();
-        let Some(blocks) = self.block_adapters.as_ref() else {
-            return out;
-        };
-        for (i, block) in blocks.iter().enumerate() {
-            for (suffix, lora) in block.iter_with_keys() {
-                let prefix = format!("joint_blocks.{i}.{suffix}");
-                out.push((format!("{prefix}.lora_A.weight"), lora.lora_a().clone()));
-                out.push((format!("{prefix}.lora_B.weight"), lora.lora_b().clone()));
+        if let Some(blocks) = self.block_adapters.as_ref() {
+            for (i, block) in blocks.iter().enumerate() {
+                for (suffix, lora) in block.iter_with_keys() {
+                    let prefix = format!("joint_blocks.{i}.{suffix}");
+                    out.push((format!("{prefix}.lora_A.weight"), lora.lora_a().clone()));
+                    out.push((format!("{prefix}.lora_B.weight"), lora.lora_b().clone()));
+                }
+            }
+        } else {
+            // LyCORIS path — zip `to_parameters()` with `named_tensors()` to
+            // recover the on-disk-name → Parameter mapping. Same convention
+            // as `chroma::ChromaLoraBundle::named_parameters`.
+            for (&(block_idx, target), adapter) in &self.lycoris_adapters {
+                let prefix = format!("joint_blocks.{block_idx}.{}", target.suffix());
+                let params = adapter.to_parameters();
+                let names = adapter.named_tensors();
+                for (param, (leaf, _)) in params.into_iter().zip(names.into_iter()) {
+                    out.push((format!("{prefix}.{leaf}"), param));
+                }
             }
         }
         out

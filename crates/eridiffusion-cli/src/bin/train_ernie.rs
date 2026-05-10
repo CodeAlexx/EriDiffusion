@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
 use flame_core::adam::AdamW;
 use eridiffusion_core::config::{LrScheduler, TrainConfig, TrainingMethod};
+use eridiffusion_core::lycoris::{LycorisAlgo, LycorisBundleConfig};
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::ema_advanced::EmaConfig;
 use eridiffusion_core::training::features::{loss_weight, lr_schedule, noise_modifiers, timestep_bias, validation::ValidationLoop};
@@ -132,6 +133,47 @@ struct Args {
     #[arg(long, default_value_t = 0)] warmup_steps: usize,
     /// Phase 5: cosine-with-restarts cycle count.
     #[arg(long, default_value_t = 1.0)] lr_cycles: f32,
+
+    // ── LyCORIS algo selection (Phase 2b) ──
+    //
+    // `--algo lora` (default) keeps the legacy LoRALinear path — byte-identical
+    // training to pre-Phase-2b. Other values select LyCORIS algos via
+    // `LycorisBundleConfig`.
+    /// LyCORIS algo: `lora` (default, legacy path) | `locon` | `loha` | `lokr`
+    /// | `full` | `oft`. ERNIE is linear-only (no Conv) so `use_tucker` is
+    /// a no-op. `full` and `oft` build successfully but their `forward_delta`
+    /// is incompatible with ernie's `base + delta_on_input` call pattern;
+    /// Phase 2c will wire merge-into-base.
+    #[arg(long, default_value = "lora")] algo: String,
+    /// LoKr Kronecker split factor (ignored for non-LoKr).
+    #[arg(long, default_value_t = 16)] lokr_factor: i32,
+    /// OFT/BOFT block size (ignored for non-OFT/BOFT).
+    #[arg(long, default_value_t = 32)] oft_block_size: usize,
+    /// OFT Cayley-Neumann series term count.
+    #[arg(long, default_value_t = 5)] oft_neumann_terms: usize,
+    /// Tucker decomposition for non-1×1 conv kernels (ernie is linear-only).
+    #[arg(long, default_value_t = false)] use_tucker: bool,
+    /// LoKr only: factorize both W1 and W2 (default false: only W2).
+    #[arg(long, default_value_t = false)] decompose_both: bool,
+    /// Enable DoRA (weight-decomposed LoRA).
+    #[arg(long, default_value_t = false)] dora: bool,
+    /// DoRA magnitude axis (`true` = lycoris-upstream).
+    #[arg(long, default_value_t = true)] dora_wd_on_out: bool,
+    #[arg(long, default_value_t = 1e-6)] dora_eps: f32,
+    /// SimpleTuner-parity perturbed-normal LoKr init. Phase 2b ernie:
+    /// no-op stub (ERNIE base weights live in BlockOffloader pinned RAM,
+    /// not resident at swap time — same situation as qwenimage). A warning
+    /// is logged when scale > 0; Phase 2c will plumb the resident weight
+    /// map into this path.
+    #[arg(long, default_value_t = 0.0)] init_lokr_norm: f32,
+    /// Per-element dropout on the adapter delta (training only).
+    #[arg(long, default_value_t = 0.0)] lora_dropout: f32,
+    /// Per-rank Bernoulli on the down-projection intermediate.
+    #[arg(long, default_value_t = 0.0)] rank_dropout: f32,
+    /// Per-step Bernoulli on the entire adapter.
+    #[arg(long, default_value_t = 0.0)] module_dropout: f32,
+    /// Rescale rank-mask by `1/mean(mask)` to preserve expectation.
+    #[arg(long, default_value_t = false)] rank_dropout_scale: bool,
 }
 
 /// LOGIT_NORMAL timestep sample matching OT _get_timestep_discrete.
@@ -202,6 +244,69 @@ fn main() -> anyhow::Result<()> {
 
     log::info!("Loading Ernie transformer (rank={} alpha={})...", args.rank, args.lora_alpha);
     let mut model = ErnieModel::load(&shards, &config, device.clone())?;
+
+    // Phase 2b: parse the LyCORIS algo selector. `lora` (default) keeps the
+    // legacy LoRALinear bundle (byte-identical pre-2b path); anything else
+    // swaps in a LyCORIS-aware adapter set in place. See
+    // train_chroma.rs:284 for the canonical pattern.
+    let algo_str = args.algo.trim().to_ascii_lowercase();
+    let algo = if algo_str == "lora" || algo_str == "none" || algo_str.is_empty() {
+        LycorisAlgo::None
+    } else {
+        LycorisAlgo::parse(&args.algo).map_err(|e| anyhow::anyhow!("--algo: {e}"))?
+    };
+    let lyc_config = LycorisBundleConfig {
+        algo,
+        rank: args.rank,
+        alpha: args.lora_alpha as f32,
+        factor: args.lokr_factor,
+        block_size: args.oft_block_size,
+        neumann_terms: args.oft_neumann_terms,
+        use_tucker: args.use_tucker,
+        decompose_both: args.decompose_both,
+        use_scalar: false,
+        dora: args.dora,
+        dora_wd_on_out: args.dora_wd_on_out,
+        dora_eps: args.dora_eps,
+        ..LycorisBundleConfig::default()
+    };
+    if algo != LycorisAlgo::None {
+        log::info!(
+            "[ernie] LyCORIS algo='{}' rank={} alpha={} factor={} block_size={} dora={}",
+            algo.as_str(),
+            lyc_config.rank,
+            lyc_config.alpha,
+            lyc_config.factor,
+            lyc_config.block_size,
+            lyc_config.dora,
+        );
+        if matches!(algo, LycorisAlgo::Full | LycorisAlgo::Oft) {
+            log::warn!(
+                "[ernie] algo='{}' selected — bundle construction will succeed, but \
+                 forward_delta will error inside ernie's `base + delta_on_input` call \
+                 pattern. Phase 2c will wire merge-into-base for these algos.",
+                algo.as_str()
+            );
+        }
+        model.swap_lycoris_bundle(&lyc_config)
+            .map_err(|e| anyhow::anyhow!("LyCORIS bundle swap: {e}"))?;
+        if matches!(algo, LycorisAlgo::LoKr) && args.init_lokr_norm > 0.0 {
+            log::warn!(
+                "[ernie] init_lokr_norm={} requested but trainer-side base-weight \
+                 access is not yet wired for ernie (transformer block weights are \
+                 streamed via BlockOffloader, not resident at bundle-construction time). \
+                 LoKr magnitude will use its lycoris-rs default init for this run. \
+                 Phase 2c will plumb the resident block-weight map into this path.",
+                args.init_lokr_norm,
+            );
+        }
+        // Suppress unused-warnings for dropout flags until LycorisLinear
+        // exposes a per-call dropout knob (Phase 2c).
+        let _ = (args.lora_dropout, args.rank_dropout, args.module_dropout, args.rank_dropout_scale);
+    } else {
+        log::info!("[ernie] algo='lora' (legacy LoRALinear path, byte-identical)");
+    }
+
     let params = model.parameters();
     log::info!("Loaded {} trainable LoRA tensors", params.len());
     if params.is_empty() {

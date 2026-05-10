@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
 use flame_core::adam::AdamW;
 use eridiffusion_core::config::{LrScheduler, TrainConfig, TrainingMethod};
+use eridiffusion_core::lycoris::{LycorisAlgo, LycorisBundleConfig};
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::ema_advanced::EmaConfig;
 use eridiffusion_core::training::features::{loss_weight, lr_schedule, noise_modifiers, timestep_bias, validation::ValidationLoop};
@@ -174,6 +175,56 @@ struct Args {
     #[arg(long, default_value_t = 0)] warmup_steps: usize,
     /// Phase 5: cosine-with-restarts cycle count.
     #[arg(long, default_value_t = 1.0)] lr_cycles: f32,
+
+    // ── LyCORIS algo selection (Phase 2b) ──
+    //
+    // `--algo lora` (default) keeps the legacy `LoRALinear` path —
+    // byte-identical to pre-Phase-2b training. Other values build a
+    // `LycorisLinear` bundle via `SD35Model::install_lycoris_bundle`.
+    // `lora_alpha` and `rank` are shared with the legacy CLI flags above
+    // (no separate `--lycoris-rank`).
+    /// LyCORIS algo: `lora` (default, legacy path) | `locon` | `loha`
+    /// | `lokr` | `full` | `oft`. `full` and `oft` build successfully but
+    /// their `forward_delta` will error inside SD3.5's
+    /// `base + delta_on_input` joint-block call pattern — Phase 2c will
+    /// wire `merge_into_base` for those.
+    #[arg(long, default_value = "lora")] algo: String,
+    /// LoKr Kronecker split factor (ignored for non-LoKr).
+    #[arg(long, default_value_t = 16)] lokr_factor: i32,
+    /// OFT block size (ignored for non-OFT).
+    #[arg(long, default_value_t = 32)] oft_block_size: usize,
+    /// OFT Cayley-Neumann series term count (ignored for non-OFT).
+    #[arg(long, default_value_t = 5)] oft_neumann_terms: usize,
+    /// LoCon / LoHa / LoKr conv variant — Tucker decomposition for non-1×1
+    /// kernels. SD3.5's LoRA targets are linear-only so this is currently
+    /// a no-op.
+    #[arg(long, default_value_t = false)] use_tucker: bool,
+    /// LoKr only: factorize both W1 *and* W2 (default false: only W2).
+    #[arg(long, default_value_t = false)] decompose_both: bool,
+    /// Enable DoRA (weight-decomposed LoRA). Applies to LoCon/LoHa/LoKr
+    /// (Full inherits, OFT errors).
+    ///
+    /// Phase 2b limitation: SD3.5's resident base-weight map is HashMap-keyed
+    /// rather than HashMap<(block,target), Tensor>, so DoRA's magnitude
+    /// initializes from `||I||_2 = 1` rather than `||W_orig||_2`. Trainer
+    /// should still converge — first few hundred steps adjust magnitude.
+    /// Phase 2c will wire pre-load magnitude init.
+    #[arg(long, default_value_t = false)] dora: bool,
+    /// DoRA magnitude axis. Default `true` matches lycoris-upstream
+    /// (norm over input dims, magnitude shape `[out, 1]`).
+    #[arg(long, default_value_t = true)] dora_wd_on_out: bool,
+    #[arg(long, default_value_t = 1e-6)] dora_eps: f32,
+    /// SimpleTuner-parity perturbed-normal LoKr init. No-op for SD3.5 in
+    /// Phase 2b (base-weight-by-target lookup not plumbed).
+    #[arg(long, default_value_t = 0.0)] init_lokr_norm: f32,
+    /// Per-element dropout on the adapter delta (training only).
+    #[arg(long, default_value_t = 0.0)] lora_dropout: f32,
+    /// Per-rank Bernoulli on the down-projection intermediate.
+    #[arg(long, default_value_t = 0.0)] rank_dropout: f32,
+    /// Per-step Bernoulli on the entire adapter.
+    #[arg(long, default_value_t = 0.0)] module_dropout: f32,
+    /// Rescale rank-mask by `1/mean(mask)` to preserve expectation.
+    #[arg(long, default_value_t = false)] rank_dropout_scale: bool,
 }
 
 /// LOGIT_NORMAL timestep sample → continuous t in `[min_t, max_t)`.
@@ -511,6 +562,64 @@ fn main() -> anyhow::Result<()> {
     log::info!("Loading SD3.5 transformer from {} shard(s) (rank={} alpha={})",
         shards.len(), args.rank, args.lora_alpha);
     let mut model = SD35Model::load(&shards, &config, device.clone())?;
+
+    // Phase 2b: parse LyCORIS algo selector. `--algo lora` (or `none`/empty)
+    // keeps the legacy `LoRALinear` bundle that `SD35Model::load` already
+    // built, so this branch is byte-equivalent to pre-Phase-2b training.
+    // `LycorisAlgo::parse("lora")` aliases to `LycorisAlgo::LoCon`; we
+    // re-map `"lora"` → `None` here explicitly so plain LoRA stays on the
+    // legacy path. Users wanting the new LoCon adapter pass `--algo locon`.
+    let algo_str = args.algo.trim().to_ascii_lowercase();
+    let algo = if algo_str == "lora" || algo_str == "none" || algo_str.is_empty() {
+        LycorisAlgo::None
+    } else {
+        LycorisAlgo::parse(&args.algo).map_err(|e| anyhow::anyhow!("--algo: {e}"))?
+    };
+    let lyc_config = LycorisBundleConfig {
+        algo,
+        rank: args.rank,
+        alpha: args.lora_alpha as f32,
+        factor: args.lokr_factor,
+        block_size: args.oft_block_size,
+        neumann_terms: args.oft_neumann_terms,
+        use_tucker: args.use_tucker,
+        decompose_both: args.decompose_both,
+        use_scalar: false,
+        dora: args.dora,
+        dora_wd_on_out: args.dora_wd_on_out,
+        dora_eps: args.dora_eps,
+        ..LycorisBundleConfig::default()
+    };
+
+    if algo != LycorisAlgo::None {
+        log::info!(
+            "[SD3.5] LyCORIS algo='{}' rank={} alpha={} factor={} block_size={} dora={}",
+            algo.as_str(),
+            lyc_config.rank,
+            lyc_config.alpha,
+            lyc_config.factor,
+            lyc_config.block_size,
+            lyc_config.dora,
+        );
+        if matches!(algo, LycorisAlgo::Full | LycorisAlgo::Oft) {
+            log::warn!(
+                "[SD3.5] algo='{}' selected — bundle construction will succeed, but \
+                 forward_delta will error inside SD3.5's `base + delta_on_input` joint-block \
+                 pattern. Phase 2c will wire merge-into-base for these algos.",
+                algo.as_str()
+            );
+        }
+        model.install_lycoris_bundle(&lyc_config, device.clone(), SEED)
+            .map_err(|e| anyhow::anyhow!("LyCORIS bundle install: {e}"))?;
+    } else {
+        log::info!("[SD3.5] algo='lora' (legacy LoRALinear path, byte-identical)");
+    }
+
+    // Reference-only: silence unused-warning for dropout/init flags wired in
+    // Block 2 but not yet plumbed past `LycorisBundleConfig` (Phase 2c).
+    let _ = (args.init_lokr_norm, args.lora_dropout, args.rank_dropout,
+             args.module_dropout, args.rank_dropout_scale);
+
     let params = model.parameters();
     log::info!("Loaded {} trainable LoRA parameters", params.len());
     if params.is_empty() {

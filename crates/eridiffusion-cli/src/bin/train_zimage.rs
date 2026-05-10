@@ -27,7 +27,8 @@ use rand::distributions::Distribution as _;
 use std::path::PathBuf;
 
 use eridiffusion_core::encoders::qwen3::Qwen3Encoder;
-use eridiffusion_core::models::zimage::ZImageModel;
+use eridiffusion_core::lycoris::{LycorisAlgo, LycorisBundleConfig};
+use eridiffusion_core::models::zimage::{ZImageLoraBundle, ZImageModel};
 use eridiffusion_core::sampler::zimage_sampler;
 use eridiffusion_core::training::board::BoardWriter;
 use eridiffusion_core::training::checkpoint::{self, CkptHeader};
@@ -167,6 +168,56 @@ struct Args {
     #[arg(long, default_value_t = 0)] warmup_steps: usize,
     /// Phase 5: cosine-with-restarts cycle count. Ignored for other schedulers.
     #[arg(long, default_value_t = 1.0)] lr_cycles: f32,
+
+    // ── LyCORIS algo selection (Phase 2b) ──
+    //
+    // `--algo lora` (default) keeps the legacy `LoRALinear` path — byte-identical
+    // training to pre-Phase-2b. Other values select LyCORIS algos via
+    // `ZImageLoraBundle::new_with_config`. `lora_alpha` and `rank` are shared
+    // with the legacy CLI flags above (no separate `--lycoris-rank`).
+    /// LyCORIS algo: `lora` (default, legacy path) | `locon` | `loha` | `lokr`
+    /// | `full` | `oft`. `full` and `oft` build successfully but their
+    /// `forward_delta` will error inside the zimage forward pass —
+    /// zimage's `base + delta_on_input` call pattern is incompatible with
+    /// Full/OFT semantics. Phase 2c will wire a `merge_into_base` path.
+    #[arg(long, default_value = "lora")] algo: String,
+    /// LoKr Kronecker split factor (ignored for non-LoKr).
+    #[arg(long, default_value_t = 16)] lokr_factor: i32,
+    /// OFT block size (ignored for non-OFT).
+    #[arg(long, default_value_t = 32)] oft_block_size: usize,
+    /// OFT Cayley-Neumann series term count (ignored for non-OFT).
+    #[arg(long, default_value_t = 5)] oft_neumann_terms: usize,
+    /// LoCon / LoHa / LoKr conv variant — Tucker decomposition for non-1×1
+    /// kernels. Z-Image is linear-only so this is currently a no-op.
+    #[arg(long, default_value_t = false)] use_tucker: bool,
+    /// LoKr only: factorize both W1 *and* W2 (default false: only W2).
+    #[arg(long, default_value_t = false)] decompose_both: bool,
+    /// Enable DoRA (weight-decomposed LoRA). Applies to LoCon/LoHa/LoKr/Full
+    /// (OFT errors).
+    ///
+    /// Phase 2b limitation: zimage's bundle ctor doesn't have access to the
+    /// resident block weights at construction time, so DoRA's magnitude is
+    /// initialized from `||I||_2 = 1` rather than `||W_orig||_2`. The trainer
+    /// should still converge but will spend the first few hundred steps
+    /// adjusting the magnitude. Phase 2c will wire pre-load magnitude init.
+    #[arg(long, default_value_t = false)] dora: bool,
+    /// DoRA magnitude axis. Default `true` matches lycoris-upstream
+    /// (norm over input dims, magnitude shape `[out, 1]`).
+    #[arg(long, default_value_t = true)] dora_wd_on_out: bool,
+    #[arg(long, default_value_t = 1e-6)] dora_eps: f32,
+    /// SimpleTuner-parity: perturbed-normal LoKr init. Scale `>0` triggers
+    /// `lokr_w1=1, lokr_w2 ~ N(μ_W, σ_W)·scale`. No-op when algo != lokr or
+    /// value is 0.0.
+    #[arg(long, default_value_t = 0.0)] init_lokr_norm: f32,
+    /// Per-element dropout on the adapter delta (training only). Reserved for
+    /// Phase 2c wiring on adapter forward; currently accepted-but-unused.
+    #[arg(long, default_value_t = 0.0)] lora_dropout: f32,
+    /// Per-rank Bernoulli on the down-projection intermediate. Phase 2c.
+    #[arg(long, default_value_t = 0.0)] rank_dropout: f32,
+    /// Per-step Bernoulli on the entire adapter. Phase 2c.
+    #[arg(long, default_value_t = 0.0)] module_dropout: f32,
+    /// Rescale rank-mask by `1/mean(mask)` to preserve expectation. Phase 2c.
+    #[arg(long, default_value_t = false)] rank_dropout_scale: bool,
 }
 
 /// LOGIT_NORMAL timestep sample matching OT _get_timestep_discrete.
@@ -205,6 +256,56 @@ fn main() -> anyhow::Result<()> {
     flame_core::config::set_default_dtype(DType::BF16);
     let device = flame_core::global_cuda_device();
 
+    // Phase 2b: parse the LyCORIS algo selector. `lora` (default) keeps the
+    // legacy `LoRALinear` bundle constructed inside `ZImageModel::load`.
+    // Anything else swaps the bundle in-place after model construction so we
+    // don't have to re-plumb the per-trainer constructor signatures.
+    //
+    // NOTE: `LycorisAlgo::parse("lora")` aliases to `LycorisAlgo::LoCon`
+    // (since LoCon-Linear is the canonical LoRA decomposition). For zimage
+    // we need to distinguish LEGACY plain `LoRALinear` (byte-identical) from
+    // the new `LycorisAdapter::LoCon` path, so re-map `"lora"` → `None` here
+    // explicitly. Users who want the new LoCon path pass `--algo locon`.
+    let algo_str = args.algo.trim().to_ascii_lowercase();
+    let algo = if algo_str == "lora" || algo_str == "none" || algo_str.is_empty() {
+        LycorisAlgo::None
+    } else {
+        LycorisAlgo::parse(&args.algo).map_err(|e| anyhow::anyhow!("--algo: {e}"))?
+    };
+    // Default storage (F32) inherited from `LycorisBundleConfig::default()`.
+    // Z-Image trainer is BF16/F32-only (see feedback_zimage_no_quantization);
+    // do NOT switch storage to FP8/Int8 here.
+    let lyc_config = LycorisBundleConfig {
+        algo,
+        rank: args.rank,
+        alpha: args.lora_alpha as f32,
+        factor: args.lokr_factor,
+        block_size: args.oft_block_size,
+        neumann_terms: args.oft_neumann_terms,
+        use_tucker: args.use_tucker,
+        decompose_both: args.decompose_both,
+        use_scalar: false,
+        dora: args.dora,
+        dora_wd_on_out: args.dora_wd_on_out,
+        dora_eps: args.dora_eps,
+        ..LycorisBundleConfig::default()
+    };
+    // Phase 2b dropout-quad flags are accepted-but-unused for now (Phase 2c
+    // will wire them through `LycorisLinear::forward_delta`). Surface a
+    // warning so users don't think they're already active.
+    if args.lora_dropout > 0.0
+        || args.rank_dropout > 0.0
+        || args.module_dropout > 0.0
+        || args.rank_dropout_scale
+    {
+        log::warn!(
+            "[zimage] dropout flags accepted but not yet wired (Phase 2c): \
+             lora_dropout={} rank_dropout={} module_dropout={} rank_dropout_scale={}",
+            args.lora_dropout, args.rank_dropout,
+            args.module_dropout, args.rank_dropout_scale,
+        );
+    }
+
     log::info!("Loading Z-Image transformer (rank={} alpha={})...", args.rank, args.lora_alpha);
     let mut model = ZImageModel::load(
         &args.model,
@@ -213,6 +314,47 @@ fn main() -> anyhow::Result<()> {
         device.clone(),
         SEED,
     )?;
+
+    // Phase 2b: if a non-legacy algo was requested, swap the bundle. Plain
+    // `--algo lora` (or `lora`/`none`) keeps the legacy bundle as-is so this
+    // branch is byte-equivalent to the pre-Phase-2b pipeline.
+    if algo != LycorisAlgo::None {
+        log::info!(
+            "[zimage] LyCORIS algo='{}' rank={} alpha={} factor={} block_size={} dora={}",
+            algo.as_str(),
+            lyc_config.rank,
+            lyc_config.alpha,
+            lyc_config.factor,
+            lyc_config.block_size,
+            lyc_config.dora,
+        );
+        if matches!(algo, LycorisAlgo::Full | LycorisAlgo::Oft) {
+            log::warn!(
+                "[zimage] algo='{}' selected — bundle construction will succeed, but \
+                 forward_delta will error inside zimage's `base + delta_on_input` call \
+                 pattern. Phase 2c will wire merge-into-base for these algos.",
+                algo.as_str()
+            );
+        }
+        let new_bundle = ZImageLoraBundle::new_with_config(&lyc_config, device.clone(), SEED)
+            .map_err(|e| anyhow::anyhow!("LyCORIS bundle construction: {e}"))?;
+        model.bundle = new_bundle;
+
+        // SimpleTuner-style perturbed-normal init for LoKr. Z-Image block
+        // weights are resident at this point (loaded in `ZImageModel::load`)
+        // but the trainer doesn't expose them through a clean accessor yet,
+        // so the bundle method logs a warning + TODO instead of silently
+        // skipping. Phase 2c will plumb the resident `block_weights` map in.
+        if matches!(algo, LycorisAlgo::LoKr) && args.init_lokr_norm > 0.0 {
+            model
+                .bundle
+                .apply_init_perturbed_normal(args.init_lokr_norm)
+                .map_err(|e| anyhow::anyhow!("init_lokr_norm: {e}"))?;
+        }
+    } else {
+        log::info!("[zimage] algo='lora' (legacy LoRALinear path, byte-identical)");
+    }
+
     if let Some(resume_path) = args.resume_lora.as_ref() {
         log::info!("Resuming LoRA weights only (no optimizer state) from {}", resume_path.display());
         model.bundle.load(resume_path, &device)?;

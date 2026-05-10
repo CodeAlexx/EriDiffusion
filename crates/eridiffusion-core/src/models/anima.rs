@@ -46,10 +46,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use cudarc::driver::CudaDevice;
 use flame_core::{parameter::Parameter, DType, Shape, Tensor};
+use crate::adapter::{AdapterModule, LycorisLinear};
 use crate::config::TrainConfig;
 use crate::lora::LoRALinear;
+use crate::lycoris::{LycorisAlgo, LycorisBundleConfig};
 use crate::models::TrainableModel;
 use crate::Result;
+use lycoris_rs::{
+    algorithms::{full::FullAdapter, locon::LoConModule, loha::LoHaModule, lokr::LoKrModule, oft::OFTModule},
+    dora::init_magnitude,
+    LycorisAdapter,
+};
 
 // ── Anima preview config (matches anima_utils.load_anima_model) ──
 pub const HIDDEN: usize = 2048;             // model_channels
@@ -161,8 +168,22 @@ impl AnimaLoraTarget {
     }
 }
 
+/// Per-target adapter collection. Default `algo == LycorisAlgo::None` is the
+/// legacy plain-LoRA path: `adapters` (Vec<LoRALinear>) is populated and
+/// `lyc_adapters` is `None`. With `--algo locon|loha|lokr|full|oft`,
+/// `new_with_config` populates `lyc_adapters` and leaves `adapters` empty.
+/// The `linear_lora` call site picks the lycoris path when present.
 pub struct AnimaLoraBundle {
-    pub adapters: Vec<LoRALinear>, // length = NUM_BLOCKS * LORA_SLOTS_PER_BLOCK
+    pub adapters: Vec<LoRALinear>, // length = NUM_BLOCKS * LORA_SLOTS_PER_BLOCK (legacy path)
+    /// LyCORIS adapters (parallel slot order to `adapters`). `None` for the
+    /// legacy plain-LoRA path; `Some(...)` for `--algo {locon,loha,lokr,full,oft}`.
+    pub lyc_adapters: Option<Vec<Arc<dyn AdapterModule>>>,
+    /// Active algo selector. Default `LycorisAlgo::None` matches the legacy
+    /// plain-LoRA path byte-for-byte.
+    pub algo: LycorisAlgo,
+    /// Plain-LoRA rank — kept for `load_from_safetensors` re-construction.
+    pub rank: usize,
+    pub alpha: f32,
 }
 
 impl AnimaLoraBundle {
@@ -174,42 +195,113 @@ impl AnimaLoraBundle {
                 adapters.push(LoRALinear::new(in_f, out_f, rank, alpha, device.clone(), s)?);
             }
         }
-        Ok(Self { adapters })
+        Ok(Self {
+            adapters,
+            lyc_adapters: None,
+            algo: LycorisAlgo::None,
+            rank,
+            alpha,
+        })
+    }
+
+    /// LyCORIS-aware constructor. `config.algo == LycorisAlgo::None` falls back
+    /// to plain `LoRALinear` (legacy byte-identical path). Other algos build
+    /// `LycorisLinear` per slot via the matching `lycoris_rs` `*_for_training`
+    /// constructor — slot order parallels the legacy `adapters` vec.
+    ///
+    /// Full and OFT bundle-construction succeeds, but their `forward_delta`
+    /// returns an error inside anima's `base + delta_on_input` call pattern
+    /// (same caveat as chroma — Phase 2c will hoist merge-into-base).
+    pub fn new_with_config(
+        config: &LycorisBundleConfig,
+        device: Arc<CudaDevice>,
+        seed: u64,
+    ) -> Result<Self> {
+        if config.algo == LycorisAlgo::None {
+            return Self::new(config.rank, config.alpha, device, seed);
+        }
+
+        let mut lyc_adapters: Vec<Arc<dyn AdapterModule>> =
+            Vec::with_capacity(NUM_BLOCKS * LORA_SLOTS_PER_BLOCK);
+        for _block_idx in 0..NUM_BLOCKS {
+            for &(in_f, out_f) in LORA_SHAPES.iter() {
+                let wrapper = build_lycoris_linear(config, in_f, out_f, device.clone())?;
+                lyc_adapters.push(Arc::new(wrapper));
+            }
+        }
+        let _ = seed; // lycoris-rs uses its own internal RNG.
+
+        Ok(Self {
+            adapters: Vec::new(),
+            lyc_adapters: Some(lyc_adapters),
+            algo: config.algo,
+            rank: config.rank,
+            alpha: config.alpha,
+        })
+    }
+
+    /// Total adapter count (works for both legacy and lycoris paths).
+    fn slot_count(&self) -> usize {
+        if let Some(ref l) = self.lyc_adapters { l.len() } else { self.adapters.len() }
+    }
+
+    /// Iterate `(slot_index, &dyn AdapterModule)` over whichever path is active.
+    fn iter_adapters(&self) -> Box<dyn Iterator<Item = (usize, &dyn AdapterModule)> + '_> {
+        if let Some(ref l) = self.lyc_adapters {
+            Box::new(l.iter().enumerate().map(|(i, a)| (i, a.as_ref() as &dyn AdapterModule)))
+        } else {
+            Box::new(self.adapters.iter().enumerate().map(|(i, a)| (i, a as &dyn AdapterModule)))
+        }
     }
 
     pub fn parameters(&self) -> Vec<Parameter> {
-        let mut p = Vec::with_capacity(self.adapters.len() * 2);
-        for l in &self.adapters {
-            p.extend(l.parameters());
+        if let Some(ref l) = self.lyc_adapters {
+            let mut out = Vec::new();
+            for adapter in l { out.extend(adapter.to_parameters()); }
+            out
+        } else {
+            let mut p = Vec::with_capacity(self.adapters.len() * 2);
+            for adapter in &self.adapters { p.extend(adapter.parameters()); }
+            p
         }
-        p
     }
 
     pub fn named_parameters(&self) -> Vec<(String, Parameter)> {
-        let mut out = Vec::with_capacity(self.adapters.len() * 2);
-        for (i, adapter) in self.adapters.iter().enumerate() {
+        let total = self.slot_count();
+        let mut out = Vec::with_capacity(total * 2);
+        for (i, adapter) in self.iter_adapters() {
             let block_idx = i / LORA_SLOTS_PER_BLOCK;
             let slot = i % LORA_SLOTS_PER_BLOCK;
             let prefix = format!("diffusion_model.blocks.{block_idx}.{}", LORA_SLOT_KEYS[slot]);
-            out.push((format!("{prefix}.lora_A.weight"), adapter.lora_a().clone()));
-            out.push((format!("{prefix}.lora_B.weight"), adapter.lora_b().clone()));
+            let params = adapter.to_parameters();
+            let names = adapter.named_tensors();
+            for (param, (leaf, _)) in params.into_iter().zip(names.into_iter()) {
+                out.push((format!("{prefix}.{leaf}"), param));
+            }
         }
         out
     }
 
-    /// Slot lookup by (block, target).
-    pub fn get(&self, block: usize, target: AnimaLoraTarget) -> &LoRALinear {
-        &self.adapters[block * LORA_SLOTS_PER_BLOCK + target.slot()]
+    /// Slot lookup by (block, target). Returns the trait object so both legacy
+    /// and lycoris paths dispatch through `AdapterModule::forward_delta`.
+    pub fn get(&self, block: usize, target: AnimaLoraTarget) -> &dyn AdapterModule {
+        let idx = block * LORA_SLOTS_PER_BLOCK + target.slot();
+        if let Some(ref l) = self.lyc_adapters {
+            l[idx].as_ref()
+        } else {
+            &self.adapters[idx]
+        }
     }
 
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
         let mut tensors: HashMap<String, Tensor> = HashMap::new();
-        for (i, adapter) in self.adapters.iter().enumerate() {
+        for (i, adapter) in self.iter_adapters() {
             let block_idx = i / LORA_SLOTS_PER_BLOCK;
             let slot = i % LORA_SLOTS_PER_BLOCK;
             let prefix = format!("diffusion_model.blocks.{block_idx}.{}", LORA_SLOT_KEYS[slot]);
-            tensors.insert(format!("{prefix}.lora_A.weight"), adapter.lora_a().tensor()?);
-            tensors.insert(format!("{prefix}.lora_B.weight"), adapter.lora_b().tensor()?);
+            for (leaf, t) in adapter.named_tensors() {
+                tensors.insert(format!("{prefix}.{leaf}"), t);
+            }
         }
         flame_core::serialization::save_file(&tensors, path)
             .map_err(|e| crate::EriDiffusionError::Safetensors(format!("save_file: {e}")))?;
@@ -219,14 +311,187 @@ impl AnimaLoraBundle {
     pub fn load(&self, path: &std::path::Path, device: &Arc<CudaDevice>) -> Result<()> {
         let source = flame_core::serialization::load_file(path, device)
             .map_err(|e| crate::EriDiffusionError::Safetensors(format!("load_file: {e}")))?;
-        for (i, adapter) in self.adapters.iter().enumerate() {
+        // Legacy LoRALinear path keeps its tailored loader (auto-handles the
+        // pre-`.weight`-suffix convention).
+        if self.lyc_adapters.is_none() {
+            for (i, adapter) in self.adapters.iter().enumerate() {
+                let block_idx = i / LORA_SLOTS_PER_BLOCK;
+                let slot = i % LORA_SLOTS_PER_BLOCK;
+                let prefix = format!("diffusion_model.blocks.{block_idx}.{}", LORA_SLOT_KEYS[slot]);
+                adapter.load_tensors(&prefix, &source)?;
+            }
+            return Ok(());
+        }
+        // LyCORIS path: copy each `<prefix>.<leaf>` tensor into the per-leaf
+        // Parameter / bare Tensor exposed by `named_tensors()`.
+        let lyc = self.lyc_adapters.as_ref().unwrap();
+        for (i, adapter) in lyc.iter().enumerate() {
             let block_idx = i / LORA_SLOTS_PER_BLOCK;
             let slot = i % LORA_SLOTS_PER_BLOCK;
             let prefix = format!("diffusion_model.blocks.{block_idx}.{}", LORA_SLOT_KEYS[slot]);
-            adapter.load_tensors(&prefix, &source)?;
+            for (leaf, _) in adapter.named_tensors() {
+                let key = format!("{prefix}.{leaf}");
+                let _ = source.get(&key).ok_or_else(|| {
+                    crate::EriDiffusionError::Safetensors(format!(
+                        "AnimaLoraBundle::load: missing key `{key}` for algo={}",
+                        self.algo.as_str()
+                    ))
+                })?;
+                // NOTE: in-place LyCORIS leaf load is not yet wired through a
+                // generic Parameter::set_data path; per-algo loaders live in
+                // `crate::lycoris`. For Phase 2b we surface the missing-key
+                // case loudly above; full LyCORIS resume lands with Phase 2c.
+            }
+            log::warn!(
+                "[AnimaLoraBundle::load] LyCORIS in-place leaf-load TODO for algo={} at slot {} \
+                 (file present but bytes not copied — Phase 2c will wire this)",
+                self.algo.as_str(), i,
+            );
         }
         Ok(())
     }
+
+    /// SimpleTuner-parity perturbed-normal LoKr init.
+    /// For each LoKr slot, look up the corresponding base weight by slot key
+    /// and call `LycorisLinear::init_perturbed_normal_lokr(base_weight, scale)`.
+    /// No-op when algo != LoKr or scale == 0.0.
+    ///
+    /// Returns `Ok(skipped_count)` — number of slots whose base-weight lookup
+    /// failed (logged but not fatal).
+    pub fn apply_init_perturbed_normal(
+        &self,
+        weights: &HashMap<String, Tensor>,
+        scale: f32,
+    ) -> Result<usize> {
+        if !matches!(self.algo, LycorisAlgo::LoKr) || scale == 0.0 {
+            return Ok(0);
+        }
+        let lyc = match self.lyc_adapters.as_ref() {
+            Some(l) => l,
+            None => return Ok(0),
+        };
+        let mut skipped = 0usize;
+        for (i, adapter) in lyc.iter().enumerate() {
+            let block_idx = i / LORA_SLOTS_PER_BLOCK;
+            let slot = i % LORA_SLOTS_PER_BLOCK;
+            let weight_key = format!("blocks.{block_idx}.{}.weight", LORA_SLOT_KEYS[slot]);
+            // Try literal then `net.` prefix to match `AnimaModel::w()`.
+            let alt = format!("net.{weight_key}");
+            let base = weights.get(&weight_key).or_else(|| weights.get(&alt));
+            let base = match base {
+                Some(t) => t,
+                None => {
+                    log::warn!(
+                        "[init_lokr_norm] missing base weight `{weight_key}` (also tried `{alt}`) \
+                         for slot {i} — skipping perturbed-normal init",
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
+            // Dispatch via the trait default-impl
+            // `AdapterModule::init_perturbed_normal_lokr`: returns
+            // `Ok(true)` when the adapter is a LycorisLinear wrapping
+            // a full-form LoKr, `Ok(false)` otherwise.  No `Any`
+            // downcast required — the trait method routes per-impl.
+            let applied = adapter
+                .init_perturbed_normal_lokr(base, scale)
+                .map_err(|e| flame_core::FlameError::InvalidOperation(format!(
+                    "init_perturbed_normal_lokr slot {i}: {e}"
+                )))?;
+            if !applied {
+                log::warn!(
+                    "[init_lokr_norm] slot {i} (block={block_idx}, key=`{weight_key}`): \
+                     adapter declined init (non-LoKr or factored form)",
+                );
+                skipped += 1;
+            }
+        }
+        Ok(skipped)
+    }
+}
+
+/// Build a single `LycorisLinear` for the configured algo. Mirrors
+/// `chroma::build_lycoris_linear` exactly.
+fn build_lycoris_linear(
+    config: &LycorisBundleConfig,
+    in_features: usize,
+    out_features: usize,
+    device: Arc<CudaDevice>,
+) -> Result<LycorisLinear> {
+    let alpha = Some(config.alpha);
+    let dtype = config.storage;
+
+    let adapter = match config.algo {
+        LycorisAlgo::None => {
+            return Err(flame_core::Error::InvalidInput(
+                "build_lycoris_linear: LycorisAlgo::None should be handled by caller".into(),
+            ).into());
+        }
+        LycorisAlgo::LoCon => LycorisAdapter::LoCon(
+            LoConModule::new_linear_for_training(
+                in_features, out_features, config.rank, alpha,
+                device.clone(), dtype,
+            )
+            .map_err(|e| flame_core::Error::InvalidInput(format!("LoCon::new_linear_for_training: {e}")))?,
+        ),
+        LycorisAlgo::LoHa => LycorisAdapter::LoHa(
+            LoHaModule::new_linear_for_training(
+                in_features, out_features, config.rank, alpha,
+                device.clone(), dtype,
+            )
+            .map_err(|e| flame_core::Error::InvalidInput(format!("LoHa::new_linear_for_training: {e}")))?,
+        ),
+        LycorisAlgo::LoKr => LycorisAdapter::LoKr(
+            LoKrModule::new_linear(
+                in_features, out_features, config.rank, config.alpha,
+                config.factor, config.decompose_both, config.use_scalar,
+                device.clone(), dtype,
+            )
+            .map_err(|e| flame_core::Error::InvalidInput(format!("LoKr::new_linear: {e}")))?,
+        ),
+        LycorisAlgo::Full => LycorisAdapter::Full(
+            FullAdapter::new_for_training(
+                flame_core::Shape::from_dims(&[out_features, in_features]),
+                None, device.clone(), dtype,
+            )
+            .map_err(|e| flame_core::Error::InvalidInput(format!("Full::new_for_training: {e}")))?,
+        ),
+        LycorisAlgo::Oft => LycorisAdapter::OFT(
+            OFTModule::new_linear(
+                in_features, out_features, config.block_size, config.alpha,
+                None, dtype, device.clone(),
+            )
+            .map_err(|e| flame_core::Error::InvalidInput(format!("OFT::new_linear: {e}")))?
+            .with_neumann_terms(config.neumann_terms),
+        ),
+    };
+
+    let dora_magnitude = if config.dora {
+        if config.algo == LycorisAlgo::Oft {
+            return Err(flame_core::Error::InvalidInput(
+                "DoRA + OFT is not supported (multiplicative + decomposition conflict)".into(),
+            ).into());
+        }
+        let shape = if config.dora_wd_on_out {
+            flame_core::Shape::from_dims(&[out_features, 1])
+        } else {
+            flame_core::Shape::from_dims(&[1, in_features])
+        };
+        let ones = Tensor::from_vec(
+            vec![1.0_f32; shape.elem_count()],
+            shape, device.clone(),
+        )?;
+        let m = init_magnitude(&ones, config.dora_wd_on_out, 0.0)
+            .map_err(|e| flame_core::Error::InvalidInput(format!("init_magnitude: {e}")))?;
+        Some(m.requires_grad_(true))
+    } else {
+        None
+    };
+
+    Ok(LycorisLinear::new(
+        adapter, dora_magnitude, config.dora_wd_on_out, config.dora_eps, config.storage,
+    ))
 }
 
 pub struct AnimaModel {
@@ -327,7 +592,9 @@ impl AnimaModel {
         let base = self.linear_no_bias(x, weight_key)?;
         if let Some((block, target)) = slot_block {
             let lora = self.bundle.get(block, target);
-            let delta = lora.forward_delta(x).map_err(crate::EriDiffusionError::from)?;
+            // Trait dispatch: covers both legacy LoRALinear and LyCORIS paths.
+            let delta = lora.forward_delta(x)
+                .map_err(|e| crate::EriDiffusionError::Model(format!("forward_delta: {e}")))?;
             base.add(&delta).map_err(Into::into)
         } else {
             Ok(base)

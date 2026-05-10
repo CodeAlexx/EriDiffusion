@@ -18,6 +18,7 @@ use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
 use flame_core::adam::AdamW;
 use flame_core::gradient_clip::GradientClipper;
 use eridiffusion_core::encoders::qwen25vl::Qwen25VLEncoder;
+use eridiffusion_core::lycoris::{LycorisAlgo, LycorisBundleConfig};
 use eridiffusion_core::models::{qwenimage as qwen_model, QwenImageTrainingModel};
 use eridiffusion_core::sampler::qwenimage_sampler;
 use eridiffusion_core::training::board::BoardWriter;
@@ -178,6 +179,60 @@ struct Args {
     #[arg(long, default_value = "constant")] lr_scheduler: String,
     /// Phase 5: cosine-with-restarts cycle count. Ignored for other schedulers.
     #[arg(long, default_value_t = 1.0)] lr_cycles: f32,
+
+    // ── LyCORIS algo selection (Phase 2b) ──
+    //
+    // `--algo lora` (default) keeps the legacy LoRALinear path — byte-identical
+    // training to pre-Phase-2b. Other values select LyCORIS algos via
+    // `QwenImageLoraBundle::new_with_config`. `lora_alpha` and `rank` are
+    // shared with the legacy CLI flags above (no separate `--lycoris-rank`).
+    /// LyCORIS algo: `lora` (default, legacy path) | `locon` | `loha` | `lokr`
+    /// | `full` | `oft`. `full` and `oft` build successfully but their
+    /// `forward_delta` will error inside the qwenimage forward pass —
+    /// qwenimage's `base + delta_on_input` call pattern is incompatible
+    /// with Full/OFT semantics. Phase 2c will wire a `merge_into_base` path.
+    #[arg(long, default_value = "lora")] algo: String,
+    /// LoKr Kronecker split factor (ignored for non-LoKr).
+    #[arg(long, default_value_t = 16)] lokr_factor: i32,
+    /// OFT block size (ignored for non-OFT).
+    #[arg(long, default_value_t = 32)] oft_block_size: usize,
+    /// OFT Cayley-Neumann series term count (ignored for non-OFT).
+    #[arg(long, default_value_t = 5)] oft_neumann_terms: usize,
+    /// LoCon / LoHa / LoKr conv variant — Tucker decomposition for non-1×1
+    /// kernels. Qwen-Image-2512 is linear-only so this is currently a no-op.
+    #[arg(long, default_value_t = false)] use_tucker: bool,
+    /// LoKr only: factorize both W1 *and* W2 (default false: only W2).
+    #[arg(long, default_value_t = false)] decompose_both: bool,
+    /// Enable DoRA (weight-decomposed LoRA). Applies to LoCon/LoHa/LoKr
+    /// (Full inherits, OFT errors).
+    ///
+    /// Phase 2b limitation: qwenimage's bundle ctor doesn't have access to
+    /// the streamed block weights at construction time, so DoRA's magnitude
+    /// is initialized from `||I||_2 = 1` rather than `||W_orig||_2`. Phase 2c
+    /// will wire pre-load magnitude init.
+    #[arg(long, default_value_t = false)] dora: bool,
+    /// DoRA magnitude axis. Default `true` matches lycoris-upstream
+    /// (norm over input dims, magnitude shape `[out, 1]`).
+    #[arg(long, default_value_t = true)] dora_wd_on_out: bool,
+    #[arg(long, default_value_t = 1e-6)] dora_eps: f32,
+    /// SimpleTuner-parity: perturbed-normal LoKr init.  Scale `>0`
+    /// triggers `lokr_w1=1, lokr_w2 ~ N(μ_W, σ_W)·scale`.  No-op when
+    /// algo != lokr or value is 0.0.
+    ///
+    /// Phase 2b note: qwenimage's resident weight map is not yet plumbed
+    /// to the bundle's perturbed-init helper (block weights are streamed
+    /// via BlockOffloader). When set with `--algo lokr`, the bundle method
+    /// logs a warning and returns Ok(()) without touching adapters. Phase
+    /// 2c will wire the resident `block_weights` map into the init call.
+    #[arg(long, default_value_t = 0.0)] init_lokr_norm: f32,
+    /// Per-element dropout on the adapter delta (training only).
+    #[arg(long, default_value_t = 0.0)] lora_dropout: f32,
+    /// Per-rank Bernoulli on the down-projection intermediate.
+    #[arg(long, default_value_t = 0.0)] rank_dropout: f32,
+    /// Per-step Bernoulli on the entire adapter.
+    #[arg(long, default_value_t = 0.0)] module_dropout: f32,
+    /// Rescale rank-mask by `1/mean(mask)` to preserve expectation.
+    #[arg(long, default_value_t = false)] rank_dropout_scale: bool,
 }
 
 /// Self-adjusting shift based on image sequence length.
@@ -326,11 +381,116 @@ fn main() -> anyhow::Result<()> {
         (None, None, None, None)
     };
 
+    // Phase 2b: parse the LyCORIS algo selector. `lora` (default) keeps the
+    // legacy LoRALinear bundle constructed inside `QwenImageTrainingModel::load`.
+    // Anything else swaps the bundle in-place after model construction so we
+    // don't have to re-plumb the per-trainer constructor signatures.
+    //
+    // NOTE: `LycorisAlgo::parse("lora")` aliases to `LycorisAlgo::LoCon`
+    // (since LoCon-Linear is the canonical LoRA decomposition). For
+    // qwenimage we need to distinguish LEGACY plain `LoRALinear`
+    // (byte-identical) from the new `LycorisAdapter::LoCon` path, so re-map
+    // `"lora"` → `None` here explicitly. Users who want the new LoCon path
+    // pass `--algo locon`.
+    let algo_str = args.algo.trim().to_ascii_lowercase();
+    let algo = if algo_str == "lora" || algo_str == "none" || algo_str.is_empty() {
+        LycorisAlgo::None
+    } else {
+        LycorisAlgo::parse(&args.algo).map_err(|e| anyhow::anyhow!("--algo: {e}"))?
+    };
+    // Default storage (F32) inherited from `LycorisBundleConfig::default()`.
+    // qwenimage trainer is BF16/F32-only; do NOT switch to FP8.
+    let lyc_config = LycorisBundleConfig {
+        algo,
+        rank: args.rank,
+        alpha: args.lora_alpha as f32,
+        factor: args.lokr_factor,
+        block_size: args.oft_block_size,
+        neumann_terms: args.oft_neumann_terms,
+        use_tucker: args.use_tucker,
+        decompose_both: args.decompose_both,
+        use_scalar: false,
+        dora: args.dora,
+        dora_wd_on_out: args.dora_wd_on_out,
+        dora_eps: args.dora_eps,
+        ..LycorisBundleConfig::default()
+    };
+
     log::info!("Loading Qwen-Image transformer...");
     let mut model = QwenImageTrainingModel::load(
         &args.model, args.rank, args.lora_alpha, /*full_finetune*/ false,
         device.clone(), args.seed,
     )?;
+
+    // If a LyCORIS algo other than the legacy plain LoRA was requested, swap
+    // the bundle. Plain `--algo lora` (or `lora`/`none`) keeps the legacy
+    // bundle as-is so this branch is byte-equivalent to the pre-Phase-2b
+    // pipeline.
+    if algo != LycorisAlgo::None {
+        log::info!(
+            "[qwenimage] LyCORIS algo='{}' rank={} alpha={} factor={} block_size={} dora={}",
+            algo.as_str(),
+            lyc_config.rank,
+            lyc_config.alpha,
+            lyc_config.factor,
+            lyc_config.block_size,
+            lyc_config.dora,
+        );
+        if matches!(algo, LycorisAlgo::Full | LycorisAlgo::Oft) {
+            log::warn!(
+                "[qwenimage] algo='{}' selected — bundle construction will succeed, but \
+                 forward_delta will error inside qwenimage's `base + delta_on_input` call \
+                 pattern. Phase 2c will wire merge-into-base for these algos.",
+                algo.as_str()
+            );
+        }
+        let new_bundle = eridiffusion_core::models::qwenimage::QwenImageLoraBundle::new_with_config(
+            &lyc_config,
+            device.clone(),
+            args.seed,
+        )
+        .map_err(|e| anyhow::anyhow!("LyCORIS bundle construction: {e}"))?;
+        model.bundle = new_bundle;
+
+        // SimpleTuner-style perturbed-normal LoKr init (Phase 2b: warns and
+        // no-ops because qwenimage's base weights are streamed via the
+        // BlockOffloader and not resident in a single map at this point).
+        if matches!(algo, LycorisAlgo::LoKr) && args.init_lokr_norm > 0.0 {
+            // `apply_init_perturbed_normal` walks LoKr adapters and looks up
+            // their base weights in the provided map. We pass an empty map
+            // here because qwenimage's `block_weights` are owned inside
+            // `QwenImageTrainingModel` and are streamed at runtime; the
+            // bundle method already logs a clear warning when the requested
+            // scale is non-zero on qwenimage so users aren't silently
+            // surprised.
+            let empty: std::collections::HashMap<String, flame_core::Tensor> =
+                std::collections::HashMap::new();
+            model
+                .bundle
+                .apply_init_perturbed_normal(&empty, args.init_lokr_norm)
+                .map_err(|e| anyhow::anyhow!("apply_init_perturbed_normal: {e}"))?;
+        }
+    } else {
+        // Explicit log: legacy path — no swap.
+        log::info!("[qwenimage] algo='lora' (legacy LoRALinear path, byte-identical)");
+    }
+    // Phase 2b: dropout flags (`--lora_dropout`, `--rank_dropout`,
+    // `--module_dropout`, `--rank_dropout_scale`) are accepted on the CLI but
+    // not yet wired into qwenimage's `add_lora` dispatch — Phase 2c will
+    // route them through the adapter's `forward_delta` per-step. Default
+    // values are `0.0`/`false`, matching pre-Phase-2b byte-identical behaviour.
+    if args.lora_dropout > 0.0
+        || args.rank_dropout > 0.0
+        || args.module_dropout > 0.0
+        || args.rank_dropout_scale
+    {
+        log::warn!(
+            "[qwenimage] dropout flags (lora_dropout={}, rank_dropout={}, \
+             module_dropout={}, rank_dropout_scale={}) are accepted but not yet \
+             wired in qwenimage Phase 2b — they are no-ops for this run.",
+            args.lora_dropout, args.rank_dropout, args.module_dropout, args.rank_dropout_scale,
+        );
+    }
 
     // Activation offload pool — sized for 24 GB GPU + 62 GB system after
     // accounting for BlockOffloader's ~38 GB pinned weights. Headroom for
@@ -712,6 +872,34 @@ fn main() -> anyhow::Result<()> {
 
         // Backward.
         let grads = loss.backward()?;
+
+        // Step-1 grad-flow diagnostic.  Catches the recurring "BF16 fused
+        // inference op missing autograd registration" bug class before it
+        // wastes a 3000-step run.  Returns a report; only panics when
+        // `FLAME_ASSERT_GRAD_FLOW=1` is set.  Note: qwen-image has 4
+        // architecturally-zero block-59 txt-stream params (`add_q_proj`,
+        // `to_add_out`, `txt_mlp.net.0.proj`, `txt_mlp.net.2`) that will
+        // legitimately appear in the report — do NOT enable the panic flag
+        // for qwen; use it on klein/sdxl/etc. where 0-dead is the contract.
+        // Step 1 (NOT step 0): LoRA-style algos init one factor at zero so
+        // half the leaves have zero grad at step 0 by construction.  Step 1
+        // (after the first optimizer step has moved them off zero) is the
+        // earliest meaningful check.
+        if step == 1 {
+            let names = model.bundle.parameter_names();
+            let named_refs: Vec<(&str, &flame_core::parameter::Parameter)> = names
+                .iter()
+                .zip(params.iter())
+                .map(|(n, p)| (n.as_str(), p))
+                .collect();
+            let report = flame_core::diagnostics::assert_grad_flow(&grads, &named_refs)?;
+            if report.is_clean() {
+                log::info!("[grad-flow] step 2 clean ({} params)", report.ok_count);
+            } else {
+                log::warn!("{}", report.summary());
+            }
+        }
+
         // Per-tensor non-finite-grad guard.  Some early-step / extreme-sigma
         // combinations push `attn.to_out.0` post-SDPA activations to BF16-
         // overflow magnitudes (block 1's `img_attn` saw max_abs=4096 in
@@ -992,7 +1180,10 @@ fn main() -> anyhow::Result<()> {
 fn qwen_named_parameters(model: &QwenImageTrainingModel)
     -> Vec<(String, flame_core::parameter::Parameter)>
 {
+    use eridiffusion_core::adapter::AdapterModule;
     use eridiffusion_core::models::qwenimage::QwenImageLoraBundle;
+
+    // Legacy plain-LoRA path — byte-identical to pre-Phase-2b.
     let mut entries: Vec<((usize, &str), &eridiffusion_core::lora::LoRALinear)> = model
         .bundle
         .adapters
@@ -1009,6 +1200,28 @@ fn qwen_named_parameters(model: &QwenImageTrainingModel)
         // save scheme is `{prefix}.lora_A.weight` then `{prefix}.lora_B.weight`.
         out.push((format!("{prefix}.lora_A.weight"), lora.lora_a().clone()));
         out.push((format!("{prefix}.lora_B.weight"), lora.lora_b().clone()));
+    }
+
+    // LyCORIS adapter path. When `--algo lora` (default) this map is empty and
+    // the loop is a no-op, preserving byte-identical legacy behaviour.
+    let mut lyc_entries: Vec<((usize, &str), &eridiffusion_core::adapter::LycorisLinear)> = model
+        .bundle
+        .lycoris_adapters
+        .iter()
+        .map(|(&(idx, target), arc)| {
+            ((idx, QwenImageLoraBundle::target_suffix(target)), arc.as_ref())
+        })
+        .collect();
+    lyc_entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for ((block_idx, suffix), adapter) in lyc_entries {
+        let prefix = format!("transformer_blocks.{block_idx}.{suffix}");
+        // `to_parameters()` and `named_tensors()` are zipped per the
+        // `AdapterModule` contract — same length, same order.
+        let params = adapter.to_parameters();
+        let names = adapter.named_tensors();
+        for ((leaf, _), p) in names.into_iter().zip(params.into_iter()) {
+            out.push((format!("{prefix}.{leaf}"), p));
+        }
     }
     out
 }

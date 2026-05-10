@@ -181,6 +181,12 @@ struct Args {
     /// (norm over input dims, magnitude shape `[out, 1]`).
     #[arg(long, default_value_t = true)] dora_wd_on_out: bool,
     #[arg(long, default_value_t = 1e-6)] dora_eps: f32,
+    /// SimpleTuner-parity: perturbed-normal LoKr init.  Scale `>0`
+    /// triggers `lokr_w1=1, lokr_w2 ~ N(μ_W, σ_W) · scale`.  No-op when
+    /// algo != lokr or value is 0.0.  Chroma streams base weights via
+    /// BlockOffloader; the helper warns when a slot's base is not
+    /// resident at swap time.
+    #[arg(long, default_value_t = 0.0)] init_lokr_norm: f32,
 }
 
 /// Resolution-dependent timestep shift (matches the chroma archive's
@@ -350,6 +356,22 @@ fn main() -> anyhow::Result<()> {
         }
         let new_bundle = ChromaLoraBundle::new_with_config(&lyc_config, device.clone(), SEED)
             .map_err(|e| anyhow::anyhow!("LyCORIS bundle construction: {e}"))?;
+        // SimpleTuner-parity perturbed-normal LoKr init.  Walks adapters
+        // and dispatches `init_perturbed_normal_lokr` per-adapter via the
+        // AdapterModule trait.  The base-weight lookup uses whatever the
+        // model has resident — chroma's BlockOffloader streams blocks at
+        // runtime, so missing slots get logged warnings rather than
+        // failing.
+        if matches!(algo, LycorisAlgo::LoKr) && args.init_lokr_norm > 0.0 {
+            let skipped = new_bundle
+                .apply_init_perturbed_normal(model.resident_weights(), args.init_lokr_norm)
+                .map_err(|e| anyhow::anyhow!("init_lokr_norm: {e}"))?;
+            log::info!(
+                "[Chroma] --init_lokr_norm={} applied (skipped={} non-LoKr/missing/factored)",
+                args.init_lokr_norm,
+                skipped,
+            );
+        }
         model.bundle = Some(new_bundle);
     } else if algo == LycorisAlgo::None {
         // Explicit log: legacy path — no swap.
@@ -635,7 +657,12 @@ fn main() -> anyhow::Result<()> {
             );
         }
 
+        let _profile_step = std::env::var("FLAME_PROFILE_STEP").ok().as_deref() == Some("1");
+        let _t_fwd_start = std::time::Instant::now();
+        if _profile_step { let _ = device.synchronize(); }
         let pred = model.forward(&noisy, &t5, &timestep)?;
+        if _profile_step { let _ = device.synchronize(); }
+        let _fwd_ms = _t_fwd_start.elapsed().as_secs_f64() * 1000.0;
 
         if pred.shape().dims() != target.shape().dims() {
             anyhow::bail!("pred {:?} != target {:?}", pred.shape().dims(), target.shape().dims());
@@ -662,7 +689,38 @@ fn main() -> anyhow::Result<()> {
         let loss_val = loss.to_vec()?[0];
         total_loss += loss_val;
 
+        let _t_bwd_start = std::time::Instant::now();
+        if _profile_step { let _ = device.synchronize(); }
         let grads = loss.backward()?;
+        if _profile_step { let _ = device.synchronize(); }
+        let _bwd_ms = _t_bwd_start.elapsed().as_secs_f64() * 1000.0;
+        if _profile_step {
+            log::info!("[profile] step {step} | fwd={_fwd_ms:.1}ms | bwd={_bwd_ms:.1}ms");
+        }
+
+        // Grad-flow diagnostic.  Runs at step 1 — NOT step 0 — because every
+        // LoRA-style algo (LoRA, LoCon, LoHa, LoKr) initializes one factor
+        // at zero so `delta = factor_a @ factor_b = 0` at step 0.  Backward
+        // through `delta * weight` then forces half the leaves to zero
+        // gradient by mathematical construction.  Step 1 (after the first
+        // optimizer step has driven the zero leaves off zero) is when the
+        // assertion can distinguish "real bug" from "expected zero-init
+        // pattern".  See flame-core/docs/TRAINER_DIAGNOSTICS.md.
+        if step == 1 {
+            if let Some(bundle) = model.bundle.as_ref() {
+                let named = bundle.named_parameters();
+                let named_refs: Vec<(&str, &flame_core::parameter::Parameter)> = named
+                    .iter()
+                    .map(|(n, p)| (n.as_str(), p))
+                    .collect();
+                let report = flame_core::diagnostics::assert_grad_flow(&grads, &named_refs)?;
+                if report.is_clean() {
+                    log::info!("[grad-flow] step 2 clean ({} params)", report.ok_count);
+                } else {
+                    log::warn!("{}", report.summary());
+                }
+            }
+        }
 
         // Global L2 grad clip = 1.0 (preset default).
         let grad_refs: Vec<&Tensor> = params

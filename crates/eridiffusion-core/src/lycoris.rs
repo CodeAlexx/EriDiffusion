@@ -687,6 +687,13 @@ impl LycorisBundle {
             LycorisAdapter::OFT(m) => {
                 out.insert(format!("{full_prefix}.oft_blocks.weight"), pt(&m.blocks)?);
             }
+            LycorisAdapter::BOFT(m) => {
+                // Same `oft_blocks` suffix as upstream `boft.py` weight_list.
+                // The 4D shape `[boft_m, num_blocks, b, b]` is what
+                // disambiguates BOFT from OFT (3D `[num_blocks, b, b]`) at
+                // load time — see `BOFTModule::algo_check` upstream.
+                out.insert(format!("{full_prefix}.oft_blocks.weight"), pt(&m.blocks)?);
+            }
         }
         Ok(())
     }
@@ -741,6 +748,12 @@ impl LycorisBundle {
             // directly. For a residual-additive call site we return
             // `R·x − x` so caller can `base = base + delta`.
             LycorisAdapter::OFT(m) => m
+                .apply_to_input(&cast_in)
+                .and_then(|rx| rx.sub(&cast_in).map_err(lycoris_rs::Error::Flame)),
+            // BOFT is the butterfly extension of OFT — same input-rotation
+            // semantics. Return `R(x) − x` so additive call sites compose
+            // correctly when the base linear is identity-like.
+            LycorisAdapter::BOFT(m) => m
                 .apply_to_input(&cast_in)
                 .and_then(|rx| rx.sub(&cast_in).map_err(lycoris_rs::Error::Flame)),
         }

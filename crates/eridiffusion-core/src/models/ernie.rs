@@ -5,8 +5,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use cudarc::driver::CudaDevice;
 use flame_core::{parameter::Parameter, DType, Shape, Tensor};
+use crate::adapter::{AdapterModule, LycorisLinear};
 use crate::config::TrainConfig;
 use crate::lora::LoRALinear;
+use crate::lycoris::{LycorisAlgo, LycorisBundleConfig};
+use crate::models::chroma::build_lycoris_linear;
 use crate::models::TrainableModel;
 use crate::Result;
 
@@ -26,7 +29,19 @@ pub struct ErnieModel {
     pub config: TrainConfig,
     pub device: Arc<CudaDevice>,
     pub weights: HashMap<String, Tensor>,
+    /// Legacy plain-LoRA adapters. Always populated when `is_lora=true`; one
+    /// per (layer, slot) of `LAYERS * 7`. When a non-`lora` LyCORIS algo is
+    /// active, the corresponding entry in `lycoris_adapters` shadows this one
+    /// (legacy slot is left untouched but never dispatched to).
     pub lora_adapters: Vec<LoRALinear>,
+    /// Phase 2b: LyCORIS adapters parallel to `lora_adapters`. `Vec` length
+    /// matches `lora_adapters.len()` exactly; entries are `None` for the
+    /// legacy `--algo lora` path (byte-identical pre-2b) and `Some(_)` once
+    /// `swap_lycoris_bundle` populates them.
+    pub lycoris_adapters: Vec<Option<Arc<LycorisLinear>>>,
+    /// Currently active algo. `LycorisAlgo::None` means `lora_adapters` is
+    /// the live path (legacy plain-LoRA, byte-identical).
+    pub algo: LycorisAlgo,
     pub parameters: Vec<Parameter>,
     pub is_lora: bool,
     /// When Some, per-layer transformer weights are streamed from pinned host RAM
@@ -71,7 +86,86 @@ impl ErnieModel {
                 parameters.push(Parameter::new(t.to_dtype(DType::F32)?.requires_grad_(true)));
             }
         }
-        Ok(Self { config: config.clone(), device, weights, lora_adapters, parameters, is_lora, offloader: None })
+        let lycoris_adapters = vec![None; lora_adapters.len()];
+        Ok(Self {
+            config: config.clone(),
+            device,
+            weights,
+            lora_adapters,
+            lycoris_adapters,
+            algo: LycorisAlgo::None,
+            parameters,
+            is_lora,
+            offloader: None,
+        })
+    }
+
+    /// Phase 2b: swap the legacy plain-LoRA bundle for a LyCORIS-aware one
+    /// covering LoCon / LoHa / LoKr / Full / OFT. Mirrors
+    /// `ChromaLoraBundle::new_with_config`'s construction pattern but inlines
+    /// it into the model since ernie does not carry a separate bundle struct.
+    /// The legacy `lora_adapters` entries are kept resident (never dispatched
+    /// to once `algo != None`) so save/load can still reuse the per-slot
+    /// shape table.
+    ///
+    /// Layout: `lycoris_adapters[layer*7 + slot]` for each
+    /// `(layer ∈ 0..LAYERS, slot ∈ 0..7)`. Slot order matches `LORA_SLOT_KEYS`.
+    pub fn swap_lycoris_bundle(&mut self, config: &LycorisBundleConfig) -> Result<()> {
+        if !self.is_lora {
+            return Err(crate::EriDiffusionError::Model(
+                "swap_lycoris_bundle: model is not in LoRA mode".into(),
+            ));
+        }
+        if config.algo == LycorisAlgo::None {
+            // Legacy path retained — no swap. Caller short-circuits but be
+            // defensive.
+            return Ok(());
+        }
+        // Per-slot in/out dims: must match `ErnieModel::load`'s slot order
+        // (Q, K, V, out, gate_proj, up_proj, linear_fc2).
+        const SLOT_DIMS: [(usize, usize); 7] = [
+            (HIDDEN, HIDDEN), // 0: to_q
+            (HIDDEN, HIDDEN), // 1: to_k
+            (HIDDEN, HIDDEN), // 2: to_v
+            (HIDDEN, HIDDEN), // 3: to_out.0
+            (HIDDEN, FFN),    // 4: gate_proj
+            (HIDDEN, FFN),    // 5: up_proj
+            (FFN, HIDDEN),    // 6: linear_fc2
+        ];
+        let mut lycoris_adapters: Vec<Option<Arc<LycorisLinear>>> =
+            Vec::with_capacity(self.lora_adapters.len());
+        let mut params: Vec<Parameter> = Vec::new();
+        for layer in 0..LAYERS {
+            for &(in_dim, out_dim) in SLOT_DIMS.iter() {
+                let wrapper = build_lycoris_linear(config, in_dim, out_dim, self.device.clone())
+                    .map_err(|e| crate::EriDiffusionError::Model(format!(
+                        "swap_lycoris_bundle: build_lycoris_linear({in_dim}, {out_dim}): {e}"
+                    )))?;
+                let arc = Arc::new(wrapper);
+                params.extend(arc.to_parameters());
+                lycoris_adapters.push(Some(arc));
+                let _ = layer; // index only used for asserts in tests.
+            }
+        }
+        debug_assert_eq!(lycoris_adapters.len(), self.lora_adapters.len());
+        self.lycoris_adapters = lycoris_adapters;
+        self.algo = config.algo;
+        self.parameters = params;
+        Ok(())
+    }
+
+    /// Look up the active adapter at flat index `adapter_idx` (= `layer*7 + slot`).
+    /// Prefers the LyCORIS slot when populated; falls back to the legacy
+    /// `LoRALinear` entry. Returns `None` when neither is populated (e.g.
+    /// out-of-range index).
+    pub fn adapter_for(&self, adapter_idx: usize) -> Option<&dyn AdapterModule> {
+        if let Some(Some(lyc)) = self.lycoris_adapters.get(adapter_idx) {
+            return Some(lyc.as_ref() as &dyn AdapterModule);
+        }
+        if let Some(legacy) = self.lora_adapters.get(adapter_idx) {
+            return Some(legacy as &dyn AdapterModule);
+        }
+        None
     }
 
     /// Enable per-layer block offloading via `BlockOffloader`. Drops all
@@ -309,6 +403,11 @@ impl ErnieModel {
                 } else {
                     None
                 };
+                let lycoris_slice: Option<&[Option<Arc<LycorisLinear>>]> = if self.is_lora {
+                    Some(&self.lycoris_adapters[lora_base..lora_base+7])
+                } else {
+                    None
+                };
                 x = block_forward_iflame(
                     &x,
                     &sc_msa, &s_msa, &g_msa,
@@ -316,6 +415,7 @@ impl ErnieModel {
                     &cos_b, &sin_b,
                     &self.weights,
                     lora_slice,
+                    lycoris_slice,
                     i, b, n_total,
                 )?;
             } else {
@@ -331,6 +431,14 @@ impl ErnieModel {
                 let lora_base = i * 7;
                 let lora_adapters: Option<Vec<LoRALinear>> = if self.is_lora {
                     Some(self.lora_adapters[lora_base..lora_base+7].to_vec())
+                } else {
+                    None
+                };
+                // Phase 2b: clone the LyCORIS slot Arcs (cheap refcount bump).
+                // Each closure capture must own a 'static-able view; the
+                // checkpoint closure path requires this.
+                let lycoris_adapters: Option<Vec<Option<Arc<LycorisLinear>>>> = if self.is_lora {
+                    Some(self.lycoris_adapters[lora_base..lora_base+7].to_vec())
                 } else {
                     None
                 };
@@ -355,6 +463,7 @@ impl ErnieModel {
                             cos_c.clone(), sin_c.clone(),
                             layer_weights.clone(),
                             lora_adapters.clone(),
+                            lycoris_adapters.clone(),
                             i, b, n_total,
                         ),
                     )?
@@ -366,6 +475,7 @@ impl ErnieModel {
                         cos_c, sin_c,
                         layer_weights,
                         lora_adapters,
+                        lycoris_adapters,
                         i, b, n_total,
                     )?
                 };
@@ -460,6 +570,7 @@ fn ernie_layer_forward_standalone(
     cos_b: Tensor, sin_b: Tensor,
     layer_weights: HashMap<String, Tensor>,
     lora_adapters: Option<Vec<LoRALinear>>,
+    lycoris_adapters: Option<Vec<Option<Arc<LycorisLinear>>>>,
     layer_idx: usize,
     b: usize,
     n_total: usize,
@@ -473,8 +584,19 @@ fn ernie_layer_forward_standalone(
     let linear_no_lora = |x: &Tensor, w_key: &str| -> flame_core::Result<Tensor> {
         x.matmul(&w(w_key)?.transpose()?)
     };
+    // Phase 2b dispatch: prefer LyCORIS adapter at this slot, else fall back
+    // to the legacy LoRALinear. Mirrors ErnieModel::adapter_for but inlined
+    // since the closure captures Vecs by value (must be 'static for
+    // AutogradContext::checkpoint).
     let linear_lora = |x: &Tensor, w_key: &str, adapter_idx: usize| -> flame_core::Result<Tensor> {
         let base = linear_no_lora(x, w_key)?;
+        if let Some(ref lyc) = lycoris_adapters {
+            if let Some(Some(adapter)) = lyc.get(adapter_idx) {
+                let delta = adapter.forward_delta(x)
+                    .map_err(|e| flame_core::FlameError::InvalidInput(format!("lycoris delta: {e}")))?;
+                return base.add(&delta);
+            }
+        }
         if let Some(ref adapters) = lora_adapters {
             let delta = adapters[adapter_idx].forward_delta(x)
                 .map_err(|e| flame_core::FlameError::InvalidInput(format!("lora delta: {e}")))?;
@@ -548,6 +670,7 @@ fn block_forward_iflame(
     cos_b: &Tensor, sin_b: &Tensor,
     weights: &HashMap<String, Tensor>,
     lora_adapters: Option<&[LoRALinear]>,
+    lycoris_adapters: Option<&[Option<Arc<LycorisLinear>>]>,
     layer_idx: usize,
     b: usize,
     n_total: usize,
@@ -561,8 +684,15 @@ fn block_forward_iflame(
     let linear_no_lora = |x: &Tensor, w_key: &str| -> crate::Result<Tensor> {
         Ok(x.matmul(&w(w_key)?.transpose()?)?)
     };
+    // Phase 2b dispatch — see ernie_layer_forward_standalone for rationale.
     let linear_lora = |x: &Tensor, w_key: &str, adapter_idx: usize| -> crate::Result<Tensor> {
         let base = linear_no_lora(x, w_key)?;
+        if let Some(lyc) = lycoris_adapters {
+            if let Some(Some(adapter)) = lyc.get(adapter_idx) {
+                let delta = adapter.forward_delta(x)?;
+                return Ok(base.add(&delta)?);
+            }
+        }
         if let Some(adapters) = lora_adapters {
             if let Some(adapter) = adapters.get(adapter_idx) {
                 let delta = adapter.forward_delta(x)?;
@@ -653,11 +783,24 @@ impl TrainableModel for ErnieModel {
             ));
         }
         let mut out = std::collections::HashMap::new();
-        for (i, adapter) in self.lora_adapters.iter().enumerate() {
-            let layer_idx = i / 7;
-            let slot = i % 7;
-            let prefix = format!("layers.{}.{}", layer_idx, LORA_SLOT_KEYS[slot]);
-            adapter.save_tensors(&prefix, &mut out)?;
+        if self.algo == LycorisAlgo::None {
+            for (i, adapter) in self.lora_adapters.iter().enumerate() {
+                let layer_idx = i / 7;
+                let slot = i % 7;
+                let prefix = format!("layers.{}.{}", layer_idx, LORA_SLOT_KEYS[slot]);
+                adapter.save_tensors(&prefix, &mut out)?;
+            }
+        } else {
+            for (i, slot_opt) in self.lycoris_adapters.iter().enumerate() {
+                if let Some(adapter) = slot_opt {
+                    let layer_idx = i / 7;
+                    let slot = i % 7;
+                    let prefix = format!("layers.{}.{}", layer_idx, LORA_SLOT_KEYS[slot]);
+                    for (leaf, t) in adapter.named_tensors() {
+                        out.insert(format!("{prefix}.{leaf}"), t);
+                    }
+                }
+            }
         }
         flame_core::serialization::save_file(&out, std::path::Path::new(path))
             .map_err(|e| crate::EriDiffusionError::Safetensors(format!("save_file: {e}")))?;
@@ -674,11 +817,22 @@ impl TrainableModel for ErnieModel {
             std::path::Path::new(path),
             &self.device,
         ).map_err(|e| crate::EriDiffusionError::Safetensors(format!("load_file: {e}")))?;
-        for (i, adapter) in self.lora_adapters.iter().enumerate() {
-            let layer_idx = i / 7;
-            let slot = i % 7;
-            let prefix = format!("layers.{}.{}", layer_idx, LORA_SLOT_KEYS[slot]);
-            adapter.load_tensors(&prefix, &source)?;
+        if self.algo == LycorisAlgo::None {
+            for (i, adapter) in self.lora_adapters.iter().enumerate() {
+                let layer_idx = i / 7;
+                let slot = i % 7;
+                let prefix = format!("layers.{}.{}", layer_idx, LORA_SLOT_KEYS[slot]);
+                adapter.load_tensors(&prefix, &source)?;
+            }
+        } else {
+            // Phase 2b: LyCORIS resume not yet wired (parity with chroma's
+            // staged rollout — chroma exposes load_named_tensors only on
+            // LycorisLinear, not via TrainableModel::load_weights). Defer
+            // until train_ernie's --resume-full path needs it.
+            return Err(crate::EriDiffusionError::Model(format!(
+                "load_weights: LyCORIS algo='{}' resume not yet wired for ernie",
+                self.algo.as_str(),
+            )));
         }
         Ok(())
     }
@@ -692,12 +846,29 @@ impl ErnieModel {
     /// (the adapter Vec's natural order).
     pub fn named_parameters(&self) -> Vec<(String, Parameter)> {
         let mut out = Vec::with_capacity(self.lora_adapters.len() * 2);
-        for (i, adapter) in self.lora_adapters.iter().enumerate() {
-            let layer_idx = i / 7;
-            let slot = i % 7;
-            let prefix = format!("layers.{}.{}", layer_idx, LORA_SLOT_KEYS[slot]);
-            out.push((format!("{prefix}.lora_A.weight"), adapter.lora_a().clone()));
-            out.push((format!("{prefix}.lora_B.weight"), adapter.lora_b().clone()));
+        if self.algo == LycorisAlgo::None {
+            for (i, adapter) in self.lora_adapters.iter().enumerate() {
+                let layer_idx = i / 7;
+                let slot = i % 7;
+                let prefix = format!("layers.{}.{}", layer_idx, LORA_SLOT_KEYS[slot]);
+                out.push((format!("{prefix}.lora_A.weight"), adapter.lora_a().clone()));
+                out.push((format!("{prefix}.lora_B.weight"), adapter.lora_b().clone()));
+            }
+        } else {
+            // Phase 2b: zip named_tensors() leaf names with to_parameters()
+            // (matching order — same convention as chroma::named_parameters).
+            for (i, slot_opt) in self.lycoris_adapters.iter().enumerate() {
+                if let Some(adapter) = slot_opt {
+                    let layer_idx = i / 7;
+                    let slot = i % 7;
+                    let prefix = format!("layers.{}.{}", layer_idx, LORA_SLOT_KEYS[slot]);
+                    let params = adapter.to_parameters();
+                    let names = adapter.named_tensors();
+                    for (param, (leaf, _)) in params.into_iter().zip(names.into_iter()) {
+                        out.push((format!("{prefix}.{leaf}"), param));
+                    }
+                }
+            }
         }
         out
     }

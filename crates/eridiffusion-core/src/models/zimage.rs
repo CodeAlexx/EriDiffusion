@@ -32,8 +32,15 @@
 //! NOT on noise_refiner, context_refiner, or adaLN_modulation.
 
 use flame_core::autograd::AutogradContext;
-use flame_core::{parameter::Parameter, DType, Result, Tensor, TensorId};
+use flame_core::{parameter::Parameter, DType, Result, Shape, Tensor, TensorId};
+use crate::adapter::{AdapterModule, LycorisLinear};
 use crate::lora::LoRALinear;
+use crate::lycoris::{LycorisAlgo, LycorisBundleConfig};
+use lycoris_rs::{
+    algorithms::{full::FullAdapter, locon::LoConModule, loha::LoHaModule, lokr::LoKrModule, oft::OFTModule},
+    dora::init_magnitude,
+    LycorisAdapter,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -68,9 +75,38 @@ pub enum LoraTarget {
     FfnW3,
 }
 
+/// Per-layer target shapes — single source of truth shared by `new` /
+/// `new_with_config`. Same order = same HashMap iteration determinism for
+/// the legacy plain-LoRA path.
+const ZIMAGE_TARGETS: &[(LoraTarget, usize, usize)] = &[
+    (LoraTarget::AttnQ, DIM, DIM),
+    (LoraTarget::AttnK, DIM, DIM),
+    (LoraTarget::AttnV, DIM, DIM),
+    (LoraTarget::AttnOut, DIM, DIM),
+    (LoraTarget::FfnW1, DIM, MLP_HIDDEN),
+    (LoraTarget::FfnW2, MLP_HIDDEN, DIM),
+    (LoraTarget::FfnW3, DIM, MLP_HIDDEN),
+];
+
+/// LoRA bundle for Z-Image. The legacy `adapters` field carries plain
+/// `LoRALinear` per target — this is the byte-identical pre-Phase-2b path
+/// used when `--algo lora` (or no `--algo` flag at all). When a non-`lora`
+/// LyCORIS algo is selected, `lycoris_adapters` is populated instead and
+/// the legacy `adapters` field is left empty; the per-block forward
+/// dispatches via `adapter_for(...)` which checks `lycoris_adapters` first.
 #[derive(Clone)]
 pub struct ZImageLoraBundle {
+    /// Legacy plain-LoRA adapters. Empty when a LyCORIS algo is active.
     pub adapters: HashMap<(usize, LoraTarget), LoRALinear>,
+    /// LyCORIS adapters (LoCon/LoHa/LoKr/Full/OFT). Empty when `algo == None`.
+    /// Wrapped in `Arc` so the per-adapter clone into the bundle's `Clone`
+    /// impl stays cheap (refcount bump).
+    pub lycoris_adapters: HashMap<(usize, LoraTarget), Arc<LycorisLinear>>,
+    /// Currently active algo. `LycorisAlgo::None` = legacy `LoRALinear`.
+    pub algo: LycorisAlgo,
+    /// Plain-LoRA rank — kept for save/load reconstruction.
+    pub rank: usize,
+    pub alpha: f32,
 }
 
 impl ZImageLoraBundle {
@@ -82,30 +118,110 @@ impl ZImageLoraBundle {
         seed: u64,
     ) -> Result<Self> {
         let mut adapters = HashMap::new();
-        let targets = [
-            (LoraTarget::AttnQ, DIM, DIM),
-            (LoraTarget::AttnK, DIM, DIM),
-            (LoraTarget::AttnV, DIM, DIM),
-            (LoraTarget::AttnOut, DIM, DIM),
-            (LoraTarget::FfnW1, DIM, MLP_HIDDEN),
-            (LoraTarget::FfnW2, MLP_HIDDEN, DIM),
-            (LoraTarget::FfnW3, DIM, MLP_HIDDEN),
-        ];
         for i in 0..num_layers {
-            for &(target, in_dim, out_dim) in &targets {
+            for &(target, in_dim, out_dim) in ZIMAGE_TARGETS {
                 let lora = LoRALinear::new(in_dim, out_dim, rank, alpha, device.clone(), seed + i as u64).map_err(|e| flame_core::FlameError::InvalidInput(format!("lora new: {e}")))?;
                 adapters.insert((i, target), lora);
             }
         }
-        Ok(Self { adapters })
+        Ok(Self {
+            adapters,
+            lycoris_adapters: HashMap::new(),
+            algo: LycorisAlgo::None,
+            rank,
+            alpha,
+        })
     }
 
-    pub fn num_adapters(&self) -> usize { self.adapters.len() }
+    /// LyCORIS-aware constructor. `config.algo == LycorisAlgo::None` falls
+    /// back to plain `LoRALinear` (legacy byte-identical path). Other algos
+    /// build `LycorisLinear` per target via the matching `lycoris_rs`
+    /// `*_for_training` constructor and store them in `lycoris_adapters`.
+    ///
+    /// `Full` and `OFT` bundle-construction succeeds, but their
+    /// `forward_delta` returns an error — Z-Image's call pattern is
+    /// `base + delta_on_input`, which is incompatible with Full's
+    /// "weight delta merged into base" or OFT's `R·(W·x+b)` semantics.
+    /// Phase 2c will wire merge-into-base for those algos.
+    pub fn new_with_config(
+        config: &LycorisBundleConfig,
+        device: Arc<cudarc::driver::CudaDevice>,
+        seed: u64,
+    ) -> Result<Self> {
+        if config.algo == LycorisAlgo::None {
+            return Self::new(NUM_LAYERS, config.rank, config.alpha, device, seed);
+        }
+        let mut lycoris_adapters: HashMap<(usize, LoraTarget), Arc<LycorisLinear>> =
+            HashMap::new();
+        for i in 0..NUM_LAYERS {
+            for &(target, in_dim, out_dim) in ZIMAGE_TARGETS {
+                let wrapper = build_lycoris_linear(config, in_dim, out_dim, device.clone())?;
+                lycoris_adapters.insert((i, target), Arc::new(wrapper));
+            }
+        }
+        let _ = seed; // lycoris-rs uses its own internal RNG.
+        Ok(Self {
+            adapters: HashMap::new(),
+            lycoris_adapters,
+            algo: config.algo,
+            rank: config.rank,
+            alpha: config.alpha,
+        })
+    }
+
+    /// SimpleTuner-style perturbed-normal init for LoKr.
+    ///
+    /// Phase 2b limitation: Z-Image's resident block weights live on
+    /// `ZImageModel::block_weights` (per-layer HashMap) but the trainer
+    /// doesn't yet pass that map into this method. Until that plumbing
+    /// lands (Phase 2c follow-up), this method logs a warning and returns
+    /// `Ok(())` without touching adapters. The user-facing flag
+    /// `--init_lokr_norm` therefore behaves as a no-op for zimage in
+    /// Phase 2b — matches the qwenimage pattern.
+    pub fn apply_init_perturbed_normal(&self, scale: f32) -> Result<()> {
+        if self.algo != LycorisAlgo::LoKr || scale <= 0.0 {
+            return Ok(());
+        }
+        log::warn!(
+            "[zimage] init_lokr_norm={scale} requested but trainer-side base-weight \
+             access is not yet wired for zimage (block weights are resident on \
+             `ZImageModel::block_weights` but not exposed at bundle-construction \
+             time). LoKr magnitude will use its lycoris-rs default init for this \
+             run. Phase 2c will plumb the resident `block_weights` map into this \
+             method (TODO)."
+        );
+        Ok(())
+    }
+
+    /// Adapter accessor used by the per-block forward closures. Checks
+    /// `lycoris_adapters` first (Phase 2b active path) then falls back to
+    /// the legacy `adapters` map. Returns `None` when no adapter exists for
+    /// `(block_idx, target)` (shouldn't happen on a fully-populated bundle).
+    pub fn adapter_for(
+        &self,
+        block_idx: usize,
+        target: LoraTarget,
+    ) -> Option<&dyn AdapterModule> {
+        if let Some(lyc) = self.lycoris_adapters.get(&(block_idx, target)) {
+            return Some(lyc.as_ref());
+        }
+        if let Some(legacy) = self.adapters.get(&(block_idx, target)) {
+            return Some(legacy);
+        }
+        None
+    }
+
+    pub fn num_adapters(&self) -> usize {
+        self.adapters.len() + self.lycoris_adapters.len()
+    }
 
     pub fn parameters(&self) -> Vec<Parameter> {
         let mut params = Vec::new();
         for lora in self.adapters.values() {
             params.extend(lora.parameters());
+        }
+        for adapter in self.lycoris_adapters.values() {
+            params.extend(adapter.to_parameters());
         }
         params
     }
@@ -229,6 +345,123 @@ fn tensors_with_weight_alias(
         out.insert(format!("{prefix}.lora_B"), t.clone());
     }
     out
+}
+
+/// Build a single `LycorisLinear` for the configured algo. For
+/// `LycorisAlgo::None` the caller (`ZImageLoraBundle::new_with_config`)
+/// short-circuits to `LoRALinear` instead — this helper bails on `None`
+/// defensively. Mirrors `chroma::build_lycoris_linear`.
+fn build_lycoris_linear(
+    config: &LycorisBundleConfig,
+    in_features: usize,
+    out_features: usize,
+    device: Arc<cudarc::driver::CudaDevice>,
+) -> Result<LycorisLinear> {
+    let alpha = Some(config.alpha);
+    let dtype = config.storage;
+
+    let adapter = match config.algo {
+        LycorisAlgo::None => {
+            return Err(flame_core::Error::InvalidInput(
+                "build_lycoris_linear: LycorisAlgo::None should be handled by caller".into(),
+            ));
+        }
+        LycorisAlgo::LoCon => LycorisAdapter::LoCon(
+            LoConModule::new_linear_for_training(
+                in_features,
+                out_features,
+                config.rank,
+                alpha,
+                device.clone(),
+                dtype,
+            )
+            .map_err(|e| flame_core::Error::InvalidInput(format!("LoCon::new_linear_for_training: {e}")))?,
+        ),
+        LycorisAlgo::LoHa => LycorisAdapter::LoHa(
+            LoHaModule::new_linear_for_training(
+                in_features,
+                out_features,
+                config.rank,
+                alpha,
+                device.clone(),
+                dtype,
+            )
+            .map_err(|e| flame_core::Error::InvalidInput(format!("LoHa::new_linear_for_training: {e}")))?,
+        ),
+        LycorisAlgo::LoKr => LycorisAdapter::LoKr(
+            LoKrModule::new_linear(
+                in_features,
+                out_features,
+                config.rank,
+                config.alpha,
+                config.factor,
+                config.decompose_both,
+                config.use_scalar,
+                device.clone(),
+                dtype,
+            )
+            .map_err(|e| flame_core::Error::InvalidInput(format!("LoKr::new_linear: {e}")))?,
+        ),
+        LycorisAlgo::Full => LycorisAdapter::Full(
+            FullAdapter::new_for_training(
+                Shape::from_dims(&[out_features, in_features]),
+                None,
+                device.clone(),
+                dtype,
+            )
+            .map_err(|e| flame_core::Error::InvalidInput(format!("Full::new_for_training: {e}")))?,
+        ),
+        LycorisAlgo::Oft => LycorisAdapter::OFT(
+            OFTModule::new_linear(
+                in_features,
+                out_features,
+                config.block_size,
+                config.alpha,
+                None,
+                dtype,
+                device.clone(),
+            )
+            .map_err(|e| flame_core::Error::InvalidInput(format!("OFT::new_linear: {e}")))?
+            .with_neumann_terms(config.neumann_terms),
+        ),
+    };
+
+    // DoRA: Z-Image's bundle ctor doesn't have access to base weights here
+    // (block weights are loaded into `ZImageModel::block_weights` after
+    // bundle construction). Initialize magnitude to ||W=I||_2 = 1 along the
+    // chosen axis as an approximation — lycoris-upstream wants ||W_orig||_2.
+    // The trainer's first few hundred steps adjust it; Phase 2c will plumb
+    // the resident weight map for a proper init.
+    let dora_magnitude = if config.dora {
+        if config.algo == LycorisAlgo::Oft {
+            return Err(flame_core::Error::InvalidInput(
+                "DoRA + OFT is not supported (multiplicative + decomposition conflict)".into(),
+            ));
+        }
+        let shape = if config.dora_wd_on_out {
+            Shape::from_dims(&[out_features, 1])
+        } else {
+            Shape::from_dims(&[1, in_features])
+        };
+        let ones = Tensor::from_vec(
+            vec![1.0_f32; shape.elem_count()],
+            shape,
+            device.clone(),
+        )?;
+        let m = init_magnitude(&ones, config.dora_wd_on_out, 0.0)
+            .map_err(|e| flame_core::Error::InvalidInput(format!("init_magnitude: {e}")))?;
+        Some(m.requires_grad_(true))
+    } else {
+        None
+    };
+
+    Ok(LycorisLinear::new(
+        adapter,
+        dora_magnitude,
+        config.dora_wd_on_out,
+        config.dora_eps,
+        config.storage,
+    ))
 }
 
 pub struct ZImageModel {
@@ -773,7 +1006,11 @@ impl ZImageModel {
     }
 
     fn add_lora_delta(&self, base: Tensor, input: &Tensor, block_idx: usize, target: LoraTarget) -> Result<Tensor> {
-        if let Some(lora) = self.bundle.adapters.get(&(block_idx, target)) {
+        // Dispatch via `adapter_for` so `--algo locon`/etc populate
+        // `lycoris_adapters` and the legacy `adapters` map can be empty —
+        // fixes the silent-skip pitfall that would otherwise train the
+        // LoRA to noise.
+        if let Some(lora) = self.bundle.adapter_for(block_idx, target) {
             let delta = lora.forward_delta(&ensure_3d(input)?).map_err(|e| flame_core::FlameError::InvalidInput(format!("lora delta: {e}")))?;
             base.add(&delta)
         } else {
@@ -1377,7 +1614,10 @@ fn block_forward_standalone(
             }
             return Ok(base);
         }
-        if let Some(lora) = bundle.adapters.get(&(block_idx, target)) {
+        // Dispatch via `adapter_for` so `--algo locon`/etc on the model's own
+        // bundle is honored (the legacy `adapters` map is empty when LyCORIS
+        // is the active path).  Fixes the silent-skip pitfall.
+        if let Some(lora) = bundle.adapter_for(block_idx, target) {
             let delta = lora.forward_delta(&ensure_3d(input)?).map_err(|e| flame_core::FlameError::InvalidInput(format!("lora delta: {e}")))?;
             base.add(&delta)
         } else {
@@ -1512,7 +1752,9 @@ fn block_forward_iflame(
             }
             return Ok(base);
         }
-        if let Some(lora) = bundle.adapters.get(&(block_idx, target)) {
+        // Dispatch via `adapter_for` to honour `--algo locon`/etc on the
+        // model's own bundle (legacy `adapters` map is empty under LyCORIS).
+        if let Some(lora) = bundle.adapter_for(block_idx, target) {
             let delta = lora.forward_delta(&ensure_3d(input)?)
                 .map_err(|e| flame_core::FlameError::InvalidInput(
                     format!("lora delta: {e}")))?;

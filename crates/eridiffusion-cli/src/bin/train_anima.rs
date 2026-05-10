@@ -30,7 +30,8 @@ use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
 use flame_core::adam::AdamW;
 use eridiffusion_core::config::{LrScheduler, TrainConfig, TrainingMethod};
 use eridiffusion_core::debug as dbg;
-use eridiffusion_core::models::{anima as anima_mod, AnimaModel, TrainableModel};
+use eridiffusion_core::lycoris::{LycorisAlgo, LycorisBundleConfig};
+use eridiffusion_core::models::{anima as anima_mod, anima::AnimaLoraBundle, AnimaModel, TrainableModel};
 use eridiffusion_core::training::board::BoardWriter;
 use eridiffusion_core::training::checkpoint::{self, CkptHeader};
 use eridiffusion_core::training::ema::ParameterEma;
@@ -153,6 +154,45 @@ struct Args {
     #[arg(long, default_value_t = 100)] warmup_steps: usize,
     /// Phase 5: cosine-with-restarts cycle count.
     #[arg(long, default_value_t = 1.0)] lr_cycles: f32,
+
+    // ── LyCORIS algo selection (Phase 2b) ──
+    //
+    // `--algo lora` (default) keeps the legacy LoRALinear path — byte-identical
+    // training to pre-Phase-2b. Other values select LyCORIS algos via
+    // `AnimaLoraBundle::new_with_config`. `lora_alpha` and `rank` are shared
+    // with the legacy CLI flags above (no separate `--lycoris-rank`).
+    /// LyCORIS algo: `lora` (default, legacy path) | `locon` | `loha` | `lokr`
+    /// | `full` | `oft`. Same `base + delta_on_input` caveat as chroma — Full
+    /// and OFT bundle-construct successfully but error inside forward_delta;
+    /// Phase 2c will hoist merge-into-base.
+    #[arg(long, default_value = "lora")] algo: String,
+    /// LoKr Kronecker split factor (ignored for non-LoKr).
+    #[arg(long, default_value_t = 16)] lokr_factor: i32,
+    /// OFT/BOFT block size (ignored for non-OFT/BOFT).
+    #[arg(long, default_value_t = 32)] oft_block_size: usize,
+    /// OFT Cayley-Neumann series term count.
+    #[arg(long, default_value_t = 5)] oft_neumann_terms: usize,
+    /// Tucker decomposition for non-1×1 conv kernels (anima is linear-only).
+    #[arg(long, default_value_t = false)] use_tucker: bool,
+    /// LoKr only: factorize both W1 and W2 (default false: only W2).
+    #[arg(long, default_value_t = false)] decompose_both: bool,
+    /// Enable DoRA (weight-decomposed LoRA).
+    #[arg(long, default_value_t = false)] dora: bool,
+    /// DoRA magnitude axis (`true` = lycoris-upstream).
+    #[arg(long, default_value_t = true)] dora_wd_on_out: bool,
+    #[arg(long, default_value_t = 1e-6)] dora_eps: f32,
+    /// SimpleTuner-parity: perturbed-normal LoKr init. Scale `>0` triggers
+    /// `lokr_w1=1, lokr_w2 ~ N(μ_W, σ_W)·scale`. No-op when algo != lokr or
+    /// value is 0.0.
+    #[arg(long, default_value_t = 0.0)] init_lokr_norm: f32,
+    /// Per-element dropout on the adapter delta (training only).
+    #[arg(long, default_value_t = 0.0)] lora_dropout: f32,
+    /// Per-rank Bernoulli on the down-projection intermediate.
+    #[arg(long, default_value_t = 0.0)] rank_dropout: f32,
+    /// Per-step Bernoulli on the entire adapter.
+    #[arg(long, default_value_t = 0.0)] module_dropout: f32,
+    /// Rescale rank-mask by `1/mean(mask)` to preserve expectation.
+    #[arg(long, default_value_t = false)] rank_dropout_scale: bool,
 }
 
 /// SIGMOID timestep sampling: t = sigmoid(scale * z), z ~ N(0,1).
@@ -246,9 +286,79 @@ fn main() -> anyhow::Result<()> {
     log::info!("Loading Anima DiT (rank={} alpha={}) from {}...",
         args.rank, args.lora_alpha, args.dit_path.display());
     let mut model = AnimaModel::load(&args.dit_path, &config, device.clone())?;
+
+    // Phase 2b: parse the LyCORIS algo selector. `lora` (default) keeps the
+    // legacy LoRALinear bundle constructed inside `AnimaModel::load`. Anything
+    // else swaps the bundle in-place after model construction.
+    //
+    // NOTE: `LycorisAlgo::parse("lora")` aliases to `LycorisAlgo::LoCon`, but
+    // for anima we need LEGACY plain `LoRALinear` (byte-identical) to remain
+    // the default path; re-map `"lora"` → `None` explicitly. Users who want
+    // the new LoCon path pass `--algo locon`.
+    let algo_str = args.algo.trim().to_ascii_lowercase();
+    let algo = if algo_str == "lora" || algo_str == "none" || algo_str.is_empty() {
+        LycorisAlgo::None
+    } else {
+        LycorisAlgo::parse(&args.algo).map_err(|e| anyhow::anyhow!("--algo: {e}"))?
+    };
+    let lyc_config = LycorisBundleConfig {
+        algo,
+        rank: args.rank,
+        alpha: args.lora_alpha as f32,
+        factor: args.lokr_factor,
+        block_size: args.oft_block_size,
+        neumann_terms: args.oft_neumann_terms,
+        use_tucker: args.use_tucker,
+        decompose_both: args.decompose_both,
+        use_scalar: false,
+        dora: args.dora,
+        dora_wd_on_out: args.dora_wd_on_out,
+        dora_eps: args.dora_eps,
+        ..LycorisBundleConfig::default()
+    };
+
+    if algo != LycorisAlgo::None {
+        log::info!(
+            "[Anima] LyCORIS algo='{}' rank={} alpha={} factor={} block_size={} dora={}",
+            algo.as_str(),
+            lyc_config.rank, lyc_config.alpha,
+            lyc_config.factor, lyc_config.block_size, lyc_config.dora,
+        );
+        if matches!(algo, LycorisAlgo::Full | LycorisAlgo::Oft) {
+            log::warn!(
+                "[Anima] algo='{}' selected — bundle construction will succeed, but \
+                 forward_delta will error inside anima's `base + delta_on_input` call \
+                 pattern. Phase 2c will wire merge-into-base for these algos.",
+                algo.as_str()
+            );
+        }
+        let new_bundle = AnimaLoraBundle::new_with_config(&lyc_config, device.clone(), SEED)
+            .map_err(|e| anyhow::anyhow!("LyCORIS bundle construction: {e}"))?;
+        model.bundle = new_bundle;
+
+        // Optional: SimpleTuner-style perturbed-normal init for LoKr.
+        if matches!(algo, LycorisAlgo::LoKr) && args.init_lokr_norm > 0.0 {
+            match model.bundle.apply_init_perturbed_normal(&model.weights, args.init_lokr_norm) {
+                Ok(skipped) if skipped > 0 => log::warn!(
+                    "[init_lokr_norm] {} slot(s) skipped (see warnings above)", skipped,
+                ),
+                Ok(_) => log::info!("[init_lokr_norm] applied scale={}", args.init_lokr_norm),
+                Err(e) => log::warn!("[init_lokr_norm] failed: {e}"),
+            }
+        }
+    } else {
+        log::info!("[Anima] algo='lora' (legacy LoRALinear path, byte-identical)");
+    }
+
     let params = model.parameters();
+    let adapter_count = model
+        .bundle
+        .lyc_adapters
+        .as_ref()
+        .map(|v| v.len())
+        .unwrap_or(model.bundle.adapters.len());
     log::info!("Loaded {} trainable LoRA tensors ({} adapters across {} blocks)",
-        params.len(), model.bundle.adapters.len(), anima_mod::NUM_BLOCKS);
+        params.len(), adapter_count, anima_mod::NUM_BLOCKS);
     if params.is_empty() {
         anyhow::bail!("No trainable parameters — TrainingMethod::Lora produced empty param list");
     }
@@ -587,7 +697,18 @@ fn main() -> anyhow::Result<()> {
         let grads = loss.backward()?;
 
         if debug_grads_enabled && (step < 3 || (step + 1) % 100 == 0) {
-            dbg::print_lora_grad_summary(step, &model.bundle.adapters, &ANIMA_LORA_CLASSES, &grads);
+            // Phase 2b: per-class LoRA grad summary is wired only for the
+            // legacy plain-LoRA path (it expects `&[LoRALinear]`). LyCORIS
+            // adapters report through `params`/`grads` already; per-class
+            // breakdown for non-LoRA algos is a Phase 2c task.
+            if model.bundle.lyc_adapters.is_none() {
+                dbg::print_lora_grad_summary(step, &model.bundle.adapters, &ANIMA_LORA_CLASSES, &grads);
+            } else if step == 0 {
+                log::info!(
+                    "ANIMA_DEBUG_GRADS: per-class summary disabled for LyCORIS algo `{}` (Phase 2c)",
+                    model.bundle.algo.as_str(),
+                );
+            }
         }
 
         // OT default: clip_grad_norm = 1.0.

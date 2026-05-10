@@ -27,9 +27,45 @@ use flame_core::{
     serialization, DType, Error, Shape, Tensor,
 };
 
+use crate::adapter::{AdapterModule, LycorisLinear};
 use crate::lora::LoRALinear;
+use crate::lycoris::{LycorisAlgo, LycorisBundleConfig};
+use crate::models::chroma::build_lycoris_linear;
 use crate::Result;
 use std::{collections::HashMap, path::Path, sync::Arc};
+
+/// Per-layer LoRA target (8 projections per DiT layer:
+/// self-attn QKVO + cross-attn QKVO).  Used as the second half of the key
+/// in [`AceStepLoRAModel::lycoris_adapters`] and as the `target` argument
+/// to [`AceStepLoRAModel::adapter_for`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AceStepLoraTarget {
+    SelfQ,
+    SelfK,
+    SelfV,
+    SelfO,
+    CrossQ,
+    CrossK,
+    CrossV,
+    CrossO,
+}
+
+impl AceStepLoraTarget {
+    /// Save-key suffix matching the per-projection prefix used by
+    /// [`AceStepLoRAModel::save_lora`] / [`AceStepLoRAModel::named_parameters`].
+    pub fn suffix(self) -> &'static str {
+        match self {
+            AceStepLoraTarget::SelfQ  => "self_attn.q_proj",
+            AceStepLoraTarget::SelfK  => "self_attn.k_proj",
+            AceStepLoraTarget::SelfV  => "self_attn.v_proj",
+            AceStepLoraTarget::SelfO  => "self_attn.o_proj",
+            AceStepLoraTarget::CrossQ => "cross_attn.q_proj",
+            AceStepLoraTarget::CrossK => "cross_attn.k_proj",
+            AceStepLoraTarget::CrossV => "cross_attn.v_proj",
+            AceStepLoraTarget::CrossO => "cross_attn.o_proj",
+        }
+    }
+}
 
 /// ACE-Step DiT decoder configuration, auto-detected from weights.
 #[derive(Debug, Clone)]
@@ -64,6 +100,17 @@ pub struct AceStepLoRAModel {
     weights: Arc<HashMap<String, Tensor>>,
     config: AceStepConfig,
     adapters: Vec<DiTLayerAdapters>,
+    /// LyCORIS adapters (LoCon/LoHa/LoKr/Full/OFT). Empty when
+    /// `algo == LycorisAlgo::None`. When [`AceStepLoRAModel::install_lycoris_bundle`]
+    /// swaps in a LyCORIS algo, the legacy `adapters` Vec is left in place
+    /// (still allocated) but never read by the forward path — every call
+    /// site routes through [`AceStepLoRAModel::adapter_for`], which prefers
+    /// the LyCORIS map. `parameters()` / `named_parameters()` only emit
+    /// from the active path.
+    lycoris_adapters: HashMap<(usize, AceStepLoraTarget), Arc<LycorisLinear>>,
+    /// Currently active algo. `LycorisAlgo::None` keeps the legacy plain
+    /// `LoRALinear` path.
+    algo: LycorisAlgo,
     /// Null condition embedding [1, 1, hidden_size] for CFG dropout.
     null_condition_emb: Tensor,
 }
@@ -191,13 +238,130 @@ impl AceStepLoRAModel {
             weights: Arc::new(weights),
             config,
             adapters,
+            lycoris_adapters: HashMap::new(),
+            algo: LycorisAlgo::None,
             null_condition_emb,
         })
     }
 
+    /// Phase 2b: swap the legacy plain-LoRA `adapters` Vec for a fresh
+    /// LyCORIS-algo bundle (LoCon / LoHa / LoKr / Full / OFT).  Populates
+    /// [`Self::lycoris_adapters`] keyed by `(layer_idx, AceStepLoraTarget)`.
+    /// Call BEFORE the trainer reads [`Self::parameters`] (the optimizer
+    /// captures `Parameter` IDs at construction time).
+    ///
+    /// Per-layer target geometry mirrors the legacy ctor:
+    /// 8 projections per layer (self/cross × q/k/v/o), with q & o using
+    /// `q_dim = num_heads * head_dim` and k & v using
+    /// `kv_dim = num_kv_heads * head_dim` (GQA).
+    ///
+    /// `Full` and `OFT` succeed at bundle construction but their
+    /// `forward_delta` will error inside ACE-Step's `base + delta_on_input`
+    /// attention call pattern — Phase 2c will wire `merge_into_base`.
+    pub fn install_lycoris_bundle(
+        &mut self,
+        cfg: &LycorisBundleConfig,
+        device: Arc<CudaDevice>,
+        seed: u64,
+    ) -> Result<()> {
+        if cfg.algo == LycorisAlgo::None {
+            return Ok(());
+        }
+        let _ = seed; // lycoris-rs uses its own internal RNG (kaiming/normal).
+
+        let h = self.config.hidden_size;
+        let q_dim = self.config.num_heads * self.config.head_dim;
+        let kv_dim = self.config.num_kv_heads * self.config.head_dim;
+
+        let mut adapters: HashMap<(usize, AceStepLoraTarget), Arc<LycorisLinear>> =
+            HashMap::new();
+        for i in 0..self.config.num_layers {
+            // (target, in_dim, out_dim) — mirrors the legacy ctor exactly.
+            let targets: [(AceStepLoraTarget, usize, usize); 8] = [
+                (AceStepLoraTarget::SelfQ,  h, q_dim),
+                (AceStepLoraTarget::SelfK,  h, kv_dim),
+                (AceStepLoraTarget::SelfV,  h, kv_dim),
+                (AceStepLoraTarget::SelfO,  h, q_dim),
+                (AceStepLoraTarget::CrossQ, h, q_dim),
+                (AceStepLoraTarget::CrossK, h, kv_dim),
+                (AceStepLoraTarget::CrossV, h, kv_dim),
+                (AceStepLoraTarget::CrossO, h, q_dim),
+            ];
+            for (target, in_dim, out_dim) in targets {
+                let wrapper = build_lycoris_linear(cfg, in_dim, out_dim, device.clone())
+                    .map_err(|e| Error::InvalidInput(format!(
+                        "build_lycoris_linear({:?}): {e}", target,
+                    )))?;
+                adapters.insert((i, target), Arc::new(wrapper));
+            }
+        }
+
+        log::info!(
+            "[ACE-Step] LyCORIS algo='{}' installed: {} adapters across {} layers",
+            cfg.algo.as_str(),
+            adapters.len(),
+            self.config.num_layers,
+        );
+
+        self.lycoris_adapters = adapters;
+        self.algo = cfg.algo;
+        Ok(())
+    }
+
+    /// Look up the active adapter for `(layer_idx, target)`. Prefers the
+    /// LyCORIS map when populated; falls back to the legacy plain-LoRA
+    /// `adapters` Vec.  Returns `Some(&dyn AdapterModule)` in both cases
+    /// once construction has run.  Used by every forward call site so the
+    /// `--algo locon|loha|lokr|...` swap is transparent to the model code.
+    pub fn adapter_for(
+        &self,
+        layer_idx: usize,
+        target: AceStepLoraTarget,
+    ) -> Option<&dyn AdapterModule> {
+        if let Some(lyc) = self.lycoris_adapters.get(&(layer_idx, target)) {
+            return Some(lyc.as_ref());
+        }
+        if layer_idx < self.adapters.len() {
+            let a = &self.adapters[layer_idx];
+            let l: &LoRALinear = match target {
+                AceStepLoraTarget::SelfQ  => &a.self_q,
+                AceStepLoraTarget::SelfK  => &a.self_k,
+                AceStepLoraTarget::SelfV  => &a.self_v,
+                AceStepLoraTarget::SelfO  => &a.self_o,
+                AceStepLoraTarget::CrossQ => &a.cross_q,
+                AceStepLoraTarget::CrossK => &a.cross_k,
+                AceStepLoraTarget::CrossV => &a.cross_v,
+                AceStepLoraTarget::CrossO => &a.cross_o,
+            };
+            return Some(l);
+        }
+        None
+    }
+
+    /// Currently-active algo (for trainer-side logging / save-format gating).
+    pub fn algo(&self) -> LycorisAlgo {
+        self.algo
+    }
+
     /// Collect all trainable LoRA parameters for the optimizer.
+    /// When a LyCORIS bundle is installed, only the LyCORIS adapters are
+    /// emitted (the legacy `adapters` Vec is left untouched in memory but
+    /// is never read by the forward path or the optimizer).
     pub fn parameters(&self) -> Vec<Parameter> {
         let mut params = Vec::new();
+        if !self.lycoris_adapters.is_empty() {
+            // Sort by (layer_idx, target_suffix) for deterministic order
+            // matching `named_parameters()` below.
+            let mut keys: Vec<(usize, AceStepLoraTarget)> =
+                self.lycoris_adapters.keys().copied().collect();
+            keys.sort_by_key(|k| (k.0, k.1.suffix()));
+            for k in &keys {
+                if let Some(a) = self.lycoris_adapters.get(k) {
+                    params.extend(a.to_parameters());
+                }
+            }
+            return params;
+        }
         for adapter in &self.adapters {
             params.extend(adapter.self_q.parameters());
             params.extend(adapter.self_k.parameters());
@@ -217,6 +381,26 @@ impl AceStepLoRAModel {
     /// Order MUST mirror `parameters()` (LoRALinear::parameters returns `[lora_a, lora_b]`).
     pub fn named_parameters(&self) -> Vec<(String, Parameter)> {
         let mut out = Vec::new();
+        if !self.lycoris_adapters.is_empty() {
+            // Same deterministic order as `parameters()`: by
+            // (layer_idx, target_suffix).  Each LyCORIS adapter contributes
+            // `prefix.<leaf>` for every entry in `named_tensors`, which
+            // mirrors `to_parameters()` order one-to-one.
+            let mut keys: Vec<(usize, AceStepLoraTarget)> =
+                self.lycoris_adapters.keys().copied().collect();
+            keys.sort_by_key(|k| (k.0, k.1.suffix()));
+            for k in &keys {
+                if let Some(a) = self.lycoris_adapters.get(k) {
+                    let prefix = format!("decoder.layers.{}.{}", k.0, k.1.suffix());
+                    let leaves = a.named_tensors();
+                    let params = a.to_parameters();
+                    for ((leaf, _), p) in leaves.iter().zip(params.iter()) {
+                        out.push((format!("{prefix}.{leaf}"), p.clone()));
+                    }
+                }
+            }
+            return out;
+        }
         let suffixes = [
             "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
             "cross_attn.q_proj", "cross_attn.k_proj", "cross_attn.v_proj", "cross_attn.o_proj",
@@ -236,8 +420,22 @@ impl AceStepLoRAModel {
     }
 
     /// Save LoRA weights as safetensors.
+    /// When a LyCORIS bundle is installed, the per-adapter `named_tensors`
+    /// entries are serialized under `decoder.layers.{i}.{suffix}.<leaf>`
+    /// (matching the canonical lycoris-rs leaf names).  Otherwise the
+    /// legacy plain-LoRA `lora_A.weight`/`lora_B.weight` keys are used.
     pub fn save_lora(&self, path: &Path) -> Result<()> {
         let mut tensors = HashMap::new();
+        if !self.lycoris_adapters.is_empty() {
+            for ((layer_idx, target), adapter) in &self.lycoris_adapters {
+                let prefix = format!("decoder.layers.{}.{}", layer_idx, target.suffix());
+                for (leaf, t) in adapter.named_tensors() {
+                    tensors.insert(format!("{prefix}.{leaf}"), t);
+                }
+            }
+            serialization::save_file(&tensors, path)?;
+            return Ok(());
+        }
         for (i, adapter) in self.adapters.iter().enumerate() {
             let prefix = format!("decoder.layers.{i}");
             adapter.self_q.save_tensors(&format!("{prefix}.self_attn.q_proj"), &mut tensors)?;
@@ -543,19 +741,27 @@ impl AceStepLoRAModel {
         layer_idx: usize,
     ) -> Result<Tensor> {
         let prefix = format!("decoder.layers.{layer_idx}.self_attn");
-        let adapter = &self.adapters[layer_idx];
         let b = hidden_states.shape().dims()[0];
         let s = hidden_states.shape().dims()[1];
         let nh = self.config.num_heads;
         let nkv = self.config.num_kv_heads;
         let hd = self.config.head_dim;
 
-        let q = linear3d(hidden_states, self.w(&format!("{prefix}.q_proj.weight"))?)?
-            .add(&adapter.self_q.forward_delta(hidden_states)?)?;
-        let k = linear3d(hidden_states, self.w(&format!("{prefix}.k_proj.weight"))?)?
-            .add(&adapter.self_k.forward_delta(hidden_states)?)?;
-        let v = linear3d(hidden_states, self.w(&format!("{prefix}.v_proj.weight"))?)?
-            .add(&adapter.self_v.forward_delta(hidden_states)?)?;
+        // Phase 2b: dispatch via `adapter_for` so the LyCORIS-swapped path
+        // picks up `lycoris_adapters` entries while the default `--algo lora`
+        // path keeps reading the legacy plain `LoRALinear` from `adapters`.
+        let q = linear3d_lora(
+            hidden_states, self.w(&format!("{prefix}.q_proj.weight"))?,
+            self.adapter_for(layer_idx, AceStepLoraTarget::SelfQ),
+        )?;
+        let k = linear3d_lora(
+            hidden_states, self.w(&format!("{prefix}.k_proj.weight"))?,
+            self.adapter_for(layer_idx, AceStepLoraTarget::SelfK),
+        )?;
+        let v = linear3d_lora(
+            hidden_states, self.w(&format!("{prefix}.v_proj.weight"))?,
+            self.adapter_for(layer_idx, AceStepLoraTarget::SelfV),
+        )?;
 
         let q = q.reshape(&[b, s, nh, hd])?;
         let k = k.reshape(&[b, s, nkv, hd])?;
@@ -582,8 +788,10 @@ impl AceStepLoRAModel {
         let out = out.transpose_dims(1, 2)?.reshape(&[b, s, nh * hd])?;
 
         let o_input = out;
-        let out = linear3d(&o_input, self.w(&format!("{prefix}.o_proj.weight"))?)?
-            .add(&adapter.self_o.forward_delta(&o_input)?)?;
+        let out = linear3d_lora(
+            &o_input, self.w(&format!("{prefix}.o_proj.weight"))?,
+            self.adapter_for(layer_idx, AceStepLoraTarget::SelfO),
+        )?;
 
         Ok(out)
     }
@@ -595,7 +803,6 @@ impl AceStepLoRAModel {
         layer_idx: usize,
     ) -> Result<Tensor> {
         let prefix = format!("decoder.layers.{layer_idx}.cross_attn");
-        let adapter = &self.adapters[layer_idx];
         let b = hidden_states.shape().dims()[0];
         let s_q = hidden_states.shape().dims()[1];
         let s_kv = encoder_hidden_states.shape().dims()[1];
@@ -603,12 +810,19 @@ impl AceStepLoRAModel {
         let nkv = self.config.num_kv_heads;
         let hd = self.config.head_dim;
 
-        let q = linear3d(hidden_states, self.w(&format!("{prefix}.q_proj.weight"))?)?
-            .add(&adapter.cross_q.forward_delta(hidden_states)?)?;
-        let k = linear3d(encoder_hidden_states, self.w(&format!("{prefix}.k_proj.weight"))?)?
-            .add(&adapter.cross_k.forward_delta(encoder_hidden_states)?)?;
-        let v = linear3d(encoder_hidden_states, self.w(&format!("{prefix}.v_proj.weight"))?)?
-            .add(&adapter.cross_v.forward_delta(encoder_hidden_states)?)?;
+        // Phase 2b: dispatch via `adapter_for` (see `self_attention_forward`).
+        let q = linear3d_lora(
+            hidden_states, self.w(&format!("{prefix}.q_proj.weight"))?,
+            self.adapter_for(layer_idx, AceStepLoraTarget::CrossQ),
+        )?;
+        let k = linear3d_lora(
+            encoder_hidden_states, self.w(&format!("{prefix}.k_proj.weight"))?,
+            self.adapter_for(layer_idx, AceStepLoraTarget::CrossK),
+        )?;
+        let v = linear3d_lora(
+            encoder_hidden_states, self.w(&format!("{prefix}.v_proj.weight"))?,
+            self.adapter_for(layer_idx, AceStepLoraTarget::CrossV),
+        )?;
 
         let q = q.reshape(&[b, s_q, nh, hd])?;
         let k = k.reshape(&[b, s_kv, nkv, hd])?;
@@ -633,8 +847,10 @@ impl AceStepLoRAModel {
         let out = out.transpose_dims(1, 2)?.reshape(&[b, s_q, nh * hd])?;
 
         let o_input = out;
-        let out = linear3d(&o_input, self.w(&format!("{prefix}.o_proj.weight"))?)?
-            .add(&adapter.cross_o.forward_delta(&o_input)?)?;
+        let out = linear3d_lora(
+            &o_input, self.w(&format!("{prefix}.o_proj.weight"))?,
+            self.adapter_for(layer_idx, AceStepLoraTarget::CrossO),
+        )?;
 
         Ok(out)
     }
@@ -646,6 +862,31 @@ impl AceStepLoRAModel {
 
 fn linear3d(input: &Tensor, weight_t: &Tensor) -> flame_core::Result<Tensor> {
     input.matmul(weight_t)
+}
+
+/// Phase 2b dispatch helper: `out = x @ wt + adapter.forward_delta(x)`.
+/// Routes through the unified [`AdapterModule`] trait so plain `LoRALinear`
+/// (legacy `--algo lora`) and `LycorisLinear` (LoCon / LoHa / LoKr / Full
+/// / OFT, plus DoRA) share the same call site. Returns `base` unchanged
+/// when `adapter` is `None`.
+fn linear3d_lora(
+    input: &Tensor,
+    weight_t: &Tensor,
+    adapter: Option<&dyn AdapterModule>,
+) -> flame_core::Result<Tensor> {
+    let base = input.matmul(weight_t)?;
+    match adapter {
+        None => Ok(base),
+        Some(a) => {
+            let delta = a.forward_delta(input)?;
+            // forward_delta returns a tensor whose final dim matches `base`'s
+            // final dim (the adapter's `out_features`); reshape defensively
+            // to base's exact shape (always matches in practice).
+            let base_dims = base.shape().dims().to_vec();
+            let delta = delta.reshape(&base_dims)?;
+            base.add(&delta)
+        }
+    }
 }
 
 fn linear3d_bias(input: &Tensor, weight_t: &Tensor, bias: &Tensor) -> flame_core::Result<Tensor> {

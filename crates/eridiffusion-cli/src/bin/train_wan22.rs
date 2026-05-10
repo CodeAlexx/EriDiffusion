@@ -48,7 +48,8 @@ use clap::Parser;
 use std::path::PathBuf;
 
 use eridiffusion_core::config::{LrScheduler, TrainConfig, TrainingMethod};
-use eridiffusion_core::models::wan22::{Wan22Config, Wan22Model, Wan22Variant};
+use eridiffusion_core::lycoris::{LycorisAlgo, LycorisBundleConfig};
+use eridiffusion_core::models::wan22::{Wan22Config, Wan22LoraBundle, Wan22Model, Wan22Variant};
 use eridiffusion_core::sampler::wan22_sampler::{
     self as wan22, Expert, DEFAULT_NOISE_BOUNDARY_T2V, DEFAULT_SHIFT_TI2V_5B,
 };
@@ -234,6 +235,56 @@ struct Args {
     #[arg(long, default_value = "constant")] lr_scheduler: String,
     #[arg(long, default_value_t = 0)] warmup_steps: usize,
     #[arg(long, default_value_t = 1.0)] lr_cycles: f32,
+
+    // ── LyCORIS algo selection (Phase 2b — dual-net wan22 special case) ──
+    //
+    // Wan 2.2 has two independent transformer experts (low-noise + high-noise
+    // for T2V/I2V-A14B; only low for TI2V-5B). Each gets its OWN algo flag so
+    // a run can mix e.g. `--algo_low loha --algo_high lokr`. The other 10
+    // shape flags (rank, alpha, factor, block_size, …) are SINGLE knobs
+    // applied to both nets. `--algo_low lora --algo_high lora` (defaults) is
+    // byte-identical to pre-Phase-2b behaviour. For TI2V-5B only `--algo_low`
+    // is consulted; `--algo_high` is ignored with a warning when the variant
+    // is single-expert.
+    /// LyCORIS algo for the LOW-noise expert: `lora` (default, legacy path)
+    /// | `locon` | `loha` | `lokr` | `full` | `oft`. `full` and `oft` build
+    /// successfully but their `forward_delta` errors inside wan22's
+    /// `base + delta_on_input` call pattern; Phase 2c wires merge-into-base.
+    #[arg(long, default_value = "lora")] algo_low: String,
+    /// LyCORIS algo for the HIGH-noise expert (dual-expert variants only).
+    /// Same value-set as `--algo_low`. Ignored for `--variant ti2v_5b`.
+    #[arg(long, default_value = "lora")] algo_high: String,
+    /// LoKr Kronecker split factor (ignored for non-LoKr).
+    #[arg(long, default_value_t = 16)] lokr_factor: i32,
+    /// OFT/BOFT block size (ignored for non-OFT/BOFT).
+    #[arg(long, default_value_t = 32)] oft_block_size: usize,
+    /// OFT Cayley-Neumann series term count.
+    #[arg(long, default_value_t = 5)] oft_neumann_terms: usize,
+    /// LoCon / LoHa / LoKr conv variant — Tucker decomposition for non-1×1
+    /// kernels. Wan22 attention projections are linear-only so this is a
+    /// no-op for the current target set.
+    #[arg(long, default_value_t = false)] use_tucker: bool,
+    /// LoKr only: factorize both W1 *and* W2 (default false: only W2).
+    #[arg(long, default_value_t = false)] decompose_both: bool,
+    /// Enable DoRA (weight-decomposed LoRA). Applies to LoCon/LoHa/LoKr/Full.
+    #[arg(long, default_value_t = false)] dora: bool,
+    /// DoRA magnitude axis (`true` = lycoris-upstream).
+    #[arg(long, default_value_t = true)] dora_wd_on_out: bool,
+    #[arg(long, default_value_t = 1e-6)] dora_eps: f32,
+    /// SimpleTuner-parity: perturbed-normal LoKr init. Scale `>0` triggers
+    /// `lokr_w1=1, lokr_w2 ~ N(μ_W, σ_W)·scale`. No-op when algo != lokr or
+    /// value is 0.0. Phase 2b: per-net base-weight access not yet plumbed
+    /// for wan22 (BlockOffloader streams blocks); apply call logs a warning
+    /// and returns Ok(()) on LoKr. Phase 2c follow-up.
+    #[arg(long, default_value_t = 0.0)] init_lokr_norm: f32,
+    /// Per-element dropout on the adapter delta (training only).
+    #[arg(long, default_value_t = 0.0)] lora_dropout: f32,
+    /// Per-rank Bernoulli on the down-projection intermediate.
+    #[arg(long, default_value_t = 0.0)] rank_dropout: f32,
+    /// Per-step Bernoulli on the entire adapter.
+    #[arg(long, default_value_t = 0.0)] module_dropout: f32,
+    /// Rescale rank-mask by `1/mean(mask)` to preserve expectation.
+    #[arg(long, default_value_t = false)] rank_dropout_scale: bool,
 }
 
 fn parse_weight_dtype(s: &str) -> anyhow::Result<DType> {
@@ -317,6 +368,71 @@ fn main() -> anyhow::Result<()> {
     config.ema_validation_swap = args.ema_validation_swap;
     config.tread_route_pattern = args.tread_route_pattern.clone();
 
+    // ── LyCORIS algo parse (Phase 2b — dual-net) ────────────────────────
+    //
+    // Each net (low + high) parses its own algo string independently. Other
+    // shape config (rank, alpha, factor, …) is shared. `--algo_low lora`
+    // (or `none`/empty) keeps the legacy `LoRALinear` path on the low net,
+    // byte-identical to pre-Phase-2b. Same for `--algo_high lora`.
+    //
+    // NOTE: `LycorisAlgo::parse("lora")` aliases to `LycorisAlgo::LoCon`
+    // (LoCon-Linear is the canonical LoRA decomposition). To keep the
+    // legacy path distinct from new LoCon path, re-map `"lora"` → `None`
+    // here explicitly. Users who want the new LoCon path pass `locon`.
+    fn parse_algo(s: &str, label: &str) -> anyhow::Result<LycorisAlgo> {
+        let l = s.trim().to_ascii_lowercase();
+        if l == "lora" || l == "none" || l.is_empty() {
+            Ok(LycorisAlgo::None)
+        } else {
+            LycorisAlgo::parse(s).map_err(|e| anyhow::anyhow!("--algo_{label}: {e}"))
+        }
+    }
+    let algo_low = parse_algo(&args.algo_low, "low")?;
+    let algo_high = parse_algo(&args.algo_high, "high")?;
+    if !dual && algo_high != LycorisAlgo::None {
+        log::warn!(
+            "[wan22] variant {} is single-expert; --algo_high='{}' is ignored",
+            variant.as_str(),
+            algo_high.as_str(),
+        );
+    }
+    // Build per-net configs sharing all shape fields except `algo`.
+    let mk_lyc_config = |algo: LycorisAlgo| LycorisBundleConfig {
+        algo,
+        rank: args.rank,
+        alpha: args.lora_alpha as f32,
+        factor: args.lokr_factor,
+        block_size: args.oft_block_size,
+        neumann_terms: args.oft_neumann_terms,
+        use_tucker: args.use_tucker,
+        decompose_both: args.decompose_both,
+        use_scalar: false,
+        dora: args.dora,
+        dora_wd_on_out: args.dora_wd_on_out,
+        dora_eps: args.dora_eps,
+        ..LycorisBundleConfig::default()
+    };
+    let lyc_config_low = mk_lyc_config(algo_low);
+    let lyc_config_high = mk_lyc_config(algo_high);
+    // Surface dropout / rank-dropout flags as a single line until they're
+    // plumbed into LycorisBundleConfig (cross-trainer task — recipe lists
+    // them on every binary's surface). Default 0.0/false → no-op today.
+    if args.lora_dropout > 0.0
+        || args.rank_dropout > 0.0
+        || args.module_dropout > 0.0
+        || args.rank_dropout_scale
+    {
+        log::warn!(
+            "[wan22] dropout flags (lora_dropout={}, rank_dropout={}, \
+             module_dropout={}, rank_dropout_scale={}) are accepted but not \
+             yet plumbed into LycorisBundleConfig — no-op for this run.",
+            args.lora_dropout,
+            args.rank_dropout,
+            args.module_dropout,
+            args.rank_dropout_scale,
+        );
+    }
+
     // ── Load expert(s) ──────────────────────────────────────────────────
     log::info!(
         "[wan22] variant={} dim={} layers={} dual={} boundary={:.4} weight_dtype={:?}",
@@ -326,6 +442,16 @@ fn main() -> anyhow::Result<()> {
         dual,
         args.noise_boundary,
         weight_dtype,
+    );
+    log::info!(
+        "[wan22] algo_low='{}' algo_high='{}' rank={} alpha={} factor={} block_size={} dora={}",
+        algo_low.as_str(),
+        algo_high.as_str(),
+        args.rank,
+        args.lora_alpha,
+        args.lokr_factor,
+        args.oft_block_size,
+        args.dora,
     );
 
     let mut low_model = if args.offload {
@@ -351,6 +477,41 @@ fn main() -> anyhow::Result<()> {
             "low",
         )?
     };
+    // Phase 2b: swap the legacy bundle in-place if a non-legacy algo was
+    // requested for the low expert. `--algo_low lora` (None) leaves the
+    // legacy bundle untouched → byte-identical to pre-Phase-2b.
+    if algo_low != LycorisAlgo::None {
+        if matches!(algo_low, LycorisAlgo::Full | LycorisAlgo::Oft) {
+            log::warn!(
+                "[wan22:low] algo='{}' selected — bundle construction will succeed, \
+                 but forward_delta will error inside wan22's `base + delta_on_input` \
+                 call pattern. Phase 2c will wire merge-into-base for these algos.",
+                algo_low.as_str(),
+            );
+        }
+        let new_bundle = Wan22LoraBundle::new_with_config(
+            &cfg,
+            &lyc_config_low,
+            device.clone(),
+            SEED,
+            "low",
+        )
+        .map_err(|e| anyhow::anyhow!("LyCORIS bundle (low) construction: {e}"))?;
+        log::info!(
+            "[wan22:low] LyCORIS algo='{}' adapters={}",
+            algo_low.as_str(),
+            new_bundle.num_adapters(),
+        );
+        low_model.lora = new_bundle;
+        if matches!(algo_low, LycorisAlgo::LoKr) && args.init_lokr_norm > 0.0 {
+            low_model
+                .lora
+                .apply_init_perturbed_normal(&low_model.weights, args.init_lokr_norm)
+                .map_err(|e| anyhow::anyhow!("init_lokr_norm (low): {e}"))?;
+        }
+    } else {
+        log::info!("[wan22:low] algo='lora' (legacy LoRALinear path, byte-identical)");
+    }
     if let Some(p) = &args.resume_low_lora {
         log::info!("[wan22:low] resume LoRA <- {}", p.display());
         // LoRA bundles save as flat safetensors; loading is a per-file
@@ -383,6 +544,39 @@ fn main() -> anyhow::Result<()> {
                 "high",
             )?
         };
+        // Phase 2b: independently swap the high-expert bundle if requested.
+        // The two nets may use DIFFERENT algos (e.g. low=loha, high=lokr).
+        if algo_high != LycorisAlgo::None {
+            if matches!(algo_high, LycorisAlgo::Full | LycorisAlgo::Oft) {
+                log::warn!(
+                    "[wan22:high] algo='{}' selected — bundle construction will succeed, \
+                     but forward_delta will error inside wan22's `base + delta_on_input` \
+                     call pattern. Phase 2c will wire merge-into-base for these algos.",
+                    algo_high.as_str(),
+                );
+            }
+            let new_bundle = Wan22LoraBundle::new_with_config(
+                &cfg,
+                &lyc_config_high,
+                device.clone(),
+                SEED ^ 0xA14B_A14B,
+                "high",
+            )
+            .map_err(|e| anyhow::anyhow!("LyCORIS bundle (high) construction: {e}"))?;
+            log::info!(
+                "[wan22:high] LyCORIS algo='{}' adapters={}",
+                algo_high.as_str(),
+                new_bundle.num_adapters(),
+            );
+            hm.lora = new_bundle;
+            if matches!(algo_high, LycorisAlgo::LoKr) && args.init_lokr_norm > 0.0 {
+                hm.lora
+                    .apply_init_perturbed_normal(&hm.weights, args.init_lokr_norm)
+                    .map_err(|e| anyhow::anyhow!("init_lokr_norm (high): {e}"))?;
+            }
+        } else {
+            log::info!("[wan22:high] algo='lora' (legacy LoRALinear path, byte-identical)");
+        }
         if let Some(p) = &args.resume_high_lora {
             log::info!("[wan22:high] resume LoRA <- {}", p.display());
             let map = flame_core::serialization::load_file(p, &device)?;

@@ -98,6 +98,30 @@ pub trait AdapterModule: Send + Sync {
         ))
     }
 
+    /// SimpleTuner-parity perturbed-normal LoKr init.  Mirrors
+    /// `init_lokr_network_with_perturbed_normal` (peft_init.py:21):
+    /// `lokr_w1.fill_(1.0)`, `lokr_w2 = approximate_normal(base_weight) · scale`.
+    ///
+    /// Default implementation is a no-op returning `Ok(false)` — the
+    /// adapter is not LoKr (or the LoKr is in a factored form that cannot
+    /// be init'd this way).  `LycorisLinear`'s impl delegates to the
+    /// inner `LoKrModule::init_perturbed_normal` when the adapter is
+    /// indeed full-form LoKr; other adapter kinds keep the default
+    /// no-op.
+    ///
+    /// Returns `Ok(true)` when the init was applied, `Ok(false)` when
+    /// silently skipped (wrong algo or factored form).  Used by
+    /// per-bundle `apply_init_perturbed_normal` helpers to walk a
+    /// generic `&[Arc<dyn AdapterModule>]` list without an `Any`
+    /// downcast.
+    fn init_perturbed_normal_lokr(
+        &self,
+        _base_weight: &Tensor,
+        _scale: f32,
+    ) -> FlameResult<bool> {
+        Ok(false)
+    }
+
     /// Owned leaf tensors, in stable per-algo order. The trainer wraps each
     /// into [`Parameter`] (or registers them with its optimizer) for the
     /// AdamW step. Order contracts come from
@@ -206,6 +230,14 @@ pub struct LycorisLinear {
     pub dora_eps: f32,
     /// Storage dtype of leaf tensors.
     pub storage: StorageDtype,
+    /// Sample-time strength multiplier scaling the forward delta.  `1.0`
+    /// (default) is byte-identical to the pre-multiplier path.  Set via
+    /// [`LycorisLinear::set_multiplier`] and read atomically — sampler
+    /// binaries flip this between `--validation_lycoris_strength` and
+    /// `1.0` around validation passes; trainers leave it at 1.0.
+    /// Stored as the bit pattern of an `f32` so the field can live behind
+    /// `&self` without a mutex.
+    pub multiplier_bits: std::sync::atomic::AtomicU32,
 }
 
 impl LycorisLinear {
@@ -224,6 +256,53 @@ impl LycorisLinear {
             dora_wd_on_out,
             dora_eps,
             storage,
+            multiplier_bits: std::sync::atomic::AtomicU32::new(1.0_f32.to_bits()),
+        }
+    }
+
+    /// Read the current sample-time strength multiplier.  Defaults to
+    /// `1.0` (byte-identical to the pre-T1.7 forward path).
+    #[inline]
+    pub fn multiplier(&self) -> f32 {
+        f32::from_bits(self.multiplier_bits.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Set the sample-time strength multiplier.  Sampler binaries call
+    /// this with `--validation_lycoris_strength` before sampling and
+    /// reset to `1.0` after.  Trainers should leave it at `1.0`.
+    #[inline]
+    pub fn set_multiplier(&self, m: f32) {
+        self.multiplier_bits
+            .store(m.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// SimpleTuner-style perturbed-normal LoKr init.  Mirrors
+    /// `init_lokr_network_with_perturbed_normal` (peft_init.py:21):
+    /// `w1.fill_(1)`, `w2 = approximate_normal(base_weight) * scale`.
+    ///
+    /// Returns `Ok(true)` when the inner adapter was LoKr **in full-form**
+    /// and the init was applied.  Returns `Ok(false)` when the adapter is
+    /// not LoKr (no-op for LoRA/LoCon/LoHa/OFT/Full).  Returns `Err(...)`
+    /// when the adapter is LoKr but factored — caller can rebuild with
+    /// `decompose_both=false` and larger rank to enable.
+    ///
+    /// Callers are responsible for finding the base linear weight that
+    /// corresponds to this adapter (typically by walking the model's
+    /// `(layer_idx, target) → weight` map and looking up the matching key).
+    pub fn init_perturbed_normal_lokr(
+        &self,
+        base_weight: &Tensor,
+        scale: f32,
+    ) -> FlameResult<bool> {
+        match &self.adapter {
+            LycorisAdapter::LoKr(m) => {
+                m.init_perturbed_normal(base_weight, scale)
+                    .map_err(|e| FlameError::InvalidOperation(format!(
+                        "LycorisLinear::init_perturbed_normal_lokr: {e}"
+                    )))?;
+                Ok(true)
+            }
+            _ => Ok(false),
         }
     }
 
@@ -254,18 +333,46 @@ impl LycorisLinear {
                         .into(),
                 ));
             }
-            LycorisAdapter::OFT(m) => {
-                // OFT is multiplicative: return `R·x − x` so the call site's
-                // `base + delta` collapses to `base + (R−I)·x`. For the
-                // identity-base case (`base ≡ x`) this gives `R·x` ≡ correct
-                // OFT output. For a non-identity base this is not what OFT
-                // means; callers should branch on [`is_input_rotation`] and
-                // use [`apply_input`] instead.
-                m.apply_to_input(&cast_in)
-                    .and_then(|rx| rx.sub(&cast_in).map_err(lycoris_rs::Error::Flame))
+            LycorisAdapter::OFT(_) => {
+                // OFT is **input-space**: it rotates `x` before the base
+                // linear runs.  There is no shape-correct additive delta on
+                // the *output* of the base linear (the rotation lives in
+                // input dim, the output is in out dim).  Callers must
+                // branch on `AdapterModule::is_input_rotation()` and route
+                // through `apply_input(x) → R·x`, which the base linear
+                // then consumes normally.
+                return Err(FlameError::InvalidOperation(
+                    "LycorisLinear::forward_delta: OFT is an input-space rotation, \
+                     not an output-additive delta. Branch on `is_input_rotation()` \
+                     and use `apply_input` instead."
+                        .into(),
+                ));
+            }
+            LycorisAdapter::BOFT(_) => {
+                // BOFT is the same shape of beast as OFT — multiplicative on
+                // the input axis (now via a butterfly chain of `m` rotations
+                // instead of a single block-diagonal one).  Same branch
+                // contract: callers detect via `is_input_rotation()` and
+                // route through `apply_input`.
+                return Err(FlameError::InvalidOperation(
+                    "LycorisLinear::forward_delta: BOFT is an input-space rotation, \
+                     not an output-additive delta. Branch on `is_input_rotation()` \
+                     and use `apply_input` instead."
+                        .into(),
+                ));
             }
         }
         .map_err(|e| FlameError::InvalidOperation(format!("LycorisLinear::forward: {e}")))?;
+        // Apply the sample-time strength multiplier.  Default `1.0`
+        // skips the multiply (no allocation when m == 1.0 — common
+        // training-path case).  The multiply is in `out`'s native dtype
+        // so it composes with the dtype-restore step below.
+        let m = self.multiplier();
+        let out = if m != 1.0 {
+            out.mul_scalar(m)?
+        } else {
+            out
+        };
         if out.dtype() != input_dt {
             Ok(out.to_dtype(input_dt)?)
         } else {
@@ -280,31 +387,42 @@ impl AdapterModule for LycorisLinear {
     }
 
     fn is_input_rotation(&self) -> bool {
-        matches!(self.adapter, LycorisAdapter::OFT(_))
+        matches!(
+            self.adapter,
+            LycorisAdapter::OFT(_) | LycorisAdapter::BOFT(_)
+        )
     }
 
     fn apply_input(&self, input: &Tensor) -> FlameResult<Tensor> {
-        match &self.adapter {
-            LycorisAdapter::OFT(m) => {
-                let storage_dt = self.storage.to_dtype();
-                let input_dt = input.dtype();
-                let cast_in = if input_dt != storage_dt {
-                    input.to_dtype(storage_dt)?
-                } else {
-                    input.clone()
-                };
-                let rx = m
-                    .apply_to_input(&cast_in)
-                    .map_err(|e| FlameError::InvalidOperation(format!("OFT::apply_to_input: {e}")))?;
-                if rx.dtype() != input_dt {
-                    Ok(rx.to_dtype(input_dt)?)
-                } else {
-                    Ok(rx)
-                }
+        // Both OFT and BOFT are input-rotation adapters; the cast-in /
+        // cast-out convention is identical (the per-algo `apply_to_input`
+        // does its own F32-to-input-dtype record-mode cast on the rotation
+        // tensor, so we just need to pass `input` through at its native
+        // dtype).
+        let storage_dt = self.storage.to_dtype();
+        let input_dt = input.dtype();
+        let cast_in = if input_dt != storage_dt {
+            input.to_dtype(storage_dt)?
+        } else {
+            input.clone()
+        };
+        let rx = match &self.adapter {
+            LycorisAdapter::OFT(m) => m
+                .apply_to_input(&cast_in)
+                .map_err(|e| FlameError::InvalidOperation(format!("OFT::apply_to_input: {e}")))?,
+            LycorisAdapter::BOFT(m) => m
+                .apply_to_input(&cast_in)
+                .map_err(|e| FlameError::InvalidOperation(format!("BOFT::apply_to_input: {e}")))?,
+            _ => {
+                return Err(FlameError::InvalidOperation(
+                    "apply_input only valid on OFT/BOFT adapters".into(),
+                ));
             }
-            _ => Err(FlameError::InvalidOperation(
-                "apply_input only valid on OFT adapters".into(),
-            )),
+        };
+        if rx.dtype() != input_dt {
+            Ok(rx.to_dtype(input_dt)?)
+        } else {
+            Ok(rx)
         }
     }
 
@@ -318,6 +436,21 @@ impl AdapterModule for LycorisLinear {
         })?;
         lycoris_rs::dora::apply_weight_decompose(wp_out, m, self.dora_wd_on_out, self.dora_eps)
             .map_err(|e| FlameError::InvalidOperation(format!("apply_weight_decompose: {e}")))
+    }
+
+    /// Trait impl delegates to the inherent
+    /// [`LycorisLinear::init_perturbed_normal_lokr`] method, which
+    /// pattern-matches the inner adapter and calls
+    /// `LoKrModule::init_perturbed_normal` only when applicable.  The
+    /// inherent method's name is the same as the trait method's; the
+    /// disambiguation is in the receiver type at call site (`&dyn
+    /// AdapterModule` → trait dispatch; `&LycorisLinear` → inherent).
+    fn init_perturbed_normal_lokr(
+        &self,
+        base_weight: &Tensor,
+        scale: f32,
+    ) -> FlameResult<bool> {
+        LycorisLinear::init_perturbed_normal_lokr(self, base_weight, scale)
     }
 
     fn parameters(&self) -> Vec<Tensor> {
@@ -361,6 +494,7 @@ impl AdapterModule for LycorisLinear {
             LycorisAdapter::LoKr(_) => "lokr",
             LycorisAdapter::Full(_) => "full",
             LycorisAdapter::OFT(_) => "oft",
+            LycorisAdapter::BOFT(_) => "boft",
         }
     }
 
@@ -425,6 +559,10 @@ impl AdapterModule for LycorisLinear {
                 }
             }
             LycorisAdapter::OFT(m) => {
+                out.push(("oft_blocks", pt(&m.blocks)));
+            }
+            LycorisAdapter::BOFT(m) => {
+                // Suffix matches `lycoris/modules/boft.py` weight_list[0].
                 out.push(("oft_blocks", pt(&m.blocks)));
             }
         }

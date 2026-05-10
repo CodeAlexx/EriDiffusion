@@ -48,8 +48,10 @@ use cudarc::driver::CudaDevice;
 use flame_core::cuda_ops::GpuOps;
 use flame_core::{parameter::Parameter, DType, Shape, Tensor};
 
+use crate::adapter::{AdapterModule, LycorisLinear};
 use crate::config::TrainConfig;
 use crate::lora::LoRALinear;
+use crate::lycoris::{LycorisAlgo, LycorisBundleConfig};
 use crate::models::TrainableModel;
 use crate::Result;
 
@@ -160,6 +162,19 @@ pub struct SDXLModel {
     pub lora_target_prefixes: Vec<String>,
     /// Reverse lookup `prefix → adapter_idx`, populated at construction.
     lora_index_by_prefix: HashMap<String, usize>,
+    /// LyCORIS adapters (LoCon/LoHa/LoKr/Full/OFT). Empty when
+    /// `algo == LycorisAlgo::None` (legacy plain-LoRA path) or in full
+    /// fine-tune mode. Indexed by the same prefix string as `lora_adapters`
+    /// (via `lora_index_by_prefix` for ordering).
+    ///
+    /// Wrapped in `Arc` so per-call-site lookups are cheap; the map is
+    /// populated by `swap_to_lycoris_bundle` after the legacy `LoRALinear`
+    /// path was constructed in `load`. The `adapter_for(prefix)` accessor
+    /// prefers this map over the legacy `lora_adapters` Vec.
+    pub lycoris_adapters: HashMap<String, Arc<LycorisLinear>>,
+    /// Currently-active LyCORIS algo. `LycorisAlgo::None` means the legacy
+    /// `LoRALinear` path is in use (see `lora_adapters` above).
+    pub algo: LycorisAlgo,
     pub parameters: Vec<Parameter>,
     pub is_lora: bool,
 }
@@ -215,9 +230,140 @@ impl SDXLModel {
             lora_adapters,
             lora_target_prefixes,
             lora_index_by_prefix,
+            lycoris_adapters: HashMap::new(),
+            algo: LycorisAlgo::None,
             parameters,
             is_lora,
         })
+    }
+
+    /// Swap the legacy `LoRALinear` bundle for a LyCORIS bundle keyed by the
+    /// same `lora_target_prefixes` set. Called by `train_sdxl --algo
+    /// <locon|loha|lokr|full|oft>` after `SDXLModel::load` constructed the
+    /// legacy bundle. `LycorisAlgo::None` is a no-op (legacy path retained).
+    ///
+    /// On success:
+    ///   * `self.lycoris_adapters` is populated with one `LycorisLinear` per
+    ///     target prefix.
+    ///   * `self.lora_adapters` is cleared (the parallel `lora_target_prefixes`
+    ///     and `lora_index_by_prefix` are kept — they drive iteration order
+    ///     for save/load and serve as the canonical target list).
+    ///   * `self.parameters` is rebuilt from the LyCORIS adapters'
+    ///     `to_parameters()`.
+    ///   * `self.algo` is updated.
+    ///
+    /// Targets that already failed during legacy bundle construction will
+    /// have been bailed earlier, so the prefix list here is guaranteed
+    /// well-formed against `enumerate_lora_targets()`.
+    pub fn swap_to_lycoris_bundle(
+        &mut self,
+        config: &LycorisBundleConfig,
+        device: Arc<CudaDevice>,
+        _seed: u64,
+    ) -> Result<()> {
+        if config.algo == LycorisAlgo::None {
+            return Ok(());
+        }
+        if !self.is_lora {
+            return Err(crate::EriDiffusionError::Lora(
+                "swap_to_lycoris_bundle requires is_lora=true (full-FT not supported)".into(),
+            ));
+        }
+
+        // Re-enumerate to get (prefix, in_features, out_features) — the same
+        // tuple list used during legacy construction. `lora_target_prefixes`
+        // alone doesn't carry shapes.
+        let targets = enumerate_lora_targets();
+        let mut lycoris_adapters: HashMap<String, Arc<LycorisLinear>> = HashMap::new();
+        for (prefix, in_f, out_f) in &targets {
+            let wrapper = crate::models::chroma::build_lycoris_linear(
+                config, *in_f, *out_f, device.clone(),
+            )
+            .map_err(|e| crate::EriDiffusionError::Lora(format!(
+                "build_lycoris_linear {prefix}: {e}"
+            )))?;
+            lycoris_adapters.insert(prefix.clone(), Arc::new(wrapper));
+        }
+
+        // Rebuild the parameter list from the new bundle. Iteration order
+        // follows `lora_target_prefixes` for determinism (HashMap iteration
+        // order is otherwise nondeterministic across runs).
+        let mut parameters: Vec<Parameter> = Vec::new();
+        for prefix in &self.lora_target_prefixes {
+            if let Some(adapter) = lycoris_adapters.get(prefix) {
+                parameters.extend(adapter.to_parameters());
+            }
+        }
+
+        // Drop the legacy bundle once the LyCORIS bundle is fully built so we
+        // never have both resident on a constrained-VRAM run.
+        self.lora_adapters.clear();
+        self.lycoris_adapters = lycoris_adapters;
+        self.algo = config.algo;
+        self.parameters = parameters;
+        Ok(())
+    }
+
+    /// Look up the active adapter for `prefix` for the forward path. Prefers
+    /// the LyCORIS map when populated; falls back to the legacy plain-LoRA
+    /// Vec via `lora_index_by_prefix`. Returns `None` when neither has an
+    /// entry (e.g. full fine-tune mode, or a prefix outside the LoRA target
+    /// set).
+    ///
+    /// MUST be the only entry point used by forward closures — see Phase 2b
+    /// pitfall: bypassing this and going straight to `lora_adapters` will
+    /// silently skip the LoRA delta when `--algo locon` is active.
+    pub fn adapter_for(&self, prefix: &str) -> Option<&dyn AdapterModule> {
+        if let Some(lyc) = self.lycoris_adapters.get(prefix) {
+            return Some(lyc.as_ref());
+        }
+        if let Some(&idx) = self.lora_index_by_prefix.get(prefix) {
+            return Some(&self.lora_adapters[idx]);
+        }
+        None
+    }
+
+    /// SimpleTuner-style perturbed-normal init for LoKr.  Mirrors
+    /// `init_lokr_network_with_perturbed_normal` (peft_init.py:21).
+    ///
+    /// SDXL's `weights` map is resident at construction time (the UNet
+    /// is loaded eagerly, no BlockOffloader streaming), so the per-prefix
+    /// base-weight lookup is direct: `self.weights[&format!("{prefix}.weight")]`.
+    ///
+    /// Walks `lycoris_adapters` and calls
+    /// `AdapterModule::init_perturbed_normal_lokr(base_weight, scale)` on
+    /// each — the trait default-impl is a no-op for non-LoKr adapters,
+    /// `LycorisLinear`'s impl delegates to `LoKrModule::init_perturbed_normal`
+    /// when applicable.  Returns the count of adapters that declined the
+    /// init (factored LoKr or wrong algo) for caller visibility.
+    pub fn apply_init_perturbed_normal(&self, scale: f32) -> Result<usize> {
+        if self.algo != LycorisAlgo::LoKr || scale <= 0.0 {
+            return Ok(0);
+        }
+        let mut skipped = 0usize;
+        let mut applied_count = 0usize;
+        for (prefix, adapter) in &self.lycoris_adapters {
+            let key = format!("{prefix}.weight");
+            let Some(base) = self.weights.get(&key) else {
+                log::warn!("[SDXL][init_lokr_norm] missing base weight `{key}` — skipping");
+                skipped += 1;
+                continue;
+            };
+            let applied = adapter
+                .init_perturbed_normal_lokr(base, scale)
+                .map_err(|e| crate::EriDiffusionError::Model(format!(
+                    "init_perturbed_normal_lokr({prefix}): {e}"
+                )))?;
+            if applied {
+                applied_count += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+        log::info!(
+            "[SDXL][init_lokr_norm] applied={applied_count} skipped={skipped} scale={scale}"
+        );
+        Ok(skipped)
     }
 
     fn w(&self, key: &str) -> Result<&Tensor> {
@@ -251,14 +397,20 @@ impl SDXLModel {
 
     /// LoRA-aware attention projection. `prefix` is the base weight prefix
     /// without ".weight" (e.g. "input_blocks.4.1.transformer_blocks.0.attn1.to_q").
+    ///
+    /// Phase 2b: dispatches through the unified [`Self::adapter_for`]
+    /// accessor, which prefers the LyCORIS map when populated and falls
+    /// back to the legacy `lora_adapters` Vec otherwise. This is the SOLE
+    /// site that adds a LoRA delta in SDXL's forward pass — every call into
+    /// `attn_proj` (attn q/k/v/o, ff.net.0.proj, ff.net.2, proj_in/proj_out)
+    /// goes through here.
     fn attn_proj(&self, x: &Tensor, prefix: &str) -> Result<Tensor> {
         let weight = self.w(&format!("{prefix}.weight"))?;
         let bias = self.weights.get(&format!("{prefix}.bias"));
         let base = Self::linear(x, weight, bias)?;
 
         if self.is_lora {
-            if let Some(&idx) = self.lora_index_by_prefix.get(prefix) {
-                let adapter = &self.lora_adapters[idx];
+            if let Some(adapter) = self.adapter_for(prefix) {
                 let x_3d = ensure_3d(x)?;
                 let delta = adapter.forward_delta(&x_3d)
                     .map_err(|e| crate::EriDiffusionError::Lora(format!("LoRA delta {prefix}: {e}")))?;
@@ -565,6 +717,9 @@ impl TrainableModel for SDXLModel {
     fn post_optimizer_step(&mut self) {
         // LoRALinear caches nothing today, but mirror the contract:
         for l in &self.lora_adapters { l.refresh_cache(); }
+        // LyCORIS adapters don't carry a transposed-BF16 cache — `forward_delta`
+        // reads leaves live each call. No-op here, kept for source-level
+        // uniformity with the legacy path.
     }
 
     /// Save LoRA adapters to safetensors using the diffusers/PEFT convention
@@ -591,23 +746,44 @@ impl TrainableModel for SDXLModel {
             ));
         }
         let mut out = HashMap::new();
-        for (i, adapter) in self.lora_adapters.iter().enumerate() {
-            let prefix = &self.lora_target_prefixes[i];
-            adapter.save_tensors(prefix, &mut out)
-                .map_err(|e| crate::EriDiffusionError::Lora(format!("save {prefix}: {e}")))?;
-            // SDXL audit H6: companion `.alpha` scalar (BF16 to match
-            // the rest of the LoRA tensors). 0-dim; loaders that expect
-            // 1-dim length-1 either work or do an .item() — both are
-            // standard.
-            let alpha_t = Tensor::from_vec(
-                vec![adapter.alpha],
-                flame_core::Shape::from_dims(&[]),
-                self.device.clone(),
-            )
-            .and_then(|t| t.to_dtype(DType::BF16))
-            .map_err(|e| crate::EriDiffusionError::Lora(format!(
-                "alpha tensor for {prefix}: {e}")))?;
-            out.insert(format!("{prefix}.alpha"), alpha_t);
+        // Iterate `lora_target_prefixes` for deterministic order across
+        // legacy and LyCORIS bundles. Each prefix dispatches to whichever
+        // map has an entry (LyCORIS preferred when both are populated; in
+        // practice exactly one is non-empty per run).
+        for (i, prefix) in self.lora_target_prefixes.iter().enumerate() {
+            if let Some(lyc) = self.lycoris_adapters.get(prefix) {
+                for (leaf, t) in lyc.named_tensors() {
+                    out.insert(format!("{prefix}.{leaf}"), t);
+                }
+                // SDXL audit H6: companion `.alpha` scalar applies to
+                // LyCORIS bundles too (downstream loaders compute
+                // scale=alpha/rank from this when present).
+                let alpha_t = Tensor::from_vec(
+                    vec![self.config.lora_alpha as f32],
+                    flame_core::Shape::from_dims(&[]),
+                    self.device.clone(),
+                )
+                .and_then(|t| t.to_dtype(DType::BF16))
+                .map_err(|e| crate::EriDiffusionError::Lora(format!(
+                    "alpha tensor for {prefix}: {e}")))?;
+                out.insert(format!("{prefix}.alpha"), alpha_t);
+            } else if let Some(adapter) = self.lora_adapters.get(i) {
+                adapter.save_tensors(prefix, &mut out)
+                    .map_err(|e| crate::EriDiffusionError::Lora(format!("save {prefix}: {e}")))?;
+                // SDXL audit H6: companion `.alpha` scalar (BF16 to match
+                // the rest of the LoRA tensors). 0-dim; loaders that expect
+                // 1-dim length-1 either work or do an .item() — both are
+                // standard.
+                let alpha_t = Tensor::from_vec(
+                    vec![adapter.alpha],
+                    flame_core::Shape::from_dims(&[]),
+                    self.device.clone(),
+                )
+                .and_then(|t| t.to_dtype(DType::BF16))
+                .map_err(|e| crate::EriDiffusionError::Lora(format!(
+                    "alpha tensor for {prefix}: {e}")))?;
+                out.insert(format!("{prefix}.alpha"), alpha_t);
+            }
         }
         flame_core::serialization::save_file(&out, std::path::Path::new(path))
             .map_err(|e| crate::EriDiffusionError::Safetensors(format!("save_file: {e}")))?;
@@ -619,6 +795,18 @@ impl TrainableModel for SDXLModel {
             return Err(crate::EriDiffusionError::Model(
                 "load_weights for full-FT SDXL not implemented yet".into(),
             ));
+        }
+        if self.algo != LycorisAlgo::None {
+            // Phase 2b limitation: in-place loading of LyCORIS weights into
+            // an existing bundle requires an algo-aware tensor walker (see
+            // `chroma::load_adapter_in_place`). Until that lands for SDXL,
+            // bail loudly so users don't silently get an empty bundle.
+            return Err(crate::EriDiffusionError::Lora(format!(
+                "load_weights into a LyCORIS bundle (algo={:?}) is not yet wired for SDXL — \
+                 reconstruct the bundle from disk via a future \
+                 `load_with_config` helper instead.",
+                self.algo
+            )));
         }
         let source = flame_core::serialization::load_file(
             std::path::Path::new(path), &self.device,
@@ -639,14 +827,46 @@ impl SDXLModel {
     /// `<prefix>.lora_A.weight` / `<prefix>.lora_B.weight`. The `.alpha` scalars
     /// that `save_weights` also writes are NOT Parameters and are intentionally
     /// skipped (alpha is restored from CkptHeader on load).
+    ///
+    /// Phase 2b: LyCORIS bundles emit `<prefix>.<leaf>` for every
+    /// [`AdapterModule::named_tensors`] entry zipped with `to_parameters`
+    /// (e.g. LoCon emits `lora_A.weight` / `lora_B.weight`; LoKr emits
+    /// `lokr_w1` / `lokr_w2_a` / `lokr_w2_b` etc.).
     pub fn named_parameters(&self) -> Vec<(String, Parameter)> {
-        let mut out = Vec::with_capacity(self.lora_adapters.len() * 2);
-        for (i, adapter) in self.lora_adapters.iter().enumerate() {
-            let prefix = &self.lora_target_prefixes[i];
-            out.push((format!("{prefix}.lora_A.weight"), adapter.lora_a().clone()));
-            out.push((format!("{prefix}.lora_B.weight"), adapter.lora_b().clone()));
+        let mut out = Vec::with_capacity(self.lora_target_prefixes.len() * 2);
+        for (i, prefix) in self.lora_target_prefixes.iter().enumerate() {
+            if let Some(lyc) = self.lycoris_adapters.get(prefix) {
+                let params = lyc.to_parameters();
+                let names = lyc.named_tensors();
+                for (param, (leaf, _)) in params.into_iter().zip(names.into_iter()) {
+                    out.push((format!("{prefix}.{leaf}"), param));
+                }
+            } else if let Some(adapter) = self.lora_adapters.get(i) {
+                out.push((format!("{prefix}.lora_A.weight"), adapter.lora_a().clone()));
+                out.push((format!("{prefix}.lora_B.weight"), adapter.lora_b().clone()));
+            }
         }
         out
+    }
+
+    /// Names parallel to `parameters()`. Each plain-LoRA adapter contributes
+    /// `(prefix.lora_A.weight, prefix.lora_B.weight)`; each LyCORIS adapter
+    /// contributes `prefix.<leaf>` for every entry returned by
+    /// [`AdapterModule::named_tensors`] (zipped with `to_parameters` order).
+    /// Used for grad-flow assertions.
+    pub fn parameter_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for (i, prefix) in self.lora_target_prefixes.iter().enumerate() {
+            if let Some(lyc) = self.lycoris_adapters.get(prefix) {
+                for (leaf, _) in lyc.named_tensors() {
+                    names.push(format!("{prefix}.{leaf}"));
+                }
+            } else if self.lora_adapters.get(i).is_some() {
+                names.push(format!("{prefix}.lora_A.weight"));
+                names.push(format!("{prefix}.lora_B.weight"));
+            }
+        }
+        names
     }
 }
 

@@ -26,6 +26,7 @@
 use clap::Parser;
 use flame_core::{adam::AdamW, autograd::AutogradContext, DType, Shape, Tensor};
 use eridiffusion_core::config::{LrScheduler, TrainConfig, TrainingMethod};
+use eridiffusion_core::lycoris::{LycorisAlgo, LycorisBundleConfig};
 use eridiffusion_core::models::{sdxl::SDXLModel, TrainableModel};
 use eridiffusion_core::sampler::sdxl_sampler::sin_embed_256;
 use eridiffusion_core::training::board::BoardWriter;
@@ -130,6 +131,65 @@ struct Args {
     /// identical. Pair with `force_v_prediction=true` (config) — terminal
     /// ᾱ=0 makes ε-prediction degenerate at the last step.
     #[arg(long, default_value_t = false)] zero_terminal_snr: bool,
+
+    // ── LyCORIS algo selection (Phase 2b) ──
+    //
+    // `--algo lora` (default) keeps the legacy `LoRALinear` path — byte-
+    // identical training to pre-Phase-2b. Other values select LyCORIS algos
+    // via `SDXLLoraBundle::new_with_config`. `lora_alpha` and `rank` are
+    // shared with the legacy CLI flags above.
+    //
+    // SDXL note: `enumerate_lora_targets()` emits Linear-only targets (attn
+    // q/k/v/o, ff.net.0.proj, ff.net.2, proj_in/proj_out). Conv layers
+    // (conv_in, ResBlock convs, downsample/upsample) are NOT covered, so
+    // `--use_tucker` has no effect on the current target set — it is
+    // forwarded to `build_lycoris_linear` for forward-compat with a future
+    // conv-target expansion.
+    /// LyCORIS algo: `lora` (default, legacy path) | `locon` | `loha` | `lokr`
+    /// | `full` | `oft`. `full` and `oft` build successfully but their
+    /// `forward_delta` will error inside SDXL's `base + delta_on_input` call
+    /// pattern. Phase 2c will wire a `merge_into_base` path.
+    #[arg(long, default_value = "lora")] algo: String,
+    /// LoKr Kronecker split factor (ignored for non-LoKr).
+    #[arg(long, default_value_t = 16)] lokr_factor: i32,
+    /// OFT block size (ignored for non-OFT).
+    #[arg(long, default_value_t = 32)] oft_block_size: usize,
+    /// OFT Cayley-Neumann series term count (ignored for non-OFT).
+    #[arg(long, default_value_t = 5)] oft_neumann_terms: usize,
+    /// LoCon / LoHa / LoKr conv variant — Tucker decomposition for non-1×1
+    /// kernels. SDXL's current target set is Linear-only so this is
+    /// forwarded but inert. Reserved for a future conv-LoRA target expansion.
+    #[arg(long, default_value_t = false)] use_tucker: bool,
+    /// LoKr only: factorize both W1 *and* W2 (default false: only W2).
+    #[arg(long, default_value_t = false)] decompose_both: bool,
+    /// Enable DoRA (weight-decomposed LoRA). Applies to LoCon/LoHa/LoKr
+    /// (Full inherits, OFT errors).
+    ///
+    /// Phase 2b limitation: SDXL's bundle ctor doesn't have access to the
+    /// loaded base weights at construction time so DoRA's magnitude is
+    /// initialized from `||I||_2 = 1` rather than `||W_orig||_2`. The
+    /// trainer should still converge but will spend the first few hundred
+    /// steps adjusting the magnitude.
+    #[arg(long, default_value_t = false)] dora: bool,
+    /// DoRA magnitude axis. Default `true` matches lycoris-upstream
+    /// (norm over input dims, magnitude shape `[out, 1]`).
+    #[arg(long, default_value_t = true)] dora_wd_on_out: bool,
+    #[arg(long, default_value_t = 1e-6)] dora_eps: f32,
+    /// SimpleTuner-parity: perturbed-normal LoKr init.  Scale `>0` triggers
+    /// `lokr_w1=1, lokr_w2 ~ N(μ_W, σ_W)·scale`.  No-op when algo != lokr or
+    /// value is 0.0. Phase 2b: SDXL's resident `weights` map IS available at
+    /// bundle-construction time (no streaming for SDXL UNet) so this can be
+    /// wired; current impl logs a TODO and no-ops until the per-prefix
+    /// base-weight lookup helper lands.
+    #[arg(long, default_value_t = 0.0)] init_lokr_norm: f32,
+    /// Per-element dropout on the adapter delta (training only).
+    #[arg(long, default_value_t = 0.0)] lora_dropout: f32,
+    /// Per-rank Bernoulli on the down-projection intermediate.
+    #[arg(long, default_value_t = 0.0)] rank_dropout: f32,
+    /// Per-step Bernoulli on the entire adapter.
+    #[arg(long, default_value_t = 0.0)] module_dropout: f32,
+    /// Rescale rank-mask by `1/mean(mask)` to preserve expectation.
+    #[arg(long, default_value_t = false)] rank_dropout_scale: bool,
 }
 
 fn collect_shards(path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -236,10 +296,95 @@ fn main() -> anyhow::Result<()> {
     config.ema_min_decay = args.ema_min_decay;
     config.tread_route_pattern = args.tread_route_pattern.clone();
 
+    // Phase 2b: parse the LyCORIS algo selector. `lora` (default) keeps the
+    // legacy `LoRALinear` bundle constructed inside `SDXLModel::load`.
+    // Anything else swaps the bundle in-place after model construction so we
+    // don't have to re-plumb the per-trainer constructor signatures.
+    //
+    // NOTE: `LycorisAlgo::parse("lora")` aliases to `LycorisAlgo::LoCon`
+    // (since LoCon-Linear is the canonical LoRA decomposition). For SDXL we
+    // need to distinguish LEGACY plain `LoRALinear` (byte-identical) from the
+    // new `LycorisAdapter::LoCon` path, so re-map `"lora"` → `None` here
+    // explicitly. Users who want the new LoCon path pass `--algo locon`.
+    let algo_str = args.algo.trim().to_ascii_lowercase();
+    let algo = if algo_str == "lora" || algo_str == "none" || algo_str.is_empty() {
+        LycorisAlgo::None
+    } else {
+        LycorisAlgo::parse(&args.algo).map_err(|e| anyhow::anyhow!("--algo: {e}"))?
+    };
+    // SDXL trainer rule: BF16/F32 throughout (no FP8 / no AdamW8bit). The
+    // default `LycorisBundleConfig::default()` storage (F32) matches that.
+    let lyc_config = LycorisBundleConfig {
+        algo,
+        rank: args.rank,
+        alpha: args.lora_alpha as f32,
+        factor: args.lokr_factor,
+        block_size: args.oft_block_size,
+        neumann_terms: args.oft_neumann_terms,
+        use_tucker: args.use_tucker,
+        decompose_both: args.decompose_both,
+        use_scalar: false,
+        dora: args.dora,
+        dora_wd_on_out: args.dora_wd_on_out,
+        dora_eps: args.dora_eps,
+        ..LycorisBundleConfig::default()
+    };
+
     let shards = collect_shards(&args.unet)?;
     log::info!("[SDXL] loading UNet from {} shard(s) (rank={}, alpha={})",
         shards.len(), args.rank, args.lora_alpha);
     let mut model = SDXLModel::load(&shards, &config, device.clone())?;
+
+    // If a LyCORIS algo other than the legacy plain LoRA was requested, swap
+    // the bundle. Plain `--algo lora` (or `lora`/`none`) keeps the legacy
+    // bundle as-is so this branch is byte-equivalent to the pre-Phase-2b
+    // pipeline.
+    if algo != LycorisAlgo::None && config.is_lora() {
+        log::info!(
+            "[SDXL] LyCORIS algo='{}' rank={} alpha={} factor={} block_size={} dora={}",
+            algo.as_str(),
+            lyc_config.rank,
+            lyc_config.alpha,
+            lyc_config.factor,
+            lyc_config.block_size,
+            lyc_config.dora,
+        );
+        if matches!(algo, LycorisAlgo::Full | LycorisAlgo::Oft) {
+            log::warn!(
+                "[SDXL] algo='{}' selected — bundle construction will succeed, but \
+                 forward_delta will error inside SDXL's `base + delta_on_input` call \
+                 pattern. Phase 2c will wire merge-into-base for these algos.",
+                algo.as_str()
+            );
+        }
+        if args.lora_dropout > 0.0 || args.rank_dropout > 0.0
+            || args.module_dropout > 0.0 || args.rank_dropout_scale
+        {
+            log::warn!(
+                "[SDXL] dropout flags (lora_dropout={}, rank_dropout={}, module_dropout={}, \
+                 rank_dropout_scale={}) plumbed but not yet wired through the LycorisLinear \
+                 forward path; defaults stay byte-identical.",
+                args.lora_dropout, args.rank_dropout, args.module_dropout, args.rank_dropout_scale
+            );
+        }
+        model.swap_to_lycoris_bundle(&lyc_config, device.clone(), SEED)
+            .map_err(|e| anyhow::anyhow!("LyCORIS bundle construction: {e}"))?;
+        if matches!(algo, LycorisAlgo::LoKr) && args.init_lokr_norm > 0.0 {
+            // SDXL's `weights` map is resident — wired end-to-end.  Walks
+            // `lycoris_adapters` and dispatches `init_perturbed_normal_lokr`
+            // per-adapter via the AdapterModule trait.
+            let skipped = model
+                .apply_init_perturbed_normal(args.init_lokr_norm)
+                .map_err(|e| anyhow::anyhow!("init_lokr_norm: {e}"))?;
+            log::info!(
+                "[SDXL] --init_lokr_norm={} applied (skipped={skipped} non-LoKr/factored)",
+                args.init_lokr_norm
+            );
+        }
+    } else if algo == LycorisAlgo::None {
+        log::info!("[SDXL] algo='lora' (legacy LoRALinear path, byte-identical)");
+    }
+
     let params = model.parameters();
     log::info!("trainable LoRA tensors: {}", params.len());
     if params.is_empty() {

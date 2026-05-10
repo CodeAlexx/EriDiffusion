@@ -13,6 +13,7 @@ use clap::Parser;
 use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
 use flame_core::adam::AdamW;
 use flame_core::gradient_clip::GradientClipper;
+use eridiffusion_core::lycoris::{LycorisAlgo, LycorisBundleConfig};
 use eridiffusion_core::models::AceStepLoRAModel;
 use eridiffusion_core::training::board::BoardWriter;
 use eridiffusion_core::training::checkpoint::{self, CkptHeader};
@@ -126,6 +127,57 @@ struct Args {
     #[arg(long, default_value = "constant")] lr_scheduler: String,
     /// Phase 5: cosine-with-restarts cycle count. Ignored for other schedulers.
     #[arg(long, default_value_t = 1.0)] lr_cycles: f32,
+
+    // ── LyCORIS algo selection (Phase 2b) ──
+    //
+    // `--algo lora` (default) keeps the legacy plain `LoRALinear` path —
+    // byte-identical to pre-Phase-2b training. Other values build a
+    // `LycorisLinear` bundle via `AceStepLoRAModel::install_lycoris_bundle`.
+    // `lora_alpha` and `rank` are shared with the existing CLI flags above
+    // (no separate `--lycoris-rank`).
+    /// LyCORIS algo: `lora` (default, legacy path) | `locon` | `loha` | `lokr`
+    /// | `full` | `oft`. `full` and `oft` build successfully but their
+    /// `forward_delta` will error inside ACE-Step's `base + delta_on_input`
+    /// attention call pattern — Phase 2c will wire `merge_into_base`.
+    #[arg(long, default_value = "lora")] algo: String,
+    /// LoKr Kronecker split factor (ignored for non-LoKr).
+    #[arg(long, default_value_t = 16)] lokr_factor: i32,
+    /// OFT block size (ignored for non-OFT).
+    #[arg(long, default_value_t = 32)] oft_block_size: usize,
+    /// OFT Cayley-Neumann series term count (ignored for non-OFT).
+    #[arg(long, default_value_t = 5)] oft_neumann_terms: usize,
+    /// LoCon / LoHa / LoKr conv variant — Tucker decomposition for non-1×1
+    /// kernels. ACE-Step's LoRA targets (Q/K/V/O) are linear-only so this is
+    /// currently a no-op.
+    #[arg(long, default_value_t = false)] use_tucker: bool,
+    /// LoKr only: factorize both W1 *and* W2 (default false: only W2).
+    #[arg(long, default_value_t = false)] decompose_both: bool,
+    /// Enable DoRA (weight-decomposed LoRA). Applies to LoCon/LoHa/LoKr
+    /// (Full inherits, OFT errors).
+    ///
+    /// Phase 2b limitation: ACE-Step's bundle ctor doesn't read the resident
+    /// base weights at construction time, so DoRA's magnitude is initialized
+    /// from `||I||_2 = 1` rather than `||W_orig||_2`. Trainer should still
+    /// converge — first few hundred steps adjust the magnitude. Phase 2c
+    /// will wire pre-load magnitude init.
+    #[arg(long, default_value_t = false)] dora: bool,
+    /// DoRA magnitude axis. Default `true` matches lycoris-upstream
+    /// (norm over input dims, magnitude shape `[out, 1]`).
+    #[arg(long, default_value_t = true)] dora_wd_on_out: bool,
+    #[arg(long, default_value_t = 1e-6)] dora_eps: f32,
+    /// SimpleTuner-parity perturbed-normal LoKr init. No-op for ACE-Step in
+    /// Phase 2b (base-weight-by-target lookup not plumbed — the resident
+    /// `weights` map is keyed by string, and the per-target lookup helper
+    /// would mirror `AceStepLoraTarget::suffix()`. Phase 2c will wire it).
+    #[arg(long, default_value_t = 0.0)] init_lokr_norm: f32,
+    /// Per-element dropout on the adapter delta (training only).
+    #[arg(long, default_value_t = 0.0)] lora_dropout: f32,
+    /// Per-rank Bernoulli on the down-projection intermediate.
+    #[arg(long, default_value_t = 0.0)] rank_dropout: f32,
+    /// Per-step Bernoulli on the entire adapter.
+    #[arg(long, default_value_t = 0.0)] module_dropout: f32,
+    /// Rescale rank-mask by `1/mean(mask)` to preserve expectation.
+    #[arg(long, default_value_t = false)] rank_dropout_scale: bool,
 }
 
 /// Apply CFG dropout: with probability `cfg_ratio`, replace `encoder_hs` with
@@ -161,9 +213,72 @@ fn main() -> anyhow::Result<()> {
 
     log::info!("Loading ACE-Step DiT (rank={} alpha={}) from {}...",
         args.rank, args.lora_alpha, args.model.display());
-    let model = AceStepLoRAModel::from_safetensors(
+    let mut model = AceStepLoRAModel::from_safetensors(
         &args.model, args.rank, args.lora_alpha, device.clone(),
     )?;
+
+    // Phase 2b: parse the LyCORIS algo selector. `--algo lora` (or `none` /
+    // empty) keeps the legacy `LoRALinear` bundle that
+    // `AceStepLoRAModel::from_safetensors` already built, so the default
+    // path is byte-equivalent to pre-Phase-2b training. Anything else swaps
+    // the bundle in-place via `install_lycoris_bundle`.
+    //
+    // NOTE: `LycorisAlgo::parse("lora")` aliases to `LycorisAlgo::LoCon`
+    // (LoCon-Linear is the canonical LoRA decomposition). For ACE-Step we
+    // need to distinguish LEGACY plain `LoRALinear` (byte-identical) from
+    // the new `LycorisAdapter::LoCon` path, so re-map `"lora"` → `None`
+    // explicitly. Users wanting the new LoCon adapter pass `--algo locon`.
+    let algo_str = args.algo.trim().to_ascii_lowercase();
+    let algo = if algo_str == "lora" || algo_str == "none" || algo_str.is_empty() {
+        LycorisAlgo::None
+    } else {
+        LycorisAlgo::parse(&args.algo).map_err(|e| anyhow::anyhow!("--algo: {e}"))?
+    };
+    let lyc_config = LycorisBundleConfig {
+        algo,
+        rank: args.rank,
+        alpha: args.lora_alpha,
+        factor: args.lokr_factor,
+        block_size: args.oft_block_size,
+        neumann_terms: args.oft_neumann_terms,
+        use_tucker: args.use_tucker,
+        decompose_both: args.decompose_both,
+        use_scalar: false,
+        dora: args.dora,
+        dora_wd_on_out: args.dora_wd_on_out,
+        dora_eps: args.dora_eps,
+        ..LycorisBundleConfig::default()
+    };
+
+    if algo != LycorisAlgo::None {
+        log::info!(
+            "[ACE-Step] LyCORIS algo='{}' rank={} alpha={} factor={} block_size={} dora={}",
+            algo.as_str(),
+            lyc_config.rank,
+            lyc_config.alpha,
+            lyc_config.factor,
+            lyc_config.block_size,
+            lyc_config.dora,
+        );
+        if matches!(algo, LycorisAlgo::Full | LycorisAlgo::Oft) {
+            log::warn!(
+                "[ACE-Step] algo='{}' selected — bundle construction will succeed, but \
+                 forward_delta will error inside ACE-Step's `base + delta_on_input` \
+                 attention call pattern. Phase 2c will wire merge-into-base.",
+                algo.as_str()
+            );
+        }
+        model.install_lycoris_bundle(&lyc_config, device.clone(), SEED_DEFAULT)
+            .map_err(|e| anyhow::anyhow!("LyCORIS bundle install: {e}"))?;
+    } else {
+        log::info!("[ACE-Step] algo='lora' (legacy LoRALinear path, byte-identical)");
+    }
+
+    // Reference-only: silence unused-warning for dropout/init flags wired in
+    // Block 2 but not yet plumbed past `LycorisBundleConfig` (Phase 2c).
+    let _ = (args.init_lokr_norm, args.lora_dropout, args.rank_dropout,
+             args.module_dropout, args.rank_dropout_scale);
+
     let params = model.parameters();
     log::info!("Loaded {} trainable LoRA tensors ({} layers, hidden={})",
         params.len(), model.config().num_layers, model.config().hidden_size);
