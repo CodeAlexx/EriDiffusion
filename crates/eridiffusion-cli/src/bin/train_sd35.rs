@@ -1071,6 +1071,28 @@ fn main() -> anyhow::Result<()> {
 
         let grads = loss.backward()?;
 
+        // Grad-flow diagnostic.  Runs at step 1 — NOT step 0 — because every
+        // LoRA-style algo (LoRA, LoCon, LoHa, LoKr) initializes one factor
+        // at zero so `delta = factor_a @ factor_b = 0` at step 0.  Backward
+        // through `delta * weight` then forces half the leaves to zero
+        // gradient by mathematical construction.  Step 1 (after the first
+        // optimizer step has driven the zero leaves off zero) is when the
+        // assertion can distinguish "real bug" from "expected zero-init
+        // pattern".  See flame-core/docs/TRAINER_DIAGNOSTICS.md.
+        if step == 1 {
+            let named = model.named_parameters();
+            let named_refs: Vec<(&str, &flame_core::parameter::Parameter)> = named
+                .iter()
+                .map(|(n, p)| (n.as_str(), p))
+                .collect();
+            let report = flame_core::diagnostics::assert_grad_flow(&grads, &named_refs)?;
+            if report.is_clean() {
+                log::info!("[grad-flow] step 2 clean ({} params)", report.ok_count);
+            } else {
+                log::warn!("{}", report.summary());
+            }
+        }
+
         // Fusion Sprint Phase 5: device-resident global L2 norm — one D2H per step.
         let grad_refs: Vec<&flame_core::Tensor> = params
             .iter()

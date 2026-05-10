@@ -960,6 +960,37 @@ fn main() -> anyhow::Result<()> {
 
         // --- 7. Backward + clip-grad-norm + step (only the active expert)
         let grads = loss.backward()?;
+
+        // Grad-flow diagnostic.  Runs at step 1 — NOT step 0 — because every
+        // LoRA-style algo (LoRA, LoCon, LoHa, LoKr) initializes one factor
+        // at zero so `delta = factor_a @ factor_b = 0` at step 0.  Backward
+        // through `delta * weight` then forces half the leaves to zero
+        // gradient by mathematical construction.  Step 1 (after the first
+        // optimizer step has driven the zero leaves off zero) is when the
+        // assertion can distinguish "real bug" from "expected zero-init
+        // pattern".  Wan22 is dual-expert: assert on whichever bundle was
+        // active this step (only the active expert's params receive grads).
+        // See flame-core/docs/TRAINER_DIAGNOSTICS.md.
+        if step == 1 {
+            let (label, named) = match chosen {
+                Expert::Low => ("wan22-low", low_model.lora.named_parameters()),
+                Expert::High => match high_model.as_ref() {
+                    Some(hm) => ("wan22-high", hm.lora.named_parameters()),
+                    None => ("wan22-low", low_model.lora.named_parameters()),
+                },
+            };
+            let named_refs: Vec<(&str, &flame_core::parameter::Parameter)> = named
+                .iter()
+                .map(|(n, p)| (n.as_str(), p))
+                .collect();
+            let report = flame_core::diagnostics::assert_grad_flow(&grads, &named_refs)?;
+            if report.is_clean() {
+                log::info!("[grad-flow] step 2 clean ({}: {} params)", label, report.ok_count);
+            } else {
+                log::warn!("[grad-flow] {}: {}", label, report.summary());
+            }
+        }
+
         // Audit H10: at step 1 (and every save_every), check what fraction
         // of the active expert's LoRA params have non-zero gradient. <95%
         // is the chroma-bug signature.
