@@ -1051,26 +1051,25 @@ impl KleinModel {
             .map(|v| v != "0").unwrap_or(true);
 
         // ---- Double blocks ----
+        // Wrapped in `AutogradContext::checkpoint` (same pattern as the
+        // single blocks below). Pre-2026-05-10 this loop ran the block
+        // forward eagerly and retained all activations across all double
+        // blocks for backward — which OOM'd on klein 9B (inner=4096) at
+        // step 0 of LoKr training (8 double blocks × wide activations
+        // saturate the 24 GB card). Now: the closure captures only the
+        // offloader Arc + prefix + LoRA slice (no GPU storage), runs the
+        // forward, and concats `(new_img, new_txt)` into a single output
+        // for the checkpoint API. After the call we `narrow` back into
+        // img / txt — same pattern chroma uses (chroma.rs:1352-1376).
+        // Backward re-runs the closure to recompute activations rather
+        // than storing them, trading ~33% extra forward compute for the
+        // ability to fit klein 9B + LoKr in 24 GB.
         let mut img = img_proj;
         let mut txt = txt_proj;
+        let img_mods_arc = std::sync::Arc::new(img_mods.clone());
+        let txt_mods_arc = std::sync::Arc::new(txt_mods.clone());
         for i in 0..self.kconfig.num_double {
             let prefix = format!("double_blocks.{i}.");
-            // BlockOffloader: stream block i from pinned host RAM into GPU slot.
-            if let Some(ref off) = self.offloader {
-                let arc = off.lock()
-                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
-                    .ensure_block(i)
-                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader ensure_block({i}): {e}")))?;
-                for (k, v) in arc.iter() {
-                    self.weights.insert(k.clone(), v.clone());
-                }
-            }
-
-            // Snapshot weights into a self-contained map for the closure.
-            let mut layer_weights: HashMap<String, Tensor> = HashMap::new();
-            for (k, v) in self.weights.iter() {
-                if k.starts_with(&prefix) { layer_weights.insert(k.clone(), v.clone()); }
-            }
             let lora_base = i * DOUBLE_LORA_SLOTS;
             let lora: Option<BlockAdapterSlice> = if self.is_lora {
                 if let Some(ref lyc) = self.lyc_adapters {
@@ -1086,38 +1085,96 @@ impl KleinModel {
 
             let img_in = img.clone();
             let txt_in = txt.clone();
-            let img_mods_c = img_mods.clone();
-            let txt_mods_c = txt_mods.clone();
+            let img_seq_len = img.shape().dims()[1];
+            let img_mods_c = img_mods_arc.clone();
+            let txt_mods_c = txt_mods_arc.clone();
             let pe_cos_c = pe_cos.clone();
             let pe_sin_c = pe_sin.clone();
             let nh = self.kconfig.num_heads;
             let hd = self.kconfig.head_dim;
+            let bi = i;
 
-            let (new_img, new_txt) = if use_checkpoint {
-                // checkpoint takes one closure -> Result<Tensor>; for two
-                // outputs we cat them and split after. To keep code simple
-                // when checkpointing both streams, we run without checkpoint
-                // here and instead checkpoint single blocks (which dominate
-                // depth). Mirrors flame-diffusion's klein-trainer choice.
-                double_block_forward_standalone(
-                    img_in, txt_in, img_mods_c, txt_mods_c, pe_cos_c, pe_sin_c,
-                    layer_weights, lora, i, nh, hd, inner,
+            // Same closure-capture discipline as the single-block loop:
+            // when offloading, capture only `(offloader, unified_idx,
+            // prefix)`; the closure re-fetches the block via `ensure_block`
+            // on every call so backward replay works. When not offloading,
+            // capture the resident GPU-tensor snapshot (cheap clones).
+            let mut layer_weights: HashMap<String, Tensor> = HashMap::new();
+            if self.offloader.is_none() {
+                for (k, v) in self.weights.iter() {
+                    if k.starts_with(&prefix) { layer_weights.insert(k.clone(), v.clone()); }
+                }
+            }
+            let offloader_for_closure = self.offloader.clone();
+            let prefix_for_closure = prefix.clone();
+
+            let block_out = if use_checkpoint {
+                flame_core::autograd::AutogradContext::checkpoint(
+                    &[img_in.clone(), txt_in.clone()],
+                    move || {
+                        let lw: HashMap<String, Tensor> = if let Some(ref off) = offloader_for_closure {
+                            let arc = off.lock()
+                                .map_err(|e| flame_core::FlameError::InvalidInput(
+                                    format!("Klein double {bi}: offloader lock: {e}")))?
+                                .ensure_block(bi)
+                                .map_err(|e| flame_core::FlameError::InvalidInput(
+                                    format!("Klein double {bi}: offloader ensure_block({bi}): {e}")))?;
+                            let mut m = HashMap::with_capacity(arc.len());
+                            for (k, v) in arc.iter() {
+                                if k.starts_with(&prefix_for_closure) { m.insert(k.clone(), v.clone()); }
+                            }
+                            m
+                        } else {
+                            layer_weights.clone()
+                        };
+                        let (ni, nt) = double_block_forward_standalone(
+                            img_in.clone(), txt_in.clone(),
+                            (*img_mods_c).clone(), (*txt_mods_c).clone(),
+                            pe_cos_c.clone(), pe_sin_c.clone(),
+                            lw, lora.clone(), bi, nh, hd, inner,
+                        )?;
+                        // Concat `(new_img, new_txt)` along the seq dim so
+                        // the checkpoint API (single output) works. We
+                        // narrow back to (img, txt) after the call.
+                        Tensor::cat(&[&ni, &nt], 1)
+                    },
                 )?
             } else {
-                double_block_forward_standalone(
-                    img_in, txt_in, img_mods_c, txt_mods_c, pe_cos_c, pe_sin_c,
-                    layer_weights, lora, i, nh, hd, inner,
-                )?
+                // Eager / non-checkpoint path. Pre-2026-05-10 behavior;
+                // kept as a fallback when KLEIN_GRAD_CHECKPOINT=0 is set
+                // for debugging or for very small datasets where the
+                // recompute cost exceeds the memory savings.
+                if let Some(ref off) = offloader_for_closure {
+                    let arc = off.lock()
+                        .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
+                        .ensure_block(bi)
+                        .map_err(|e| crate::EriDiffusionError::Model(format!("offloader ensure_block({bi}): {e}")))?;
+                    for (k, v) in arc.iter() {
+                        if k.starts_with(&prefix_for_closure) { layer_weights.insert(k.clone(), v.clone()); }
+                    }
+                }
+                let (ni, nt) = double_block_forward_standalone(
+                    img_in.clone(), txt_in.clone(),
+                    (*img_mods_c).clone(), (*txt_mods_c).clone(),
+                    pe_cos_c.clone(), pe_sin_c.clone(),
+                    layer_weights, lora.clone(), bi, nh, hd, inner,
+                )?;
+                if let Some(ref off) = offloader_for_closure {
+                    off.lock()
+                        .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
+                        .evict_block();
+                }
+                Tensor::cat(&[&ni, &nt], 1)?
             };
-            img = new_img;
-            txt = new_txt;
-            // Evict double block i from weights and release GPU slot.
-            if let Some(ref off) = self.offloader {
-                self.weights.retain(|k, _| !k.starts_with(&prefix));
-                off.lock()
-                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
-                    .evict_block();
-            }
+
+            // Split `block_out` back into (img, txt) along the seq dim.
+            // Chroma uses the same narrow-after-cat pattern. Recording
+            // the narrow ops (~2 entries per block) is negligible vs the
+            // checkpoint's recompute graph and keeps the autograd chain
+            // alive into the next block.
+            let total_seq = block_out.shape().dims()[1];
+            img = block_out.narrow(1, 0, img_seq_len)?;
+            txt = block_out.narrow(1, img_seq_len, total_seq - img_seq_len)?;
         }
 
         // ---- Single blocks (txt-then-img) ----
