@@ -22,7 +22,6 @@
 
 use clap::Parser;
 use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
-use flame_core::adam::AdamW;
 use rand::distributions::Distribution as _;
 use std::path::PathBuf;
 
@@ -39,7 +38,7 @@ use eridiffusion_core::training::features::{
     caption_dropout, loss_weight, lr_schedule, noise_modifiers, timestep_bias,
     validation::ValidationLoop,
 };
-use eridiffusion_core::training::training_features::OptimizerKind;
+use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
 use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
 use std::str::FromStr as _;
 
@@ -406,15 +405,16 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("No trainable parameters — ZImageModel produced empty param list");
     }
 
-    match OptimizerKind::parse(&args.optimizer) {
-        Ok(OptimizerKind::AdamW) => {}
-        Ok(other) => log::warn!(
-            "non-AdamW optimizer selected: {} — Phase 1 falls back to AdamW (full dispatch in Phase 5)",
-            other.as_str()
-        ),
-        Err(e) => log::warn!("--optimizer parse: {} — falling back to AdamW", e),
+    let opt_kind = OptimizerKind::parse(&args.optimizer)
+        .map_err(|e| anyhow::anyhow!("--optimizer: {e}"))?;
+    if matches!(opt_kind, OptimizerKind::AdamW8bit) {
+        anyhow::bail!(
+            "AdamW8bit is forbidden for Z-Image (no-quantization rule per \
+             `feedback_zimage_no_quantization.md`). Use `--optimizer adamw` or another non-quantized optimizer."
+        );
     }
-    let mut opt = AdamW::new(args.lr, 0.9, 0.999, 1e-8, 0.01);
+    log::info!("[Z-Image] optimizer={}", opt_kind.as_str());
+    let mut opt = Optimizer::new(opt_kind, args.lr, 0.9, 0.999, 1e-8, 0.01);
 
     // EMA shadow (Phase 3). See train_klein.rs for the same pattern.
     let ema_cfg = EmaConfig {
@@ -474,7 +474,14 @@ fn main() -> anyhow::Result<()> {
         let loaded = checkpoint::load_full(resume_path, &device)?;
         let named = model.bundle.named_parameters();
         checkpoint::apply_lora_weights(&loaded, &named)?;
-        checkpoint::apply_to_optimizer(&loaded, &mut opt, &named, args.rank, args.lora_alpha)?;
+        if let Optimizer::AdamW(ref mut adam) = opt {
+            checkpoint::apply_to_optimizer(&loaded, adam, &named, args.rank, args.lora_alpha)?;
+        } else {
+            log::warn!(
+                "[resume-full] non-AdamW resume not yet implemented for {:?}; LoRA weights restored, optimizer state reset",
+                opt.kind()
+            );
+        }
         model.refresh_lora_cache();
         start_step = loaded.header.step as usize;
         if start_step >= args.steps {
@@ -1037,18 +1044,28 @@ fn main() -> anyhow::Result<()> {
         if save_now {
             let mid_ckpt = args.output_dir.join(format!("zimage_lora_step{step_num}.safetensors"));
             if save_mode_full {
-                let header = CkptHeader::from_adamw(
-                    "train_zimage",
-                    step_num as u64,
-                    &opt,
-                    args.rank,
-                    args.lora_alpha,
-                    SEED,
-                    String::new(),
-                );
-                let named = model.bundle.named_parameters();
-                if let Err(e) = checkpoint::save_full(&mid_ckpt, &named, &opt, &header) {
-                    log::warn!("[mid-save step {step_num}] full save failed: {e}");
+                if let Optimizer::AdamW(ref adam) = opt {
+                    let header = CkptHeader::from_adamw(
+                        "train_zimage",
+                        step_num as u64,
+                        adam,
+                        args.rank,
+                        args.lora_alpha,
+                        SEED,
+                        String::new(),
+                    );
+                    let named = model.bundle.named_parameters();
+                    if let Err(e) = checkpoint::save_full(&mid_ckpt, &named, adam, &header) {
+                        log::warn!("[mid-save step {step_num}] full save failed: {e}");
+                    }
+                } else {
+                    log::warn!(
+                        "[mid-save step {step_num}] full-state save not yet implemented for {:?}; saving weights only",
+                        opt.kind()
+                    );
+                    if let Err(e) = model.bundle.save(&mid_ckpt) {
+                        log::warn!("[mid-save step {step_num}] weights save failed: {e}");
+                    }
                 }
             } else {
                 if let Err(e) = model.bundle.save(&mid_ckpt) {
@@ -1104,17 +1121,25 @@ fn main() -> anyhow::Result<()> {
 
     let ckpt = args.output_dir.join(format!("zimage_lora_{}steps.safetensors", args.steps));
     if save_mode_full {
-        let header = CkptHeader::from_adamw(
-            "train_zimage",
-            total_steps as u64,
-            &opt,
-            args.rank,
-            args.lora_alpha,
-            SEED,
-            String::new(),
-        );
-        let named = model.bundle.named_parameters();
-        checkpoint::save_full(&ckpt, &named, &opt, &header)?;
+        if let Optimizer::AdamW(ref adam) = opt {
+            let header = CkptHeader::from_adamw(
+                "train_zimage",
+                total_steps as u64,
+                adam,
+                args.rank,
+                args.lora_alpha,
+                SEED,
+                String::new(),
+            );
+            let named = model.bundle.named_parameters();
+            checkpoint::save_full(&ckpt, &named, adam, &header)?;
+        } else {
+            log::warn!(
+                "[final] full-state save not yet implemented for {:?}; saving weights only",
+                opt.kind()
+            );
+            model.save_weights(&ckpt)?;
+        }
     } else {
         model.save_weights(&ckpt)?;
     }

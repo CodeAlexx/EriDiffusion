@@ -37,7 +37,7 @@
 //! FLUX-family trainers (Klein/Flux).
 
 use clap::Parser;
-use flame_core::{adam::AdamW, autograd::AutogradContext, DType, Shape, Tensor};
+use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
 use eridiffusion_core::config::{LrScheduler, TrainConfig, TrainingMethod};
 use eridiffusion_core::encoders::flux_vae::{SCALE, SHIFT};
 use eridiffusion_core::lycoris::{LoraInitType, LycorisAlgo, LycorisBundleConfig};
@@ -50,7 +50,7 @@ use eridiffusion_core::training::features::validation::ValidationLoop;
 use eridiffusion_core::training::features::{loss_weight, lr_schedule, noise_modifiers, timestep_bias};
 use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
 use std::str::FromStr as _;
-use eridiffusion_core::training::training_features::OptimizerKind;
+use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
 use std::path::PathBuf;
 
 const NUM_TRAIN_TIMESTEPS: usize = 1000;
@@ -391,15 +391,11 @@ fn main() -> anyhow::Result<()> {
     }
 
     // OT preset optimizer: AdamW(β=(0.9, 0.999), ε=1e-8, wd=0.01).
-    match OptimizerKind::parse(&args.optimizer) {
-        Ok(OptimizerKind::AdamW) => {}
-        Ok(other) => log::warn!(
-            "non-AdamW optimizer selected: {} — Phase 1 falls back to AdamW (full dispatch in Phase 5)",
-            other.as_str()
-        ),
-        Err(e) => log::warn!("--optimizer parse: {} — falling back to AdamW", e),
-    }
-    let mut opt = AdamW::new(args.lr, 0.9, 0.999, 1e-8, 0.01);
+    // Phase B (2026-05-10): unified Optimizer enum dispatches all kinds.
+    let opt_kind = OptimizerKind::parse(&args.optimizer)
+        .map_err(|e| anyhow::anyhow!("--optimizer: {e}"))?;
+    log::info!("[Chroma] optimizer={}", opt_kind.as_str());
+    let mut opt = Optimizer::new(opt_kind, args.lr, 0.9, 0.999, 1e-8, 0.01);
 
     // EMA shadow.
     let ema_cfg = EmaConfig {

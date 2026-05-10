@@ -11,7 +11,6 @@
 
 use clap::Parser;
 use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
-use flame_core::adam::AdamW;
 use flame_core::gradient_clip::GradientClipper;
 use eridiffusion_core::lycoris::{LoraInitType, LycorisAlgo, LycorisBundleConfig};
 use eridiffusion_core::models::AceStepLoRAModel;
@@ -24,7 +23,7 @@ use eridiffusion_core::training::features::{
 };
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::schedule;
-use eridiffusion_core::training::training_features::OptimizerKind;
+use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
 use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::str::FromStr as _;
@@ -351,14 +350,9 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
-    match OptimizerKind::parse(&args.optimizer) {
-        Ok(OptimizerKind::AdamW) => {}
-        Ok(other) => log::warn!(
-            "non-AdamW optimizer selected: {} — Phase 1 falls back to AdamW (full dispatch in Phase 5)",
-            other.as_str()
-        ),
-        Err(e) => log::warn!("--optimizer parse: {} — falling back to AdamW", e),
-    }
+    let opt_kind = OptimizerKind::parse(&args.optimizer)
+        .map_err(|e| anyhow::anyhow!("--optimizer: {e}"))?;
+    log::info!("[ACE-Step] optimizer={}", opt_kind.as_str());
     // Phase 1: caption_dropout. ACE-Step has no inline encoder, so the user
     // supplies a `--null-text-cache` produced upstream on a single
     // empty-caption sample. We load `encoder_hidden_states` once and swap it
@@ -409,7 +403,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         None
     };
-    let mut optimizer = AdamW::new(args.lr, 0.9, 0.999, 1e-8, 0.01);
+    let mut optimizer = Optimizer::new(opt_kind, args.lr, 0.9, 0.999, 1e-8, 0.01);
     let mut start_step = 0usize;
 
     // EMA shadow (Phase 3 advanced). Built from current live params before
@@ -498,7 +492,14 @@ fn main() -> anyhow::Result<()> {
         let loaded = checkpoint::load_full(path, &device)?;
         let named = model.named_parameters();
         checkpoint::apply_lora_weights(&loaded, &named)?;
-        checkpoint::apply_to_optimizer(&loaded, &mut optimizer, &named, args.rank, args.lora_alpha)?;
+        if let Optimizer::AdamW(ref mut adam) = optimizer {
+            checkpoint::apply_to_optimizer(&loaded, adam, &named, args.rank, args.lora_alpha)?;
+        } else {
+            log::warn!(
+                "[resume-full] non-AdamW resume not yet implemented for {:?}; LoRA weights restored, optimizer state reset",
+                optimizer.kind()
+            );
+        }
         start_step = loaded.header.step as usize;
         if start_step >= args.steps {
             log::warn!("Resumed step ({start_step}) >= --steps ({}); nothing to do.", args.steps);
@@ -960,7 +961,7 @@ fn main() -> anyhow::Result<()> {
 fn save_ckpt(
     path: &std::path::Path,
     model: &AceStepLoRAModel,
-    optimizer: &AdamW,
+    optimizer: &Optimizer,
     rank: usize,
     alpha: f32,
     seed: u64,
@@ -972,17 +973,28 @@ fn save_ckpt(
         log::info!("[save] {} (weights only)", path.display());
         return Ok(());
     }
+    let adam = match optimizer {
+        Optimizer::AdamW(a) => a,
+        _ => {
+            log::warn!(
+                "[save] full-state save not yet implemented for {:?}; saving weights only",
+                optimizer.kind()
+            );
+            model.save_lora(path)?;
+            return Ok(());
+        }
+    };
     let header = CkptHeader::from_adamw(
         "train_acestep",
         step as u64,
-        optimizer,
+        adam,
         rank,
         alpha,
         seed,
         String::new(),
     );
     let named = model.named_parameters();
-    checkpoint::save_full(path, &named, optimizer, &header)
+    checkpoint::save_full(path, &named, adam, &header)
         .map_err(|e| anyhow::anyhow!("save_full: {e}"))?;
     Ok(())
 }

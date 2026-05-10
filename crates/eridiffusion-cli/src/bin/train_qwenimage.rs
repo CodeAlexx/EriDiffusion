@@ -15,7 +15,6 @@
 
 use clap::Parser;
 use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
-use flame_core::adam::AdamW;
 use flame_core::gradient_clip::GradientClipper;
 use eridiffusion_core::encoders::qwen25vl::Qwen25VLEncoder;
 use eridiffusion_core::lycoris::{LoraInitType, LycorisAlgo, LycorisBundleConfig};
@@ -29,7 +28,7 @@ use eridiffusion_core::training::features::{
     validation::ValidationLoop,
 };
 use eridiffusion_core::training::ema::ParameterEma;
-use eridiffusion_core::training::training_features::OptimizerKind;
+use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
 use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
 use std::str::FromStr as _;
 use rand::{rngs::StdRng, SeedableRng};
@@ -656,14 +655,9 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
-    match OptimizerKind::parse(&args.optimizer) {
-        Ok(OptimizerKind::AdamW) => {}
-        Ok(other) => log::warn!(
-            "non-AdamW optimizer selected: {} — Phase 1 falls back to AdamW (full dispatch in Phase 5)",
-            other.as_str()
-        ),
-        Err(e) => log::warn!("--optimizer parse: {} — falling back to AdamW", e),
-    }
+    let opt_kind = OptimizerKind::parse(&args.optimizer)
+        .map_err(|e| anyhow::anyhow!("--optimizer: {e}"))?;
+    log::info!("[Qwen-Image] optimizer={}", opt_kind.as_str());
     // Phase 1: caption_dropout. Qwen-Image has no inline encoder, so the user
     // supplies a `--null-text-cache` produced by `prepare_qwenimage` on a
     // single empty-caption sample. We load `text_embedding` once and swap it
@@ -702,7 +696,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         None
     };
-    let mut optimizer = AdamW::new(args.lr, 0.9, 0.999, 1e-8, 0.01);
+    let mut optimizer = Optimizer::new(opt_kind, args.lr, 0.9, 0.999, 1e-8, 0.01);
 
     // EMA shadow (Phase 3 advanced). Built from current live params (post
     // resume_lora / pre-step-0). Updated after each opt.step via
@@ -779,7 +773,14 @@ fn main() -> anyhow::Result<()> {
         let loaded = checkpoint::load_full(path, &device)?;
         let named = qwen_named_parameters(&model);
         checkpoint::apply_lora_weights(&loaded, &named)?;
-        checkpoint::apply_to_optimizer(&loaded, &mut optimizer, &named, args.rank, args.lora_alpha)?;
+        if let Optimizer::AdamW(ref mut adam) = optimizer {
+            checkpoint::apply_to_optimizer(&loaded, adam, &named, args.rank, args.lora_alpha)?;
+        } else {
+            log::warn!(
+                "[resume-full] non-AdamW resume not yet implemented for {:?}; LoRA weights restored, optimizer state reset",
+                optimizer.kind()
+            );
+        }
         start_step = loaded.header.step as usize;
         if start_step >= args.steps {
             log::warn!("Resumed step {} >= --steps {}; nothing to do.", start_step, args.steps);
@@ -1340,7 +1341,7 @@ fn load_te_weights(
 fn save_ckpt(
     path: &std::path::Path,
     model: &QwenImageTrainingModel,
-    optimizer: &AdamW,
+    optimizer: &Optimizer,
     rank: usize,
     alpha: f32,
     seed: u64,
@@ -1352,10 +1353,21 @@ fn save_ckpt(
         log::info!("[save] {} (weights only)", path.display());
         return Ok(());
     }
+    let adam = match optimizer {
+        Optimizer::AdamW(a) => a,
+        _ => {
+            log::warn!(
+                "[save] full-state save not yet implemented for {:?}; saving weights only",
+                optimizer.kind()
+            );
+            model.save_weights(path)?;
+            return Ok(());
+        }
+    };
     let header = CkptHeader::from_adamw(
         "train_qwenimage",
         step as u64,
-        optimizer,
+        adam,
         rank,
         alpha,
         seed,
@@ -1371,7 +1383,7 @@ fn save_ckpt(
         let _ = header;
         return Ok(());
     }
-    checkpoint::save_full(path, &named, optimizer, &header)
+    checkpoint::save_full(path, &named, adam, &header)
         .map_err(|e| anyhow::anyhow!("save_full: {e}"))?;
     Ok(())
 }

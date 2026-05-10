@@ -59,44 +59,19 @@ use eridiffusion_core::training::features::{
     ema_advanced::EmaConfig, loss_weight, lr_schedule, timestep_bias,
     validation::ValidationLoop,
 };
-use eridiffusion_core::training::training_features::OptimizerKind;
+use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
 use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
 use std::str::FromStr as _;
-use flame_core::adam::AdamW;
 use flame_core::autograd::AutogradContext;
 use flame_core::{DType, Shape, Tensor};
 
 const SEED: u64 = 42;
 const NUM_TRAIN_TIMESTEPS: f32 = 1000.0;
 
-/// Optimizer variant — wraps AdamW + AdamW8bit so the trainer's per-step
-/// step()/set_lr()/zero_grad() loop can dispatch by variant.
-/// 2026-05-09 audit M4 (Wan2.2 quant exception per `feedback_wan22_quant_exception`).
-enum WanOpt {
-    AdamW(AdamW),
-    AdamW8bit(eridiffusion_core::training::training_features::AdamW8bit),
-}
-
-impl WanOpt {
-    fn step(&mut self, params: &[flame_core::parameter::Parameter]) -> flame_core::Result<()> {
-        match self {
-            WanOpt::AdamW(o) => o.step(params),
-            WanOpt::AdamW8bit(o) => o.step(params),
-        }
-    }
-    fn zero_grad(&self, params: &[flame_core::parameter::Parameter]) {
-        match self {
-            WanOpt::AdamW(o) => o.zero_grad(params),
-            WanOpt::AdamW8bit(o) => o.zero_grad(params),
-        }
-    }
-    fn set_lr(&mut self, lr: f32) {
-        match self {
-            WanOpt::AdamW(o) => o.set_lr(lr),
-            WanOpt::AdamW8bit(o) => o.lr = lr,
-        }
-    }
-}
+// 2026-05-10 Phase B: dropped WanOpt local enum; trainer now uses the
+// unified `Optimizer` enum from eridiffusion_core (covers AdamW + 8 others).
+// Per `feedback_wan22_quant_exception`, AdamW8bit is the supported quant
+// exception for Wan2.2 — still selectable via `--optimizer adamw8bit`.
 
 #[derive(Parser)]
 struct Args {
@@ -618,29 +593,17 @@ fn main() -> anyhow::Result<()> {
     };
 
     // ── Optimizer per expert ────────────────────────────────────────────
-    // 2026-05-09 audit M4: AdamW8bit is now wired (was warn-and-fallback).
-    // Per `feedback_wan22_quant_exception` 8bit is the supported quant
-    // exception for Wan; saves ~3× optimizer state vs F32 AdamW.
+    // 2026-05-10 Phase B: unified `Optimizer` enum — full optimizer family
+    // is now dispatched (Prodigy / Lion / Adafactor / StableAdamW / etc).
+    // Per `feedback_wan22_quant_exception`, AdamW8bit remains supported.
     let opt_kind = OptimizerKind::parse(&args.optimizer)
         .map_err(|e| anyhow::anyhow!("--optimizer parse: {e}"))?;
-    let make_opt = || -> WanOpt {
-        match opt_kind {
-            OptimizerKind::AdamW    => WanOpt::AdamW(AdamW::new(args.lr, 0.9, 0.999, 1e-8, 0.01)),
-            OptimizerKind::AdamW8bit => WanOpt::AdamW8bit(eridiffusion_core::training::training_features::AdamW8bit::new(
-                args.lr, 0.9, 0.999, 1e-8, 0.01,
-            )),
-            other => {
-                log::warn!(
-                    "optimizer {} not implemented for wan trainer; falling back to AdamW",
-                    other.as_str()
-                );
-                WanOpt::AdamW(AdamW::new(args.lr, 0.9, 0.999, 1e-8, 0.01))
-            }
-        }
+    let make_opt = || -> Optimizer {
+        Optimizer::new(opt_kind, args.lr, 0.9, 0.999, 1e-8, 0.01)
     };
     log::info!("[wan22] optimizer={}", opt_kind.as_str());
     let mut opt_low = make_opt();
-    let mut opt_high: Option<WanOpt> = if dual { Some(make_opt()) } else { None };
+    let mut opt_high: Option<Optimizer> = if dual { Some(make_opt()) } else { None };
 
     let params_low = low_model.parameters();
     log::info!("[wan22:low] {} trainable LoRA tensors", params_low.len());

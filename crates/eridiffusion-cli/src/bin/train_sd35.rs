@@ -21,13 +21,12 @@
 use clap::Parser;
 use std::path::PathBuf;
 use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
-use flame_core::adam::AdamW;
 use eridiffusion_core::config::{LrScheduler, TrainConfig, TrainingMethod};
 use eridiffusion_core::lycoris::{LoraInitType, LycorisAlgo, LycorisBundleConfig};
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::ema_advanced::EmaConfig;
 use eridiffusion_core::training::features::{loss_weight, lr_schedule, noise_modifiers, timestep_bias, validation::ValidationLoop};
-use eridiffusion_core::training::training_features::OptimizerKind;
+use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
 use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
 use std::str::FromStr as _;
 use eridiffusion_core::debug as dbg;
@@ -675,14 +674,9 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("No trainable LoRA parameters — check model.is_lora and config.training_method");
     }
 
-    match OptimizerKind::parse(&args.optimizer) {
-        Ok(OptimizerKind::AdamW) => {}
-        Ok(other) => log::warn!(
-            "non-AdamW optimizer selected: {} — Phase 1 falls back to AdamW (full dispatch in Phase 5)",
-            other.as_str()
-        ),
-        Err(e) => log::warn!("--optimizer parse: {} — falling back to AdamW", e),
-    }
+    let opt_kind = OptimizerKind::parse(&args.optimizer)
+        .map_err(|e| anyhow::anyhow!("--optimizer: {e}"))?;
+    log::info!("[SD3.5] optimizer={}", opt_kind.as_str());
     let effective_caption_dropout_prob = args.caption_dropout_probability;
     // HIGH-1: OT-style 3 INDEPENDENT per-encoder Bernoullis. Each step,
     // CLIP-L / CLIP-G / T5 are zeroed independently with prob `p` each,
@@ -740,7 +734,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         None
     };
-    let mut opt = AdamW::new(args.lr, 0.9, 0.999, 1e-8, 0.01);
+    let mut opt = Optimizer::new(opt_kind, args.lr, 0.9, 0.999, 1e-8, 0.01);
 
     // EMA shadow (Phase 3). See train_klein.rs for the same pattern.
     let ema_cfg = EmaConfig {
@@ -806,7 +800,14 @@ fn main() -> anyhow::Result<()> {
         let loaded = checkpoint::load_full(resume_path, &device)?;
         let named = model.named_parameters();
         checkpoint::apply_lora_weights(&loaded, &named)?;
-        checkpoint::apply_to_optimizer(&loaded, &mut opt, &named, args.rank, args.lora_alpha as f32)?;
+        if let Optimizer::AdamW(ref mut adam) = opt {
+            checkpoint::apply_to_optimizer(&loaded, adam, &named, args.rank, args.lora_alpha as f32)?;
+        } else {
+            log::warn!(
+                "[resume-full] non-AdamW resume not yet implemented for {:?}; LoRA weights restored, optimizer state reset",
+                opt.kind()
+            );
+        }
         start_step = loaded.header.step as usize;
         if start_step >= args.steps {
             log::warn!("Resumed step ({start_step}) >= --steps ({}) — nothing to do.", args.steps);
@@ -1337,13 +1338,23 @@ fn main() -> anyhow::Result<()> {
         if args.save_every > 0 && step_num % args.save_every == 0 && step_num < args.steps {
             let mid_ckpt = args.output_dir.join(format!("sd35_lora_step{step_num}.safetensors"));
             if save_mode_full {
-                let header = CkptHeader::from_adamw(
-                    "train_sd35", step_num as u64, &opt,
-                    args.rank, args.lora_alpha as f32, SEED, String::new(),
-                );
-                let named = model.named_parameters();
-                if let Err(e) = checkpoint::save_full(&mid_ckpt, &named, &opt, &header) {
-                    log::warn!("[save step {step_num}] full save failed: {e}");
+                if let Optimizer::AdamW(ref adam) = opt {
+                    let header = CkptHeader::from_adamw(
+                        "train_sd35", step_num as u64, adam,
+                        args.rank, args.lora_alpha as f32, SEED, String::new(),
+                    );
+                    let named = model.named_parameters();
+                    if let Err(e) = checkpoint::save_full(&mid_ckpt, &named, adam, &header) {
+                        log::warn!("[save step {step_num}] full save failed: {e}");
+                    }
+                } else {
+                    log::warn!(
+                        "[save step {step_num}] full-state save not yet implemented for {:?}; saving weights only",
+                        opt.kind()
+                    );
+                    if let Err(e) = model.save_weights(&mid_ckpt.to_string_lossy()) {
+                        log::warn!("[save step {step_num}] weights-only save failed: {e}");
+                    }
                 }
             } else if let Err(e) = model.save_weights(&mid_ckpt.to_string_lossy()) {
                 log::warn!("[save step {step_num}] failed: {e}");
@@ -1393,15 +1404,27 @@ fn main() -> anyhow::Result<()> {
 
     let ckpt = args.output_dir.join(format!("sd35_lora_{}steps.safetensors", args.steps));
     if save_mode_full {
-        let header = CkptHeader::from_adamw(
-            "train_sd35", args.steps as u64, &opt,
-            args.rank, args.lora_alpha as f32, SEED, String::new(),
-        );
-        let named = model.named_parameters();
-        if let Err(e) = checkpoint::save_full(&ckpt, &named, &opt, &header) {
-            log::warn!("save_full failed: {e}");
+        if let Optimizer::AdamW(ref adam) = opt {
+            let header = CkptHeader::from_adamw(
+                "train_sd35", args.steps as u64, adam,
+                args.rank, args.lora_alpha as f32, SEED, String::new(),
+            );
+            let named = model.named_parameters();
+            if let Err(e) = checkpoint::save_full(&ckpt, &named, adam, &header) {
+                log::warn!("save_full failed: {e}");
+            } else {
+                log::info!("Saved checkpoint to {}", ckpt.display());
+            }
         } else {
-            log::info!("Saved checkpoint to {}", ckpt.display());
+            log::warn!(
+                "[final] full-state save not yet implemented for {:?}; saving weights only",
+                opt.kind()
+            );
+            if let Err(e) = model.save_weights(&ckpt.to_string_lossy()) {
+                log::warn!("weights-only save failed: {e}");
+            } else {
+                log::info!("Saved weights-only checkpoint to {}", ckpt.display());
+            }
         }
     } else if let Err(e) = model.save_weights(&ckpt.to_string_lossy()) {
         log::warn!("save_weights failed: {e}");
