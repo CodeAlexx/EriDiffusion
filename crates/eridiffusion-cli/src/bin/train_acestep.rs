@@ -18,7 +18,7 @@ use eridiffusion_core::training::board::BoardWriter;
 use eridiffusion_core::training::checkpoint::{self, CkptHeader};
 use eridiffusion_core::config::LrScheduler;
 use eridiffusion_core::training::features::{
-    ema_advanced::EmaConfig, loss_weight, lr_schedule, noise_modifiers, timestep_bias,
+    caption_dropout, ema_advanced::EmaConfig, loss_weight, lr_schedule, noise_modifiers, timestep_bias,
     validation::ValidationLoop,
 };
 use eridiffusion_core::training::ema::ParameterEma;
@@ -231,6 +231,12 @@ fn main() -> anyhow::Result<()> {
     }
     if args.validation_prompts_file.is_some() {
         log::warn!("--validation-prompts-file is Klein-only in Phase 2; ignored here");
+    }
+    if args.masked_loss_weight > 0.0 {
+        log::warn!(
+            "[masked-loss] --masked-loss-weight={:.3} requested but ACE-Step's audio-latent cache schema has no `latent_mask` field; flag is a no-op for this trainer.",
+            args.masked_loss_weight
+        );
     }
     flame_core::config::set_default_dtype(DType::BF16);
     let device = flame_core::global_cuda_device();
@@ -564,12 +570,7 @@ fn main() -> anyhow::Result<()> {
         // step swaps encoder_hidden_states with null cache. Default-off
         // (prob == 0.0 OR null_text == None) draws no rng.
         let encoder_hs = if let Some(ref nt) = null_text {
-            use rand::Rng;
-            if rng.r#gen::<f32>() < effective_caption_dropout_prob {
-                nt.clone()
-            } else {
-                encoder_hs
-            }
+            caption_dropout::maybe_drop_caption(&encoder_hs, nt, effective_caption_dropout_prob, &mut rng)?
         } else {
             encoder_hs
         };

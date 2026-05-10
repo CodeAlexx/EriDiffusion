@@ -35,7 +35,7 @@ use eridiffusion_core::config::LrScheduler;
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::ema_advanced::EmaConfig;
 use eridiffusion_core::training::features::{
-    caption_dropout, loss_weight, lr_schedule, noise_modifiers, timestep_bias,
+    loss_weight, lr_schedule, noise_modifiers, timestep_bias,
     validation::ValidationLoop,
 };
 use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
@@ -285,6 +285,12 @@ fn main() -> anyhow::Result<()> {
     }
     if args.validation_prompts_file.is_some() {
         log::warn!("--validation-prompts-file is Klein-only in Phase 2; ignored here");
+    }
+    if args.masked_loss_weight > 0.0 {
+        log::warn!(
+            "[masked-loss] --masked-loss-weight={:.3} requested but Z-Image's prepare_zimage cache schema has no `latent_mask` field; flag is a no-op for this trainer.",
+            args.masked_loss_weight
+        );
     }
     std::fs::create_dir_all(&args.output_dir)?;
 

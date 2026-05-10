@@ -47,7 +47,7 @@ use eridiffusion_core::training::board::BoardWriter;
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::ema_advanced::EmaConfig;
 use eridiffusion_core::training::features::validation::ValidationLoop;
-use eridiffusion_core::training::features::{loss_weight, lr_schedule, noise_modifiers, timestep_bias};
+use eridiffusion_core::training::features::{caption_dropout, loss_weight, lr_schedule, noise_modifiers, timestep_bias};
 use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
 use std::str::FromStr as _;
 use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
@@ -265,6 +265,12 @@ fn main() -> anyhow::Result<()> {
     config.validation_dataset_dir = args.validation_dataset_dir.clone();
     config.validation_every_steps = args.validation_every_steps;
     config.masked_loss_weight = args.masked_loss_weight;
+    if args.masked_loss_weight > 0.0 {
+        log::warn!(
+            "[masked-loss] --masked-loss-weight={:.3} requested but Chroma's prepare_chroma cache schema has no `latent_mask` field; flag is a no-op for this trainer.",
+            args.masked_loss_weight
+        );
+    }
     config.ema_inv_gamma = args.ema_inv_gamma;
     config.ema_power = args.ema_power;
     config.ema_update_after_step = args.ema_update_after_step;
@@ -575,12 +581,7 @@ fn main() -> anyhow::Result<()> {
 
         // Caption dropout (T5-only — chroma has no clip pool).
         let t5 = if let Some(ref nt5) = null_t5 {
-            use rand::Rng;
-            if rng.r#gen::<f32>() < effective_caption_dropout_prob {
-                nt5.clone()
-            } else {
-                t5
-            }
+            caption_dropout::maybe_drop_caption(&t5, nt5, effective_caption_dropout_prob, &mut rng)?
         } else {
             t5
         };

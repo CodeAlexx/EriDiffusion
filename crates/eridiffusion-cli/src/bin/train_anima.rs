@@ -298,6 +298,12 @@ fn main() -> anyhow::Result<()> {
     config.multi_backend_weights = args.multi_backend_weights.clone();
     config.validation_prompts_file = args.validation_prompts_file.clone();
     config.masked_loss_weight = args.masked_loss_weight;
+    if args.masked_loss_weight > 0.0 {
+        log::warn!(
+            "[masked-loss] --masked-loss-weight={:.3} requested but Anima's prepare_anima cache schema has no `latent_mask` field; flag is a no-op for this trainer.",
+            args.masked_loss_weight
+        );
+    }
     config.ema_inv_gamma = args.ema_inv_gamma;
     config.ema_power = args.ema_power;
     config.ema_update_after_step = args.ema_update_after_step;
