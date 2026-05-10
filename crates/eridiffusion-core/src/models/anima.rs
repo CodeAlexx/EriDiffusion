@@ -173,6 +173,13 @@ impl AnimaLoraTarget {
 /// `lyc_adapters` is `None`. With `--algo locon|loha|lokr|full|oft`,
 /// `new_with_config` populates `lyc_adapters` and leaves `adapters` empty.
 /// The `linear_lora` call site picks the lycoris path when present.
+///
+/// `Clone` is cheap — `Vec<LoRALinear>` clones are Parameter Arc-bumps, and
+/// `Vec<Arc<dyn AdapterModule>>` is just Arc bumps. `clone()` is required for
+/// the gradient-checkpointing path: each block's checkpoint closure captures
+/// a bundle clone by move so the closure is `'static` (recall: closures
+/// stored for backward replay must outlive `&self`).
+#[derive(Clone)]
 pub struct AnimaLoraBundle {
     pub adapters: Vec<LoRALinear>, // length = NUM_BLOCKS * LORA_SLOTS_PER_BLOCK (legacy path)
     /// LyCORIS adapters (parallel slot order to `adapters`). `None` for the
@@ -1067,12 +1074,66 @@ impl AnimaModel {
             context
         };
 
-        // 5. 28 transformer blocks.
+        // 5. 28 transformer blocks (each wrapped in a gradient checkpoint).
+        //
+        // Anima at 4096-token sequence runs into VRAM limits with LoKr —
+        // the LoKr factored forward saves more F32 intermediates per
+        // adapter than LoCon (2 matmuls + 2 transposes vs 1 matmul), and
+        // 448 adapters × 28 blocks × autograd-retained intermediates
+        // overflows 24 GB even though the base model is only ~3.9 GB.
+        //
+        // Fix (mirroring klein/zimage/chroma): wrap each block in
+        // `AutogradContext::checkpoint`. The closure captures
+        // `(block_weights_clone, bundle_clone)` (cheap — bundle clones
+        // are Arc bumps; weights clones are Tensor handle clones), runs
+        // the standalone block forward, and returns the output. Backward
+        // re-executes the closure to recompute activations rather than
+        // storing them. Trades ~33% extra forward compute for the
+        // ability to fit anima + LoKr in 24 GB. LoCon still works either
+        // way; this just unblocks LoKr/LoHa/larger adapter counts.
+        let use_checkpoint = std::env::var("ANIMA_GRAD_CHECKPOINT")
+            .map(|v| v != "0")
+            .unwrap_or(true);
         for i in 0..NUM_BLOCKS {
-            x_hidden = self.transformer_block(
-                &x_hidden, &context, &t_cond, &base_adaln,
-                &rope_cos, &rope_sin, i,
-            )?;
+            if use_checkpoint {
+                // anima preview checkpoints store keys with a `net.` prefix —
+                // `self.w(key)` (and `anima_w` below) try the bare path first
+                // and then fall back to `net.<key>`. To make sure both forms
+                // are visible to the closure, filter on either prefix.
+                let prefix = format!("blocks.{i}.");
+                let prefix_net = format!("net.blocks.{i}.");
+                let mut block_weights: HashMap<String, Tensor> = HashMap::new();
+                for (k, v) in self.weights.iter() {
+                    if k.starts_with(&prefix) || k.starts_with(&prefix_net) {
+                        block_weights.insert(k.clone(), v.clone());
+                    }
+                }
+                let bundle_c = self.bundle.clone();
+                let context_c = context.clone();
+                let t_cond_c = t_cond.clone();
+                let base_adaln_c = base_adaln.clone();
+                let rope_cos_c = rope_cos.clone();
+                let rope_sin_c = rope_sin.clone();
+                let block_idx = i;
+
+                let x_in = x_hidden.clone();
+                x_hidden = flame_core::autograd::AutogradContext::checkpoint(
+                    &[x_in.clone()],
+                    move || {
+                        anima_block_forward_standalone(
+                            &block_weights, &bundle_c, &x_in,
+                            &context_c, &t_cond_c, &base_adaln_c,
+                            &rope_cos_c, &rope_sin_c, block_idx,
+                        )
+                        .map_err(|e| flame_core::FlameError::InvalidInput(format!("{e}")))
+                    },
+                )?;
+            } else {
+                x_hidden = self.transformer_block(
+                    &x_hidden, &context, &t_cond, &base_adaln,
+                    &rope_cos, &rope_sin, i,
+                )?;
+            }
         }
 
         // 6. Final layer.
@@ -1133,6 +1194,245 @@ impl TrainableModel for AnimaModel {
         }
         self.bundle.load(std::path::Path::new(path), &self.device)
     }
+}
+
+// ─── Standalone block forward (gradient-checkpoint-friendly) ────────────────
+//
+// These free functions are byte-equivalent ports of the `&self`-method
+// versions above (linear_no_bias, linear_lora, rms_norm_per_head,
+// rms_norm_per_head_bhsd, adaln_modulation, apply_adaln, self_attention,
+// cross_attention, mlp, transformer_block) but take their state explicitly
+// (`block_weights`, `bundle`) instead of `&self`. This is what
+// `AutogradContext::checkpoint` needs: `move ||` closures can't borrow
+// `&self` because they're stored for backward replay.
+//
+// The block loop calls `anima_block_forward_standalone` inside a checkpoint
+// closure with cloned `block_weights: HashMap<String, Tensor>` (cheap —
+// Tensor clones are Arc-shared storage handles) and `bundle.clone()` (cheap
+// per the `#[derive(Clone)]` rationale on `AnimaLoraBundle`).
+
+fn anima_w<'a>(weights: &'a HashMap<String, Tensor>, key: &str) -> Result<&'a Tensor> {
+    if let Some(t) = weights.get(key) { return Ok(t); }
+    let alt = format!("net.{key}");
+    weights.get(&alt).ok_or_else(|| {
+        crate::EriDiffusionError::Model(format!("Anima: missing weight `{key}` (also tried `{alt}`)"))
+    })
+}
+
+fn anima_linear_no_bias(
+    weights: &HashMap<String, Tensor>, x: &Tensor, weight_key: &str,
+) -> Result<Tensor> {
+    let weight = anima_w(weights, weight_key)?;
+    let dims = x.shape().dims().to_vec();
+    let in_f = *dims.last().unwrap();
+    let batch: usize = dims[..dims.len() - 1].iter().product();
+    let out_f = weight.shape().dims()[0];
+    let x_2d = x.reshape(&[batch, in_f])?;
+    let wt = weight.transpose()?.contiguous()?;
+    let out_2d = x_2d.matmul(&wt)?;
+    let mut out_shape = dims[..dims.len() - 1].to_vec();
+    out_shape.push(out_f);
+    out_2d.reshape(&out_shape).map_err(Into::into)
+}
+
+fn anima_linear_lora(
+    weights: &HashMap<String, Tensor>,
+    bundle: &AnimaLoraBundle,
+    x: &Tensor,
+    weight_key: &str,
+    slot_block: Option<(usize, AnimaLoraTarget)>,
+) -> Result<Tensor> {
+    let base = anima_linear_no_bias(weights, x, weight_key)?;
+    if let Some((block, target)) = slot_block {
+        let lora = bundle.get(block, target);
+        let delta = lora.forward_delta(x)
+            .map_err(|e| crate::EriDiffusionError::Model(format!("forward_delta: {e}")))?;
+        base.add(&delta).map_err(Into::into)
+    } else {
+        Ok(base)
+    }
+}
+
+fn anima_rms_norm_per_head(
+    weights: &HashMap<String, Tensor>, x: &Tensor, weight_key: &str,
+) -> Result<Tensor> {
+    let w = anima_w(weights, weight_key)?;
+    let dims = x.shape().dims().to_vec();
+    let (b, s, h, d) = (dims[0], dims[1], dims[2], dims[3]);
+    let flat = x.reshape(&[b * s * h, d])?;
+    let normed = primitive_rms_norm(&flat, w, NORM_EPS)?;
+    normed.reshape(&[b, s, h, d]).map_err(Into::into)
+}
+
+fn anima_rms_norm_per_head_bhsd(
+    weights: &HashMap<String, Tensor>, x: &Tensor, weight_key: &str,
+) -> Result<Tensor> {
+    let w = anima_w(weights, weight_key)?;
+    let dims = x.shape().dims().to_vec();
+    let (b, h, s, d) = (dims[0], dims[1], dims[2], dims[3]);
+    let flat = x.reshape(&[b * h * s, d])?;
+    let normed = primitive_rms_norm(&flat, w, NORM_EPS)?;
+    normed.reshape(&[b, h, s, d]).map_err(Into::into)
+}
+
+fn anima_adaln_modulation(
+    weights: &HashMap<String, Tensor>,
+    bundle: &AnimaLoraBundle,
+    t_cond: &Tensor,
+    base_adaln: &Tensor,
+    prefix: &str,
+    slot_pair: Option<(usize, AnimaLoraTarget, AnimaLoraTarget)>,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let t_silu = t_cond.silu()?;
+    let (slot1, slot2) = match slot_pair {
+        Some((b, s1, s2)) => (Some((b, s1)), Some((b, s2))),
+        None => (None, None),
+    };
+    let h = anima_linear_lora(weights, bundle, &t_silu, &format!("{prefix}.1.weight"), slot1)?;
+    let mod_out = anima_linear_lora(weights, bundle, &h, &format!("{prefix}.2.weight"), slot2)?;
+    let mod_out = mod_out.add(base_adaln)?;
+    let dim = HIDDEN;
+    let shift = mod_out.narrow(1, 0, dim)?;
+    let scale = mod_out.narrow(1, dim, dim)?;
+    let gate = mod_out.narrow(1, 2 * dim, dim)?;
+    Ok((shift, scale, gate))
+}
+
+fn anima_apply_adaln(x: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
+    let normed = primitive_layer_norm(x, NORM_EPS)?;
+    let scale_3d = scale.unsqueeze(1)?.add_scalar(1.0)?;
+    let shift_3d = shift.unsqueeze(1)?;
+    normed.mul(&scale_3d)?.add(&shift_3d).map_err(Into::into)
+}
+
+fn anima_self_attention(
+    weights: &HashMap<String, Tensor>,
+    bundle: &AnimaLoraBundle,
+    x: &Tensor,
+    rope_cos: &Tensor,
+    rope_sin: &Tensor,
+    block: usize,
+) -> Result<Tensor> {
+    let prefix = format!("blocks.{block}.self_attn");
+    let dims = x.shape().dims().to_vec();
+    let (b, seq) = (dims[0], dims[1]);
+
+    let q = anima_linear_lora(weights, bundle, x, &format!("{prefix}.q_proj.weight"), Some((block, AnimaLoraTarget::SaQ)))?;
+    let k = anima_linear_lora(weights, bundle, x, &format!("{prefix}.k_proj.weight"), Some((block, AnimaLoraTarget::SaK)))?;
+    let v = anima_linear_lora(weights, bundle, x, &format!("{prefix}.v_proj.weight"), Some((block, AnimaLoraTarget::SaV)))?;
+
+    let q = q.reshape(&[b, seq, HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
+    let k = k.reshape(&[b, seq, HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
+    let v = v.reshape(&[b, seq, HEADS, HEAD_DIM])?.permute(&[0, 2, 1, 3])?;
+
+    let q = anima_rms_norm_per_head_bhsd(weights, &q, &format!("{prefix}.q_norm.weight"))?;
+    let k = anima_rms_norm_per_head_bhsd(weights, &k, &format!("{prefix}.k_norm.weight"))?;
+
+    let q = q.contiguous()?;
+    let k = k.contiguous()?;
+    let q = flame_core::bf16_ops::rope_halfsplit_bf16(&q, rope_cos, rope_sin)?;
+    let k = flame_core::bf16_ops::rope_halfsplit_bf16(&k, rope_cos, rope_sin)?;
+
+    let out = flame_core::attention::sdpa(&q, &k, &v, None)?;
+    let out = out.permute(&[0, 2, 1, 3])?.reshape(&[b, seq, HEADS * HEAD_DIM])?;
+    anima_linear_lora(weights, bundle, &out, &format!("{prefix}.output_proj.weight"), Some((block, AnimaLoraTarget::SaOut)))
+}
+
+fn anima_cross_attention(
+    weights: &HashMap<String, Tensor>,
+    bundle: &AnimaLoraBundle,
+    x: &Tensor,
+    context: &Tensor,
+    block: usize,
+) -> Result<Tensor> {
+    let prefix = format!("blocks.{block}.cross_attn");
+    let dims = x.shape().dims().to_vec();
+    let (b, seq_img) = (dims[0], dims[1]);
+    let seq_txt = context.shape().dims()[1];
+
+    let q = anima_linear_lora(weights, bundle, x, &format!("{prefix}.q_proj.weight"), Some((block, AnimaLoraTarget::CaQ)))?;
+    let k = anima_linear_lora(weights, bundle, context, &format!("{prefix}.k_proj.weight"), Some((block, AnimaLoraTarget::CaK)))?;
+    let v = anima_linear_lora(weights, bundle, context, &format!("{prefix}.v_proj.weight"), Some((block, AnimaLoraTarget::CaV)))?;
+
+    let q = q.reshape(&[b, seq_img, HEADS, HEAD_DIM])?;
+    let k = k.reshape(&[b, seq_txt, HEADS, HEAD_DIM])?;
+    let v = v.reshape(&[b, seq_txt, HEADS, HEAD_DIM])?;
+
+    let q = anima_rms_norm_per_head(weights, &q, &format!("{prefix}.q_norm.weight"))?;
+    let k = anima_rms_norm_per_head(weights, &k, &format!("{prefix}.k_norm.weight"))?;
+
+    let q = q.permute(&[0, 2, 1, 3])?;
+    let k = k.permute(&[0, 2, 1, 3])?;
+    let v = v.permute(&[0, 2, 1, 3])?;
+
+    let out = flame_core::attention::sdpa(&q, &k, &v, None)?;
+    let out = out.permute(&[0, 2, 1, 3])?.reshape(&[b, seq_img, HEADS * HEAD_DIM])?;
+    anima_linear_lora(weights, bundle, &out, &format!("{prefix}.output_proj.weight"), Some((block, AnimaLoraTarget::CaOut)))
+}
+
+fn anima_mlp(
+    weights: &HashMap<String, Tensor>,
+    bundle: &AnimaLoraBundle,
+    x: &Tensor,
+    block: usize,
+) -> Result<Tensor> {
+    let prefix = format!("blocks.{block}.mlp");
+    let h = anima_linear_lora(weights, bundle, x, &format!("{prefix}.layer1.weight"), Some((block, AnimaLoraTarget::MlpL1)))?;
+    let h = h.gelu()?;
+    anima_linear_lora(weights, bundle, &h, &format!("{prefix}.layer2.weight"), Some((block, AnimaLoraTarget::MlpL2)))
+}
+
+/// Standalone Anima transformer block. Byte-equivalent to the
+/// `AnimaModel::transformer_block` method; takes state via `block_weights`
+/// + `bundle` instead of `&self` so it can run inside an
+/// `AutogradContext::checkpoint` closure.
+pub fn anima_block_forward_standalone(
+    block_weights: &HashMap<String, Tensor>,
+    bundle: &AnimaLoraBundle,
+    x: &Tensor,
+    context: &Tensor,
+    t_cond: &Tensor,
+    base_adaln: &Tensor,
+    rope_cos: &Tensor,
+    rope_sin: &Tensor,
+    block: usize,
+) -> Result<Tensor> {
+    let mut x = x.clone();
+
+    // Self-attention.
+    let (shift_sa, scale_sa, gate_sa) = anima_adaln_modulation(
+        block_weights, bundle, t_cond, base_adaln,
+        &format!("blocks.{block}.adaln_modulation_self_attn"),
+        Some((block, AnimaLoraTarget::AdalnSa1, AnimaLoraTarget::AdalnSa2)),
+    )?;
+    let x_mod = anima_apply_adaln(&x, &shift_sa, &scale_sa)?;
+    let attn_out = anima_self_attention(block_weights, bundle, &x_mod, rope_cos, rope_sin, block)?;
+    let gate_sa_3d = gate_sa.unsqueeze(1)?;
+    x = x.add(&attn_out.mul(&gate_sa_3d)?)?;
+
+    // Cross-attention.
+    let (shift_ca, scale_ca, gate_ca) = anima_adaln_modulation(
+        block_weights, bundle, t_cond, base_adaln,
+        &format!("blocks.{block}.adaln_modulation_cross_attn"),
+        Some((block, AnimaLoraTarget::AdalnCa1, AnimaLoraTarget::AdalnCa2)),
+    )?;
+    let x_mod = anima_apply_adaln(&x, &shift_ca, &scale_ca)?;
+    let cross_out = anima_cross_attention(block_weights, bundle, &x_mod, context, block)?;
+    let gate_ca_3d = gate_ca.unsqueeze(1)?;
+    x = x.add(&cross_out.mul(&gate_ca_3d)?)?;
+
+    // MLP.
+    let (shift_mlp, scale_mlp, gate_mlp) = anima_adaln_modulation(
+        block_weights, bundle, t_cond, base_adaln,
+        &format!("blocks.{block}.adaln_modulation_mlp"),
+        Some((block, AnimaLoraTarget::AdalnMlp1, AnimaLoraTarget::AdalnMlp2)),
+    )?;
+    let x_mod = anima_apply_adaln(&x, &shift_mlp, &scale_mlp)?;
+    let mlp_out = anima_mlp(block_weights, bundle, &x_mod, block)?;
+    let gate_mlp_3d = gate_mlp.unsqueeze(1)?;
+    x = x.add(&mlp_out.mul(&gate_mlp_3d)?)?;
+
+    Ok(x)
 }
 
 // ─── Standalone helpers ─────────────────────────────────────────────────────
