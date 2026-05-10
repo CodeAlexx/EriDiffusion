@@ -50,6 +50,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context};
+use serde::Deserialize;
 use cudarc::driver::CudaDevice;
 use flame_core::{parameter::Parameter, DType, Shape, Tensor};
 
@@ -58,6 +59,199 @@ use lycoris_rs::{
     dora::{apply_weight_decompose, init_magnitude},
     LycorisAdapter, LycorisModule, StorageDtype,
 };
+
+/// PEFT / SimpleTuner `--lora_init_type` selector. Re-exported from
+/// `lycoris-rs` so trainer binaries can import it via the same module they
+/// already use for `LycorisAlgo` / `LycorisBundleConfig`.
+pub use lycoris_rs::LoraInitType;
+
+/// SimpleTuner `--lycoris_config preset.json` schema.
+///
+/// SimpleTuner uses a JSON file to map per-target-pattern algo configs onto
+/// individual layer families: e.g. `Attention` blocks get one rank/factor,
+/// `FeedForward` blocks get another. The file shape is:
+///
+/// ```json
+/// {
+///   "algo": "lokr",
+///   "multiplier": 1.0,
+///   "full_matrix": true,
+///   "linear_dim": 10000,
+///   "linear_alpha": 1,
+///   "factor": 16,
+///   "apply_preset": {
+///     "target_module": ["Attention", "FeedForward"],
+///     "module_algo_map": {
+///       "Attention":    { "factor": 16 },
+///       "FeedForward":  { "factor": 8  }
+///     }
+///   }
+/// }
+/// ```
+///
+/// **Pattern matching**: SimpleTuner's `target_module` lists module *class
+/// names* and walks the PyTorch module tree. We don't have class names —
+/// adapters are keyed by dotted-path strings (e.g.
+/// `transformer.blocks.0.attn.q_proj`). The Rust port matches each pattern
+/// as a **case-insensitive substring** against the adapter name. So a pattern
+/// `"Attention"` hits any name containing `attention` / `attn` / `xattn`,
+/// and a pattern `"FeedForward"` matches `feedforward` / `ffn` / `mlp`. To
+/// target both attention and FFN under the SimpleTuner naming convention,
+/// users typically write patterns such as `["attn", "ffn"]` for our trainers.
+///
+/// Top-level fields are applied as the bundle defaults; `module_algo_map`
+/// entries override per-target. Unset override fields fall back to the
+/// top-level value.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct LycorisConfigFile {
+    /// Top-level algo. Used when `module_algo_map` doesn't override.
+    #[serde(default)]
+    pub algo: Option<String>,
+    #[serde(default)]
+    pub multiplier: Option<f32>,
+    /// LoKr `full_matrix` (no rank decomposition; W1 and W2 stored full).
+    #[serde(default)]
+    pub full_matrix: Option<bool>,
+    /// LoKr / generic rank. Maps to `LycorisBundleConfig::rank`.
+    #[serde(default)]
+    pub linear_dim: Option<usize>,
+    /// LoKr / generic alpha. Maps to `LycorisBundleConfig::alpha`.
+    #[serde(default)]
+    pub linear_alpha: Option<f32>,
+    /// LoKr factor.
+    #[serde(default)]
+    pub factor: Option<i32>,
+    /// LoKr `decompose_both`.
+    #[serde(default)]
+    pub decompose_both: Option<bool>,
+    /// LoKr `bypass_mode` (accepted for compatibility; currently a no-op
+    /// in the Rust port).
+    #[serde(default)]
+    pub bypass_mode: Option<bool>,
+    /// Tucker decomposition for conv variants.
+    #[serde(default)]
+    pub use_tucker: Option<bool>,
+    /// DoRA enable flag (top-level).
+    #[serde(default)]
+    pub dora: Option<bool>,
+    /// LoRA init type (top-level).
+    #[serde(default)]
+    pub lora_init_type: Option<String>,
+    /// Per-target preset.
+    #[serde(default)]
+    pub apply_preset: Option<LycorisPreset>,
+}
+
+/// `apply_preset` block from a SimpleTuner-style lycoris_config.json.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct LycorisPreset {
+    /// Module name patterns to target (case-insensitive substring match
+    /// against the adapter's dotted path). Empty list = match nothing
+    /// (caller falls back to the trainer's normal target picker).
+    #[serde(default)]
+    pub target_module: Vec<String>,
+    /// Per-pattern overrides. Pattern matching is the same as
+    /// `target_module`. The first matching pattern's override wins.
+    #[serde(default)]
+    pub module_algo_map: HashMap<String, LycorisModuleOverride>,
+}
+
+/// Per-pattern override from `module_algo_map`. Any field left as `None`
+/// inherits from the top-level [`LycorisConfigFile`] / bundle config.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct LycorisModuleOverride {
+    #[serde(default)]
+    pub algo: Option<String>,
+    #[serde(default)]
+    pub linear_dim: Option<usize>,
+    #[serde(default)]
+    pub linear_alpha: Option<f32>,
+    #[serde(default)]
+    pub factor: Option<i32>,
+    #[serde(default)]
+    pub decompose_both: Option<bool>,
+    #[serde(default)]
+    pub use_tucker: Option<bool>,
+    #[serde(default)]
+    pub dora: Option<bool>,
+    #[serde(default)]
+    pub lora_init_type: Option<String>,
+}
+
+impl LycorisPreset {
+    /// Find the first `module_algo_map` entry whose pattern matches `name`
+    /// (case-insensitive substring). Returns `None` if no pattern matches.
+    /// HashMap iteration is unordered — when multiple patterns match,
+    /// the result is non-deterministic; callers should design patterns to
+    /// be mutually exclusive.
+    pub fn resolve(&self, name: &str) -> Option<&LycorisModuleOverride> {
+        let lower = name.to_ascii_lowercase();
+        self.module_algo_map
+            .iter()
+            .find(|(pat, _)| lower.contains(&pat.to_ascii_lowercase()))
+            .map(|(_, ov)| ov)
+    }
+
+    /// Returns `true` if `name` is allowed by `target_module` (or the list
+    /// is empty, which we treat as "match everything" so the file can be
+    /// used as override-only without filtering).
+    pub fn is_allowed(&self, name: &str) -> bool {
+        if self.target_module.is_empty() {
+            return true;
+        }
+        let lower = name.to_ascii_lowercase();
+        self.target_module
+            .iter()
+            .any(|p| lower.contains(&p.to_ascii_lowercase()))
+    }
+}
+
+impl LycorisConfigFile {
+    /// Parse a SimpleTuner-style `lycoris_config.json`.
+    pub fn from_path(path: &Path) -> anyhow::Result<Self> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("read lycoris_config: {}", path.display()))?;
+        let cfg: LycorisConfigFile = serde_json::from_str(&raw)
+            .with_context(|| format!("parse lycoris_config: {}", path.display()))?;
+        Ok(cfg)
+    }
+
+    /// Build a [`LycorisBundleConfig`] from this file, overlaying top-level
+    /// fields onto the supplied `base` config (CLI defaults). Fields absent
+    /// from the file leave `base` untouched. The parsed `apply_preset` is
+    /// returned alongside so `AdapterStore` can apply per-target overrides
+    /// during construction.
+    pub fn apply_to(
+        &self,
+        mut base: LycorisBundleConfig,
+    ) -> anyhow::Result<(LycorisBundleConfig, Option<LycorisPreset>)> {
+        if let Some(ref a) = self.algo {
+            base.algo = LycorisAlgo::parse(a)?;
+        }
+        if let Some(d) = self.linear_dim {
+            base.rank = d;
+        }
+        if let Some(a) = self.linear_alpha {
+            base.alpha = a;
+        }
+        if let Some(f) = self.factor {
+            base.factor = f;
+        }
+        if let Some(d) = self.decompose_both {
+            base.decompose_both = d;
+        }
+        if let Some(t) = self.use_tucker {
+            base.use_tucker = t;
+        }
+        if let Some(d) = self.dora {
+            base.dora = d;
+        }
+        if let Some(ref t) = self.lora_init_type {
+            base.init_type = LoraInitType::parse(t).map_err(|e| anyhow!("lora_init_type: {e}"))?;
+        }
+        Ok((base, self.apply_preset.clone()))
+    }
+}
 
 /// LyCORIS algorithm selector. `None` means "fall back to legacy LoRALinear".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,6 +329,16 @@ pub struct LycorisBundleConfig {
     /// Storage dtype for trainable leaves. F32 default for trainer (AdamW state),
     /// BF16 for inference / merge-only.
     pub storage: StorageDtype,
+    /// PEFT / SimpleTuner `lora_init_type` parity. Applies to the LoCon (LoRA)
+    /// path only — other algos retain their algorithm-specific upstream init.
+    /// `Default` (current) leaves Phase-2b byte-identical; `Gaussian` switches
+    /// LoCon's `down`-side init to `N(0, 1/rank)`.
+    pub init_type: LoraInitType,
+    /// Optional SimpleTuner-style `lycoris_config preset.json` —
+    /// per-target overrides resolved at adapter construction time. `None`
+    /// = bundle uses uniform top-level config. See [`LycorisPreset`] for
+    /// the matching rules.
+    pub preset: Option<LycorisPreset>,
 }
 
 impl Default for LycorisBundleConfig {
@@ -153,6 +357,8 @@ impl Default for LycorisBundleConfig {
             dora_wd_on_out: true,
             dora_eps: 1e-6,
             storage: StorageDtype::F32,
+            init_type: LoraInitType::Default,
+            preset: None,
         }
     }
 }
@@ -211,13 +417,14 @@ impl LycorisBundle {
         let adapter = match self.config.algo {
             LycorisAlgo::None => unreachable!(),
             LycorisAlgo::LoCon => LycorisAdapter::LoCon(
-                LoConModule::new_linear_for_training(
+                LoConModule::new_linear_for_training_with_init(
                     in_features,
                     out_features,
                     self.config.rank,
                     alpha,
                     device,
                     dtype,
+                    self.config.init_type,
                 )
                 .map_err(|e| anyhow!("LoCon::new_linear_for_training({name}): {e}"))?,
             ),
@@ -307,7 +514,7 @@ impl LycorisBundle {
         let adapter = match self.config.algo {
             LycorisAlgo::None => unreachable!(),
             LycorisAlgo::LoCon => LycorisAdapter::LoCon(
-                LoConModule::new_conv2d_for_training(
+                LoConModule::new_conv2d_for_training_with_init(
                     in_channels,
                     out_channels,
                     kernel_size,
@@ -316,6 +523,7 @@ impl LycorisBundle {
                     self.config.use_tucker,
                     device,
                     dtype,
+                    self.config.init_type,
                 )
                 .map_err(|e| anyhow!("LoCon::new_conv2d_for_training({name}): {e}"))?,
             ),
@@ -794,6 +1002,96 @@ impl LycorisBundle {
     }
 }
 
+/// Streaming `init_lokr_norm` for trainers whose base weights are not all
+/// resident in a single map (BlockOffloader / sharded streaming trainers:
+/// qwenimage, zimage, anima, sd35, ernie, acestep, wan22).
+///
+/// Walks the bundle's adapters, calls `lookup(adapter_name)` to fetch each
+/// LoKr adapter's base weight on demand, and applies the perturbed-normal
+/// init via `AdapterModule::init_perturbed_normal_lokr`.
+///
+/// The trainer provides `lookup` — a closure that maps an adapter's dotted
+/// path to its base weight tensor. The closure can fetch the weight from a
+/// memory-mapped safetensors file via [`flame_core::serialization::load_file_filtered`]
+/// (paged-in, dropped after init) or from the trainer's resident-shared map
+/// (head/embeds/etc.) without retaining the streamed block weights.
+///
+/// Returns the number of adapters skipped (non-LoKr, factored, or
+/// `lookup` returned `None`).
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // Inside `train_qwenimage::main`, after model load:
+/// let ckpt_path = args.transformer.clone();
+/// let device_for_lookup = device.clone();
+/// let skipped = streaming_init_lokr(
+///     &model.bundle.adapters,
+///     &model.bundle.names,
+///     args.init_lokr_norm,
+///     |name| {
+///         // `name` is e.g. "transformer_blocks.0.attn.to_q";
+///         // map to the safetensors key the checkpoint uses.
+///         let key = adapter_name_to_ckpt_key(name);
+///         let map = flame_core::serialization::load_file_filtered(
+///             &ckpt_path,
+///             &device_for_lookup,
+///             |k| k == key,
+///         )?;
+///         Ok(map.into_iter().next().map(|(_, t)| t))
+///     },
+/// )?;
+/// ```
+pub fn streaming_init_lokr<F>(
+    adapters: &[Box<dyn crate::adapter::AdapterModule>],
+    names: &[String],
+    scale: f32,
+    mut lookup: F,
+) -> anyhow::Result<usize>
+where
+    F: FnMut(&str) -> anyhow::Result<Option<Tensor>>,
+{
+    if scale <= 0.0 {
+        return Ok(adapters.len()); // skip everything when disabled
+    }
+    if adapters.len() != names.len() {
+        bail!(
+            "streaming_init_lokr: adapters/names length mismatch ({} vs {})",
+            adapters.len(),
+            names.len()
+        );
+    }
+    let mut skipped = 0usize;
+    for (adapter, name) in adapters.iter().zip(names.iter()) {
+        if adapter.kind() != "lokr" {
+            skipped += 1;
+            continue;
+        }
+        match lookup(name)? {
+            Some(w) => {
+                let applied = adapter
+                    .init_perturbed_normal_lokr(&w, scale)
+                    .map_err(|e| anyhow!("init_perturbed_normal_lokr({name}): {e}"))?;
+                if !applied {
+                    log::warn!(
+                        "streaming_init_lokr: '{name}' is LoKr but factored — \
+                         init_perturbed_normal_lokr only supports full-form LoKr"
+                    );
+                    skipped += 1;
+                }
+            }
+            None => {
+                log::warn!(
+                    "streaming_init_lokr: no base weight returned by lookup for '{name}' — \
+                     skipping"
+                );
+                skipped += 1;
+            }
+        }
+    }
+    Ok(skipped)
+}
+
 /// Build `<prefix>.<name>` (or just `<name>` when prefix is empty).
 fn qualify(prefix: &str, name: &str) -> String {
     if prefix.is_empty() {
@@ -925,6 +1223,21 @@ pub struct LycorisCliArgs {
 
     #[arg(long, default_value_t = 1e-6)]
     pub lycoris_dora_eps: f32,
+
+    /// PEFT / SimpleTuner `--lora_init_type`. Applies to the LoCon (LoRA)
+    /// path only. Choices: `default | gaussian | pissa | olora | loftq`.
+    /// `pissa`/`olora`/`loftq` parse but error at adapter construction
+    /// because flame-core does not yet expose SVD/QR.
+    #[arg(long, default_value = "default")]
+    pub lora_init_type: String,
+
+    /// SimpleTuner-style `lycoris_config preset.json` — per-target
+    /// `module_algo_map` overrides. See [`LycorisConfigFile`] for the
+    /// schema. Top-level fields overlay the bundle defaults; per-target
+    /// overrides apply at adapter construction time. Default unset → no
+    /// preset (uniform top-level config).
+    #[arg(long)]
+    pub lycoris_config: Option<std::path::PathBuf>,
 }
 
 impl Default for LycorisCliArgs {
@@ -942,6 +1255,8 @@ impl Default for LycorisCliArgs {
             lycoris_decompose: false,
             lycoris_dora_wd_on_out: true,
             lycoris_dora_eps: 1e-6,
+            lora_init_type: "default".to_string(),
+            lycoris_config: None,
         }
     }
 }
@@ -952,7 +1267,9 @@ impl LycorisBundleConfig {
     /// Inference / merge-only callers should construct the config directly.
     pub fn from_cli(args: &LycorisCliArgs) -> anyhow::Result<Self> {
         let algo = LycorisAlgo::parse(&args.lycoris_algo)?;
-        Ok(Self {
+        let init_type = LoraInitType::parse(&args.lora_init_type)
+            .map_err(|e| anyhow!("--lora_init_type: {e}"))?;
+        let base = Self {
             algo,
             rank: args.lycoris_rank,
             alpha: args.lycoris_alpha,
@@ -966,7 +1283,29 @@ impl LycorisBundleConfig {
             dora_wd_on_out: args.lycoris_dora_wd_on_out,
             dora_eps: args.lycoris_dora_eps,
             storage: StorageDtype::F32,
-        })
+            init_type,
+            preset: None,
+        };
+        base.with_optional_lycoris_config_file(args.lycoris_config.as_deref())
+    }
+
+    /// Load and overlay a SimpleTuner-style `lycoris_config.json` onto this
+    /// config (in place). Top-level fields in the JSON override the
+    /// supplied defaults; the parsed `apply_preset` is stored in
+    /// `self.preset` for per-target dispatch in the [`AdapterStore`].
+    ///
+    /// `path = None` is a no-op (idiomatic for trainers that pass
+    /// `Option<&Path>` straight from CLI).
+    pub fn with_optional_lycoris_config_file<P: AsRef<Path>>(
+        mut self,
+        path: Option<P>,
+    ) -> anyhow::Result<Self> {
+        let Some(p) = path else { return Ok(self) };
+        let file = LycorisConfigFile::from_path(p.as_ref())?;
+        let (cfg, preset) = file.apply_to(self)?;
+        self = cfg;
+        self.preset = preset;
+        Ok(self)
     }
 }
 
@@ -1024,6 +1363,57 @@ impl AdapterStore {
         }
     }
 
+    /// Resolve the effective per-target [`LycorisBundleConfig`] for adapter
+    /// `name`, applying any preset filter and `module_algo_map` overrides.
+    ///
+    /// Returns `Ok(Some(cfg))` when the adapter should be built (with `cfg`
+    /// reflecting any per-target overrides), `Ok(None)` when the preset's
+    /// `target_module` filter excludes this name. Returns `Err` only on a
+    /// malformed override (e.g. unknown algo string).
+    fn resolve_effective_config(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<LycorisBundleConfig>> {
+        let Some(preset) = self.config.preset.as_ref() else {
+            return Ok(Some(self.config.clone()));
+        };
+        if !preset.is_allowed(name) {
+            return Ok(None);
+        }
+        let mut cfg = self.config.clone();
+        if let Some(ov) = preset.resolve(name) {
+            if let Some(ref a) = ov.algo {
+                cfg.algo = LycorisAlgo::parse(a)
+                    .map_err(|e| anyhow!("preset override algo for '{name}': {e}"))?;
+            }
+            if let Some(d) = ov.linear_dim {
+                cfg.rank = d;
+            }
+            if let Some(a) = ov.linear_alpha {
+                cfg.alpha = a;
+            }
+            if let Some(f) = ov.factor {
+                cfg.factor = f;
+            }
+            if let Some(d) = ov.decompose_both {
+                cfg.decompose_both = d;
+            }
+            if let Some(t) = ov.use_tucker {
+                cfg.use_tucker = t;
+            }
+            if let Some(d) = ov.dora {
+                cfg.dora = d;
+            }
+            if let Some(ref t) = ov.lora_init_type {
+                cfg.init_type = LoraInitType::parse(t)
+                    .map_err(|e| anyhow!("preset override lora_init_type for '{name}': {e}"))?;
+            }
+        }
+        // Drop preset on the per-call config so the inner ctor doesn't recurse.
+        cfg.preset = None;
+        Ok(Some(cfg))
+    }
+
     /// Build the right adapter for the configured algo and push it.
     ///
     /// `config.algo == None` → constructs a [`LoRALinear`] (legacy plain
@@ -1035,6 +1425,35 @@ impl AdapterStore {
     /// `seed` is forwarded to [`LoRALinear::new`] for the LoRA path. The
     /// LyCORIS path uses its internal RNG (kaiming/normal init).
     pub fn build_and_push_linear(
+        &mut self,
+        name: &str,
+        in_features: usize,
+        out_features: usize,
+        w_orig: Option<&Tensor>,
+    ) -> anyhow::Result<()> {
+        // SimpleTuner-style per-target preset resolution. When `preset` is
+        // set, find the first `module_algo_map` entry whose pattern matches
+        // `name` (case-insensitive substring) and overlay its overrides on
+        // the bundle config for this single adapter. `target_module` is
+        // applied as a filter when present: a name that doesn't match any
+        // `target_module` entry skips with `Ok(())` (caller's outer loop
+        // moves on, no adapter created — this matches SimpleTuner's
+        // `apply_preset` semantics).
+        let effective_config = self.resolve_effective_config(name)?;
+        if effective_config.is_none() {
+            log::debug!(
+                "AdapterStore: name='{name}' filtered out by lycoris_config target_module"
+            );
+            return Ok(());
+        }
+        let effective_config = effective_config.unwrap();
+        let saved_config = std::mem::replace(&mut self.config, effective_config);
+        let result = self.build_and_push_linear_inner(name, in_features, out_features, w_orig);
+        self.config = saved_config;
+        return result;
+    }
+
+    fn build_and_push_linear_inner(
         &mut self,
         name: &str,
         in_features: usize,
@@ -1067,8 +1486,14 @@ impl AdapterStore {
                 let adapter = match self.config.algo {
                     LycorisAlgo::None => unreachable!(),
                     LycorisAlgo::LoCon => LycorisAdapter::LoCon(
-                        LoConModule::new_linear_for_training(
-                            in_features, out_features, self.config.rank, alpha, device, dtype,
+                        LoConModule::new_linear_for_training_with_init(
+                            in_features,
+                            out_features,
+                            self.config.rank,
+                            alpha,
+                            device,
+                            dtype,
+                            self.config.init_type,
                         )
                         .map_err(|e| anyhow!("LoCon::new_linear_for_training({name}): {e}"))?,
                     ),
@@ -1146,6 +1571,35 @@ impl AdapterStore {
         kernel_size: (usize, usize),
         w_orig: Option<&Tensor>,
     ) -> anyhow::Result<()> {
+        // Same per-target preset overlay as `build_and_push_linear`.
+        let effective_config = self.resolve_effective_config(name)?;
+        if effective_config.is_none() {
+            log::debug!(
+                "AdapterStore: name='{name}' filtered out by lycoris_config target_module"
+            );
+            return Ok(());
+        }
+        let effective_config = effective_config.unwrap();
+        let saved_config = std::mem::replace(&mut self.config, effective_config);
+        let result = self.build_and_push_conv2d_inner(
+            name,
+            in_channels,
+            out_channels,
+            kernel_size,
+            w_orig,
+        );
+        self.config = saved_config;
+        return result;
+    }
+
+    fn build_and_push_conv2d_inner(
+        &mut self,
+        name: &str,
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: (usize, usize),
+        w_orig: Option<&Tensor>,
+    ) -> anyhow::Result<()> {
         if self.config.algo == LycorisAlgo::None {
             bail!(
                 "AdapterStore::build_and_push_conv2d: plain-LoRA (algo=None) does not support \
@@ -1165,7 +1619,7 @@ impl AdapterStore {
 
         let adapter = match self.config.algo {
             LycorisAlgo::LoCon => LycorisAdapter::LoCon(
-                LoConModule::new_conv2d_for_training(
+                LoConModule::new_conv2d_for_training_with_init(
                     in_channels,
                     out_channels,
                     kernel_size,
@@ -1174,6 +1628,7 @@ impl AdapterStore {
                     self.config.use_tucker,
                     device,
                     dtype,
+                    self.config.init_type,
                 )
                 .map_err(|e| anyhow!("LoCon::new_conv2d_for_training({name}): {e}"))?,
             ),

@@ -618,6 +618,63 @@ impl Wan22Model {
     /// `weight_dtype=BF16` with the `*_fp8_scaled.safetensors` files is
     /// the realistic 14B path: on-disk savings only, runtime is BF16.
     /// LoRA params are always F32 regardless.
+    /// Load a Wan22 checkpoint, transparently handling HuggingFace-sharded
+    /// directories (e.g. TI2V-5B's `diffusion_pytorch_model-{1..3}-of-3`).
+    /// Mirrors the shard-detection logic in `ChromaTrainingModel`.
+    fn load_weights_with_shards(
+        path: &Path,
+        device: &Arc<CudaDevice>,
+    ) -> Result<HashMap<String, Tensor>> {
+        if path.is_dir() {
+            return Self::load_shards_from_dir(path, device);
+        }
+        let parent = path.parent().unwrap_or(path);
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let index_path = parent.join(format!("{stem}.safetensors.index.json"));
+        if index_path.exists() || stem.contains("-of-") || stem.contains("-00001-") {
+            return Self::load_shards_from_dir(parent, device);
+        }
+        Ok(flame_core::serialization::load_file(path, device)?)
+    }
+
+    fn load_shards_from_dir(
+        dir: &Path,
+        device: &Arc<CudaDevice>,
+    ) -> Result<HashMap<String, Tensor>> {
+        let read_dir = std::fs::read_dir(dir).map_err(|e| {
+            crate::EriDiffusionError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("{}: {}", dir.display(), e),
+            ))
+        })?;
+        let mut shard_paths: Vec<std::path::PathBuf> = read_dir
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
+            .collect();
+        shard_paths.sort();
+        if shard_paths.is_empty() {
+            return Err(crate::EriDiffusionError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no safetensors shards found in {}", dir.display()),
+            )));
+        }
+        log::info!(
+            "[wan22] loading {} shards from {}",
+            shard_paths.len(),
+            dir.display()
+        );
+        let mut all = HashMap::new();
+        for shard in &shard_paths {
+            log::info!(
+                "[wan22]   shard: {}",
+                shard.file_name().unwrap().to_string_lossy()
+            );
+            let part = flame_core::serialization::load_file(shard, device)?;
+            all.extend(part);
+        }
+        Ok(all)
+    }
+
     pub fn load(
         ckpt_path: &Path,
         cfg: Wan22Config,
@@ -633,7 +690,7 @@ impl Wan22Model {
             cfg.variant.as_str(),
             ckpt_path.display()
         );
-        let raw = flame_core::serialization::load_file(ckpt_path, &device)?;
+        let raw = Self::load_weights_with_shards(ckpt_path, &device)?;
         let mut weights = HashMap::with_capacity(raw.len());
         for (k, v) in raw {
             let cast = if v.dtype() == weight_dtype {

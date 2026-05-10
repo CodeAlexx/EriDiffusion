@@ -48,7 +48,7 @@ use clap::Parser;
 use std::path::PathBuf;
 
 use eridiffusion_core::config::{LrScheduler, TrainConfig, TrainingMethod};
-use eridiffusion_core::lycoris::{LycorisAlgo, LycorisBundleConfig};
+use eridiffusion_core::lycoris::{LoraInitType, LycorisAlgo, LycorisBundleConfig};
 use eridiffusion_core::models::wan22::{Wan22Config, Wan22LoraBundle, Wan22Model, Wan22Variant};
 use eridiffusion_core::sampler::wan22_sampler::{
     self as wan22, Expert, DEFAULT_NOISE_BOUNDARY_T2V, DEFAULT_SHIFT_TI2V_5B,
@@ -271,6 +271,15 @@ struct Args {
     /// DoRA magnitude axis (`true` = lycoris-upstream).
     #[arg(long, default_value_t = true)] dora_wd_on_out: bool,
     #[arg(long, default_value_t = 1e-6)] dora_eps: f32,
+    /// PEFT/SimpleTuner `--lora_init_type`. Applies to LoCon (the LoRA path)
+    /// only. Choices: `default | gaussian | pissa | olora | loftq`. The
+    /// PISSA/OLoRA/LoftQ variants parse but error at adapter construction
+    /// because flame-core does not yet expose SVD/QR.
+    #[arg(long, default_value = "default")] lora_init_type: String,
+    /// SimpleTuner-style `lycoris_config preset.json`. Optional; per-target
+    /// `module_algo_map` overrides apply during adapter construction. The
+    /// same preset is shared by `low_noise` and `high_noise` experts.
+    #[arg(long)] lycoris_config: Option<PathBuf>,
     /// SimpleTuner-parity: perturbed-normal LoKr init. Scale `>0` triggers
     /// `lokr_w1=1, lokr_w2 ~ N(μ_W, σ_W)·scale`. No-op when algo != lokr or
     /// value is 0.0. Phase 2b: per-net base-weight access not yet plumbed
@@ -396,6 +405,9 @@ fn main() -> anyhow::Result<()> {
             algo_high.as_str(),
         );
     }
+    // Parse LoRA init type once (shared by both nets).
+    let lora_init_type = LoraInitType::parse(&args.lora_init_type)
+        .map_err(|e| anyhow::anyhow!("--lora_init_type: {e}"))?;
     // Build per-net configs sharing all shape fields except `algo`.
     let mk_lyc_config = |algo: LycorisAlgo| LycorisBundleConfig {
         algo,
@@ -410,10 +422,13 @@ fn main() -> anyhow::Result<()> {
         dora: args.dora,
         dora_wd_on_out: args.dora_wd_on_out,
         dora_eps: args.dora_eps,
+        init_type: lora_init_type,
         ..LycorisBundleConfig::default()
     };
-    let lyc_config_low = mk_lyc_config(algo_low);
-    let lyc_config_high = mk_lyc_config(algo_high);
+    let lyc_config_low = mk_lyc_config(algo_low)
+        .with_optional_lycoris_config_file(args.lycoris_config.as_deref())?;
+    let lyc_config_high = mk_lyc_config(algo_high)
+        .with_optional_lycoris_config_file(args.lycoris_config.as_deref())?;
     // Surface dropout / rank-dropout flags as a single line until they're
     // plumbed into LycorisBundleConfig (cross-trainer task — recipe lists
     // them on every binary's surface). Default 0.0/false → no-op today.

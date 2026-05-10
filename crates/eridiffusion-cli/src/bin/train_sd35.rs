@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
 use flame_core::adam::AdamW;
 use eridiffusion_core::config::{LrScheduler, TrainConfig, TrainingMethod};
-use eridiffusion_core::lycoris::{LycorisAlgo, LycorisBundleConfig};
+use eridiffusion_core::lycoris::{LoraInitType, LycorisAlgo, LycorisBundleConfig};
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::ema_advanced::EmaConfig;
 use eridiffusion_core::training::features::{loss_weight, lr_schedule, noise_modifiers, timestep_bias, validation::ValidationLoop};
@@ -214,6 +214,14 @@ struct Args {
     /// (norm over input dims, magnitude shape `[out, 1]`).
     #[arg(long, default_value_t = true)] dora_wd_on_out: bool,
     #[arg(long, default_value_t = 1e-6)] dora_eps: f32,
+    /// PEFT/SimpleTuner `--lora_init_type`. Applies to LoCon (the LoRA path)
+    /// only. Choices: `default | gaussian | pissa | olora | loftq`. The
+    /// PISSA/OLoRA/LoftQ variants parse but error at adapter construction
+    /// because flame-core does not yet expose SVD/QR.
+    #[arg(long, default_value = "default")] lora_init_type: String,
+    /// SimpleTuner-style `lycoris_config preset.json`. Optional; per-target
+    /// `module_algo_map` overrides apply during adapter construction.
+    #[arg(long)] lycoris_config: Option<PathBuf>,
     /// SimpleTuner-parity perturbed-normal LoKr init. No-op for SD3.5 in
     /// Phase 2b (base-weight-by-target lookup not plumbed).
     #[arg(long, default_value_t = 0.0)] init_lokr_norm: f32,
@@ -588,8 +596,12 @@ fn main() -> anyhow::Result<()> {
         dora: args.dora,
         dora_wd_on_out: args.dora_wd_on_out,
         dora_eps: args.dora_eps,
+        init_type: LoraInitType::parse(&args.lora_init_type)
+            .map_err(|e| anyhow::anyhow!("--lora_init_type: {e}"))?,
         ..LycorisBundleConfig::default()
     };
+    let lyc_config = lyc_config
+        .with_optional_lycoris_config_file(args.lycoris_config.as_deref())?;
 
     if algo != LycorisAlgo::None {
         log::info!(

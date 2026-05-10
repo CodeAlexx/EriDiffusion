@@ -231,15 +231,49 @@ impl ZImageLoraBundle {
     /// optimizer state by name across runs (TensorIds are unstable, names
     /// are stable). Order: (block_idx, target_idx) ascending, then A then B.
     pub fn named_parameters(&self) -> Vec<(String, Parameter)> {
+        // Legacy plain-LoRA path.
         let mut keys: Vec<&(usize, LoraTarget)> = self.adapters.keys().collect();
         keys.sort_by_key(|(b, t)| (*b, *t as usize));
-        let mut out = Vec::with_capacity(self.adapters.len() * 2);
+        let mut out: Vec<(String, Parameter)> =
+            Vec::with_capacity((self.adapters.len() + self.lycoris_adapters.len()) * 2);
         for &(block_idx, target) in keys {
             let lora = &self.adapters[&(block_idx, target)];
             let suffix = Self::ai_toolkit_suffix(target);
             let prefix = format!("diffusion_model.layers.{block_idx}.{suffix}");
             out.push((format!("{prefix}.lora_A.weight"), lora.lora_a().clone()));
             out.push((format!("{prefix}.lora_B.weight"), lora.lora_b().clone()));
+        }
+
+        // LyCORIS path. Each adapter's `to_parameters()` order matches its
+        // `named_tensors()` so the per-leaf zip is stable. Suffix uses
+        // `lycoris-upstream` conventions (`lora_down.weight` /
+        // `lora_up.weight` for LoCon, `hada_*` for LoHa, `lokr_*` for LoKr,
+        // `dora_scale` last when DoRA is on — see
+        // `LycorisLinear::named_tensors`). Without this branch a `--algo
+        // lokr` (or any non-`lora` algo) save silently writes 0 keys.
+        let mut lyc_keys: Vec<&(usize, LoraTarget)> =
+            self.lycoris_adapters.keys().collect();
+        lyc_keys.sort_by_key(|(b, t)| (*b, *t as usize));
+        for &(block_idx, target) in lyc_keys {
+            let adapter = &self.lycoris_adapters[&(block_idx, target)];
+            let suffix = Self::ai_toolkit_suffix(target);
+            let prefix = format!("diffusion_model.layers.{block_idx}.{suffix}");
+            let params = adapter.to_parameters();
+            let named = adapter.named_tensors();
+            if params.len() != named.len() {
+                log::warn!(
+                    "ZImageLoraBundle::named_parameters: adapter at \
+                     ({block_idx}, {:?}) has {} params but {} named entries; \
+                     skipping (lycoris-rs/AdapterModule contract bug)",
+                    target,
+                    params.len(),
+                    named.len(),
+                );
+                continue;
+            }
+            for ((leaf, _), p) in named.into_iter().zip(params.into_iter()) {
+                out.push((format!("{prefix}.{leaf}"), p));
+            }
         }
         out
     }

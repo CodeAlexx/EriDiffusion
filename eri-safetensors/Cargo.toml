@@ -1,0 +1,15 @@
+[package]
+name = "eri-safetensors"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-Rust safetensors mmap loader. Vendored from serenity-safetensors with pyo3 bindings stripped."
+
+[lib]
+name = "eri_safetensors"
+
+[dependencies]
+safetensors = "0.4"
+serde_json = "1.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
