@@ -25,7 +25,9 @@ use eridiffusion_core::training::features::{
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::schedule;
 use eridiffusion_core::training::training_features::OptimizerKind;
+use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
 use rand::{rngs::StdRng, Rng, SeedableRng};
+use std::str::FromStr as _;
 use std::path::PathBuf;
 
 const SEED_DEFAULT: u64 = 42;
@@ -42,9 +44,24 @@ struct Args {
     #[arg(long, default_value = "4e-4")] lr: f32,
     #[arg(long, default_value = "200")] warmup_steps: usize,
     /// Logit-normal timestep mu (configuration_acestep_v15.py default -0.4).
+    /// Used only when `--timestep-distribution=auto` (default).
     #[arg(long, default_value = "-0.4")] timestep_mu: f32,
     /// Logit-normal timestep sigma (default 1.0).
+    /// Used only when `--timestep-distribution=auto` (default).
     #[arg(long, default_value = "1.0")] timestep_sigma: f32,
+    /// Unified OneTrainer timestep distribution. `auto` (default) keeps
+    /// the byte-equivalent legacy `(timestep_mu, timestep_sigma)` logit-normal
+    /// path. Other choices: `uniform`, `sigmoid`, `logit_normal`, `heavy_tail`,
+    /// `cos_map`, `inverted_parabola`. When non-`auto`, `--timestep-mu` and
+    /// `--timestep-sigma` are ignored in favor of `--noising-weight` /
+    /// `--noising-bias`.
+    #[arg(long, default_value = "auto")] timestep_distribution: String,
+    /// Distribution-specific weight knob (default 0.0). Ignored when
+    /// `--timestep-distribution=auto`.
+    #[arg(long, default_value_t = 0.0)] noising_weight: f32,
+    /// Distribution-specific bias knob (default 0.0). Ignored when
+    /// `--timestep-distribution=auto`.
+    #[arg(long, default_value_t = 0.0)] noising_bias: f32,
     /// CFG dropout ratio (modeling_acestep_v15_base.py default 0.15).
     #[arg(long, default_value = "0.15")] cfg_ratio: f32,
     /// Resume LoRA weights only.
@@ -447,6 +464,23 @@ fn main() -> anyhow::Result<()> {
         cfg
     };
 
+    // Unified OneTrainer timestep distribution dispatch (optional override).
+    // `auto` keeps the legacy `(timestep_mu, timestep_sigma)` logit-normal
+    // path for byte-equivalence with pre-flag runs.
+    let unified_timestep_cfg: Option<TimestepConfig> = if args.timestep_distribution.eq_ignore_ascii_case("auto") {
+        None
+    } else {
+        let dist = TimestepDistribution::from_str(&args.timestep_distribution)
+            .map_err(|e| anyhow::anyhow!("--timestep-distribution: {e}"))?;
+        Some(TimestepConfig {
+            distribution: dist,
+            noising_weight: args.noising_weight,
+            noising_bias: args.noising_bias,
+            min_strength: 0.0,
+            max_strength: 1.0,
+        })
+    };
+
     if args.multires_noise_iterations > 0 {
         log::warn!(
             "[multires-noise] ACE-Step uses non-4D latent shape; multires noise helper short-circuits to no-op for non-4D inputs. Pass 0 to silence."
@@ -572,7 +606,11 @@ fn main() -> anyhow::Result<()> {
         )?;
         let x0 = target_latents;
         let t_val = {
-            let raw_t = schedule::sample_timestep_logit_normal(&mut rng, args.timestep_mu, args.timestep_sigma);
+            let raw_t = if let Some(ref tcfg) = unified_timestep_cfg {
+                tcfg.sample_one(&mut rng)
+            } else {
+                schedule::sample_timestep_logit_normal(&mut rng, args.timestep_mu, args.timestep_sigma)
+            };
             // schedule helper already returns sigmoid(z*sigma+mu)-equivalent in (0,1).
             // Default-off: Strategy::None → returns raw_t unchanged. Use total=1.0
             // because ACE-Step's t lives in (0, 1) directly (no NUM_TRAIN_TIMESTEPS
@@ -756,9 +794,13 @@ fn main() -> anyhow::Result<()> {
                     // uses its OWN run-side RNG so it does not perturb the
                     // training-side seeded sequence (byte invariance).
                     let mut vrng = StdRng::seed_from_u64(args.seed ^ (step as u64 + 1));
-                    let v_t_val = schedule::sample_timestep_logit_normal(
-                        &mut vrng, args.timestep_mu, args.timestep_sigma,
-                    );
+                    let v_t_val = if let Some(ref tcfg) = unified_timestep_cfg {
+                        tcfg.sample_one(&mut vrng)
+                    } else {
+                        schedule::sample_timestep_logit_normal(
+                            &mut vrng, args.timestep_mu, args.timestep_sigma,
+                        )
+                    };
                     // Mirror training: validation uses CLEAN noise (no offset/
                     // perturbation/multires — multires is a no-op for non-4D
                     // anyway, and offset+perturbation are training-only random

@@ -40,6 +40,8 @@ use eridiffusion_core::training::features::{
     validation::ValidationLoop,
 };
 use eridiffusion_core::training::training_features::OptimizerKind;
+use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
+use std::str::FromStr as _;
 
 const ZIMAGE_TEMPLATE_PRE: &str = "<|im_start|>user\n";
 const ZIMAGE_TEMPLATE_POST: &str = "<|im_end|>\n<|im_start|>assistant\n";
@@ -150,6 +152,13 @@ struct Args {
     #[arg(long, default_value_t = 0.0)] timestep_bias_multiplier: f32,
     #[arg(long, default_value_t = 0.0)] timestep_bias_range_min: f32,
     #[arg(long, default_value_t = 1.0)] timestep_bias_range_max: f32,
+    /// Timestep distribution. `logit_normal` (default — Z-Image preset),
+    /// `uniform`, `sigmoid`, `heavy_tail`, `cos_map`, `inverted_parabola`.
+    #[arg(long, default_value = "logit_normal")] timestep_distribution: String,
+    /// Distribution-specific weight knob (default 0.0 — Z-Image preset).
+    #[arg(long, default_value_t = 0.0)] noising_weight: f32,
+    /// Distribution-specific bias knob (default 0.0 — Z-Image preset).
+    #[arg(long, default_value_t = 0.0)] noising_bias: f32,
     #[arg(long)] tread_route_pattern: Option<String>,
     /// Phase 1: optimizer family CLI surface; non-AdamW selection logs a
     /// warning and falls back to AdamW (full dispatch in Phase 5).
@@ -231,8 +240,8 @@ struct Args {
 }
 
 /// LOGIT_NORMAL timestep sample matching OT _get_timestep_discrete.
-/// Returns continuous timestep in [0, num_train_timesteps), passed to the model.
-/// Caller floors it to look up sigma. Same math as `train_ernie.rs`.
+/// Superseded by the unified `TimestepConfig` dispatch — kept for reference.
+#[allow(dead_code)]
 fn sample_timestep_logit_normal(rng: &mut rand::rngs::StdRng) -> f32 {
     use rand_distr::{Distribution, Normal};
     let normal = Normal::new(LOGIT_NORMAL_BIAS, LOGIT_NORMAL_SCALE).unwrap();
@@ -245,6 +254,23 @@ fn sample_timestep_logit_normal(rng: &mut rand::rngs::StdRng) -> f32 {
         NUM_TRAIN_TIMESTEPS as f32 * TIMESTEP_SHIFT * t
             / ((TIMESTEP_SHIFT - 1.0) * t + NUM_TRAIN_TIMESTEPS as f32)
     }
+}
+
+/// Build the unified `TimestepConfig` from CLI args.
+fn build_timestep_config(
+    distribution: &str,
+    weight: f32,
+    bias: f32,
+) -> anyhow::Result<TimestepConfig> {
+    let dist = TimestepDistribution::from_str(distribution)
+        .map_err(|e| anyhow::anyhow!("--timestep-distribution: {e}"))?;
+    Ok(TimestepConfig {
+        distribution: dist,
+        noising_weight: weight,
+        noising_bias: bias,
+        min_strength: 0.0,
+        max_strength: 1.0,
+    })
 }
 
 fn main() -> anyhow::Result<()> {
@@ -433,6 +459,13 @@ fn main() -> anyhow::Result<()> {
         }
         cfg
     };
+
+    // Unified OneTrainer timestep distribution dispatch.
+    let timestep_cfg = build_timestep_config(
+        &args.timestep_distribution,
+        args.noising_weight,
+        args.noising_bias,
+    )?;
 
     // ── Full resume: weights + AdamW state + step counter ────────────────
     let mut start_step: usize = 0;
@@ -665,8 +698,8 @@ fn main() -> anyhow::Result<()> {
             (cap_feats, cap_mask)
         };
 
-        // LOGIT_NORMAL continuous timestep ∈ [0, NUM_TRAIN_TIMESTEPS), then floor → sigma idx.
-        let raw_t = sample_timestep_logit_normal(&mut rng);
+        // Continuous timestep ∈ [0, NUM_TRAIN_TIMESTEPS), then floor → sigma idx.
+        let raw_t = timestep_cfg.sample_one(&mut rng) * NUM_TRAIN_TIMESTEPS as f32;
         // Default-off: Strategy::None → returns raw_t unchanged.
         let t_continuous = timestep_bias::apply_bias(
             raw_t,
@@ -886,7 +919,7 @@ fn main() -> anyhow::Result<()> {
                     };
                     // Side-RNG so training-side `rng` is not perturbed.
                     let mut vrng = rand::rngs::StdRng::seed_from_u64(SEED ^ (step as u64 + 1));
-                    let raw_t = sample_timestep_logit_normal(&mut vrng);
+                    let raw_t = timestep_cfg.sample_one(&mut vrng) * NUM_TRAIN_TIMESTEPS as f32;
                     let t_continuous = timestep_bias::apply_bias(
                         raw_t,
                         NUM_TRAIN_TIMESTEPS as f32,

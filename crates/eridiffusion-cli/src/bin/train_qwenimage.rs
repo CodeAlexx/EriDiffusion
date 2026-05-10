@@ -30,6 +30,8 @@ use eridiffusion_core::training::features::{
 };
 use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::training_features::OptimizerKind;
+use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
+use std::str::FromStr as _;
 use rand::{rngs::StdRng, SeedableRng};
 use std::path::PathBuf;
 
@@ -165,6 +167,14 @@ struct Args {
     #[arg(long, default_value_t = 0.0)] timestep_bias_multiplier: f32,
     #[arg(long, default_value_t = 0.0)] timestep_bias_range_min: f32,
     #[arg(long, default_value_t = 1.0)] timestep_bias_range_max: f32,
+    /// Timestep distribution. `logit_normal` (default — qwen preset),
+    /// `uniform`, `sigmoid`, `heavy_tail`, `cos_map`, `inverted_parabola`.
+    /// The qwen-shift remap is applied after the unified sampler.
+    #[arg(long, default_value = "logit_normal")] timestep_distribution: String,
+    /// Distribution-specific weight knob (default 0.0 — qwen preset).
+    #[arg(long, default_value_t = 0.0)] noising_weight: f32,
+    /// Distribution-specific bias knob (default 0.0 — qwen preset).
+    #[arg(long, default_value_t = 0.0)] noising_bias: f32,
     /// Phase 1: optimizer family CLI surface (Phase 5 wires full dispatch).
     #[arg(long, default_value = "adamw")] optimizer: String,
 
@@ -275,6 +285,9 @@ fn format_elapsed(secs: f32) -> String {
 
 /// Sample logit-normal then apply qwen_shift remap. Matches musubi
 /// `t = sigmoid(z); t = t*shift / (1 + (shift-1)*t)` byte-for-byte.
+///
+/// Superseded by the unified `TimestepConfig` dispatch (see `apply_qwen_shift`).
+#[allow(dead_code)]
 fn sample_timestep_logit_normal_qwenshift(rng: &mut StdRng, shift: f32) -> f32 {
     use rand_distr::{Distribution, Normal};
     let normal = Normal::new(0.0f32, 1.0f32).unwrap();
@@ -286,6 +299,30 @@ fn sample_timestep_logit_normal_qwenshift(rng: &mut StdRng, shift: f32) -> f32 {
     // Continuous sampling here can hit sigma == 0 (degenerate clean input)
     // → clamp to the OT minimum.
     shifted.clamp(1.0 / 1000.0, 1.0)
+}
+
+/// Apply qwen-shift remap and clamp. Caller passes `t` from the unified
+/// `TimestepConfig::sample_one` (in `[0, 1]`).
+fn apply_qwen_shift(t: f32, shift: f32) -> f32 {
+    let shifted = shift * t / (1.0 + (shift - 1.0) * t);
+    shifted.clamp(1.0 / 1000.0, 1.0)
+}
+
+/// Build the unified `TimestepConfig` from CLI args.
+fn build_timestep_config(
+    distribution: &str,
+    weight: f32,
+    bias: f32,
+) -> anyhow::Result<TimestepConfig> {
+    let dist = TimestepDistribution::from_str(distribution)
+        .map_err(|e| anyhow::anyhow!("--timestep-distribution: {e}"))?;
+    Ok(TimestepConfig {
+        distribution: dist,
+        noising_weight: weight,
+        noising_bias: bias,
+        min_strength: 0.0,
+        max_strength: 1.0,
+    })
 }
 
 fn main() -> anyhow::Result<()> {
@@ -722,6 +759,13 @@ fn main() -> anyhow::Result<()> {
         cfg
     };
 
+    // Unified OneTrainer timestep distribution dispatch.
+    let timestep_cfg = build_timestep_config(
+        &args.timestep_distribution,
+        args.noising_weight,
+        args.noising_bias,
+    )?;
+
     let mut start_step = 0usize;
 
     // Resume.
@@ -808,7 +852,7 @@ fn main() -> anyhow::Result<()> {
         let _ = b;
 
         // Sample timestep with qwen_shift.
-        let raw_t = sample_timestep_logit_normal_qwenshift(&mut rng, shift);
+        let raw_t = apply_qwen_shift(timestep_cfg.sample_one(&mut rng), shift);
         // Default-off: Strategy::None → returns raw_t unchanged. qwenimage
         // sigma is already in [0, 1], so we pass total=1.0.
         let t_continuous = timestep_bias::apply_bias(
@@ -1038,7 +1082,7 @@ fn main() -> anyhow::Result<()> {
                     let (v_lat_h, v_lat_w) = (v_dims[2], v_dims[3]);
 
                     let mut vrng = rand::rngs::StdRng::seed_from_u64(args.seed ^ (step as u64 + 1));
-                    let v_sigma = sample_timestep_logit_normal_qwenshift(&mut vrng, shift);
+                    let v_sigma = apply_qwen_shift(timestep_cfg.sample_one(&mut vrng), shift);
                     let v_timestep = Tensor::from_vec(
                         vec![v_sigma],
                         Shape::from_dims(&[1]),

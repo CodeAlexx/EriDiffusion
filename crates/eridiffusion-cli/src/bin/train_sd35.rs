@@ -28,6 +28,8 @@ use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::ema_advanced::EmaConfig;
 use eridiffusion_core::training::features::{loss_weight, lr_schedule, noise_modifiers, timestep_bias, validation::ValidationLoop};
 use eridiffusion_core::training::training_features::OptimizerKind;
+use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
+use std::str::FromStr as _;
 use eridiffusion_core::debug as dbg;
 use eridiffusion_core::encoders::clip_g::ClipGEncoder;
 use eridiffusion_core::encoders::clip_l::{ClipConfig, ClipEncoder};
@@ -159,6 +161,13 @@ struct Args {
     #[arg(long, default_value_t = 0.0)] timestep_bias_multiplier: f32,
     #[arg(long, default_value_t = 0.0)] timestep_bias_range_min: f32,
     #[arg(long, default_value_t = 1.0)] timestep_bias_range_max: f32,
+    /// Timestep distribution. `logit_normal` (default — SD3.5 preset),
+    /// `uniform`, `sigmoid`, `heavy_tail`, `cos_map`, `inverted_parabola`.
+    #[arg(long, default_value = "logit_normal")] timestep_distribution: String,
+    /// Distribution-specific weight knob (default 0.0 — SD3.5 preset).
+    #[arg(long, default_value_t = 0.0)] noising_weight: f32,
+    /// Distribution-specific bias knob (default 0.0 — SD3.5 preset).
+    #[arg(long, default_value_t = 0.0)] noising_bias: f32,
     #[arg(long)] tread_route_pattern: Option<String>,
     /// Phase 1: optimizer family CLI surface (Phase 5 wires full dispatch).
     #[arg(long, default_value = "adamw")] optimizer: String,
@@ -236,10 +245,8 @@ struct Args {
 }
 
 /// LOGIT_NORMAL timestep sample → continuous t in `[min_t, max_t)`.
-/// Mirrors OT `_get_timestep_discrete` (LOGIT_NORMAL branch, line 154-160 +
-/// 172): scales the unit-interval logit-normal draw into
-/// `[min_noising_strength, max_noising_strength) * num_train_timesteps`,
-/// then applies the resolution-aware shift.
+/// Superseded by the unified `TimestepConfig` dispatch — kept for reference.
+#[allow(dead_code)]
 fn sample_timestep_logit_normal(
     rng: &mut rand::rngs::StdRng,
     shift: f32,
@@ -259,6 +266,36 @@ fn sample_timestep_logit_normal(
         NUM_TRAIN_TIMESTEPS as f32 * shift * t
             / ((shift - 1.0) * t + NUM_TRAIN_TIMESTEPS as f32)
     }
+}
+
+/// Apply SD3.5's resolution-aware timestep shift after scaling. Caller
+/// passes `t` already in `[min_t, max_t) ⊂ [0, NUM_TRAIN_TIMESTEPS)`.
+fn apply_sd35_shift(t: f32, shift: f32) -> f32 {
+    if (shift - 1.0).abs() < 1e-6 {
+        t
+    } else {
+        NUM_TRAIN_TIMESTEPS as f32 * shift * t
+            / ((shift - 1.0) * t + NUM_TRAIN_TIMESTEPS as f32)
+    }
+}
+
+/// Build the unified `TimestepConfig` from CLI args + `TrainConfig` strength range.
+fn build_timestep_config(
+    distribution: &str,
+    weight: f32,
+    bias: f32,
+    min_strength: f32,
+    max_strength: f32,
+) -> anyhow::Result<TimestepConfig> {
+    let dist = TimestepDistribution::from_str(distribution)
+        .map_err(|e| anyhow::anyhow!("--timestep-distribution: {e}"))?;
+    Ok(TimestepConfig {
+        distribution: dist,
+        noising_weight: weight,
+        noising_bias: bias,
+        min_strength: min_strength.max(0.0),
+        max_strength: max_strength.min(1.0),
+    })
 }
 
 fn collect_shards(path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -749,6 +786,15 @@ fn main() -> anyhow::Result<()> {
         cfg
     };
 
+    // Unified OneTrainer timestep distribution dispatch.
+    let timestep_cfg = build_timestep_config(
+        &args.timestep_distribution,
+        args.noising_weight,
+        args.noising_bias,
+        config.min_noising_strength as f32,
+        config.max_noising_strength as f32,
+    )?;
+
     if let Some(resume_path) = args.resume_lora.as_ref() {
         log::info!("Resuming LoRA weights only (no optimizer state) from {}", resume_path.display());
         model.load_weights(&resume_path.to_string_lossy())?;
@@ -961,12 +1007,15 @@ fn main() -> anyhow::Result<()> {
         let mut sigma_per_b: Vec<f32> = Vec::with_capacity(bs);
         let mut t_model_per_b: Vec<f32> = Vec::with_capacity(bs);
         for _ in 0..bs {
-            let raw_t = sample_timestep_logit_normal(
-                &mut rng,
-                args.timestep_shift,
-                config.min_noising_strength as f32,
-                config.max_noising_strength as f32,
-            );
+            // Sample u in [0, 1] from the unified dispatcher, rescale to
+            // [min_t, max_t) using `min_strength/max_strength` (the legacy
+            // sd35 sampler did this inline), then apply the resolution-aware
+            // shift to match the legacy path byte-for-byte.
+            let u = timestep_cfg.sample_one(&mut rng);
+            let min_t = NUM_TRAIN_TIMESTEPS as f32 * timestep_cfg.min_strength;
+            let max_t = NUM_TRAIN_TIMESTEPS as f32 * timestep_cfg.max_strength;
+            let t_scaled = u * (max_t - min_t) + min_t;
+            let raw_t = apply_sd35_shift(t_scaled, args.timestep_shift);
             // Default-off: Strategy::None → returns raw_t unchanged.
             let t_continuous = timestep_bias::apply_bias(
                 raw_t,
@@ -1211,11 +1260,12 @@ fn main() -> anyhow::Result<()> {
                         SEED.wrapping_mul(0x9E3779B97F4A7C15)
                             .wrapping_add(step as u64 + 1),
                     );
-                    let t_continuous = sample_timestep_logit_normal(
-                        &mut vrng,
+                    let v_u = timestep_cfg.sample_one(&mut vrng);
+                    let v_min_t = NUM_TRAIN_TIMESTEPS as f32 * timestep_cfg.min_strength;
+                    let v_max_t = NUM_TRAIN_TIMESTEPS as f32 * timestep_cfg.max_strength;
+                    let t_continuous = apply_sd35_shift(
+                        v_u * (v_max_t - v_min_t) + v_min_t,
                         args.timestep_shift,
-                        config.min_noising_strength as f32,
-                        config.max_noising_strength as f32,
                     );
                     let sigma_idx = (t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
                     let sigma = (sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32;

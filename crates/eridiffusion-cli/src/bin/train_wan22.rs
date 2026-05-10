@@ -60,6 +60,8 @@ use eridiffusion_core::training::features::{
     validation::ValidationLoop,
 };
 use eridiffusion_core::training::training_features::OptimizerKind;
+use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
+use std::str::FromStr as _;
 use flame_core::adam::AdamW;
 use flame_core::autograd::AutogradContext;
 use flame_core::{DType, Shape, Tensor};
@@ -146,9 +148,22 @@ struct Args {
     /// archive default.
     #[arg(long, default_value_t = 1.0)] sigmoid_scale: f32,
 
-    /// `logit_normal | uniform` — see archive `schedule.rs`. Both
-    /// then get `apply_time_shift(_, shift)` applied on top.
+    /// Legacy timestep method: `logit_normal | uniform`. Used only when
+    /// `--timestep-distribution=auto` (default). Both go through the wan22
+    /// `apply_time_shift(_, shift)` helper after sampling.
     #[arg(long, default_value = "logit_normal")] timestep_method: String,
+    /// Unified OneTrainer timestep distribution. `auto` (default) keeps
+    /// the legacy `--timestep-method` path for byte-equivalence with
+    /// pre-flag runs. Other choices: `uniform`, `sigmoid`, `logit_normal`,
+    /// `heavy_tail`, `cos_map`, `inverted_parabola`. When non-`auto`, the
+    /// chosen distribution samples a base `t ∈ [0, 1]`, then the wan22
+    /// `apply_time_shift(_, shift)` is applied on top — matching the
+    /// legacy plumbing.
+    #[arg(long, default_value = "auto")] timestep_distribution: String,
+    /// Distribution-specific weight knob (default 0.0).
+    #[arg(long, default_value_t = 0.0)] noising_weight: f32,
+    /// Distribution-specific bias knob (default 0.0).
+    #[arg(long, default_value_t = 0.0)] noising_bias: f32,
 
     #[arg(long, default_value = "0")] save_every: usize,
     #[arg(long, default_value = "0")] sample_every: usize,
@@ -780,6 +795,21 @@ fn main() -> anyhow::Result<()> {
         timestep_method.as_str(),
         "logit_normal" | "logitnormal"
     );
+    // Unified OneTrainer timestep distribution dispatch (optional override).
+    // `auto` keeps the legacy `--timestep-method` path for byte-equivalence.
+    let unified_timestep_cfg: Option<TimestepConfig> = if args.timestep_distribution.eq_ignore_ascii_case("auto") {
+        None
+    } else {
+        let dist = TimestepDistribution::from_str(&args.timestep_distribution)
+            .map_err(|e| anyhow::anyhow!("--timestep-distribution: {e}"))?;
+        Some(TimestepConfig {
+            distribution: dist,
+            noising_weight: args.noising_weight,
+            noising_bias: args.noising_bias,
+            min_strength: 0.0,
+            max_strength: 1.0,
+        })
+    };
 
     // ── Training loop ───────────────────────────────────────────────────
     log::info!("[wan22] starting training: {} steps", steps);
@@ -858,7 +888,12 @@ fn main() -> anyhow::Result<()> {
         // --- 2. Per-batch-element timestep + Wan time shift
         let mut t_continuous = Vec::with_capacity(args.batch_size);
         for _ in 0..args.batch_size {
-            let raw_t = if use_logit_normal {
+            let raw_t = if let Some(ref tcfg) = unified_timestep_cfg {
+                // Sample base in [0,1], then apply the wan22 time shift on top
+                // (matches the legacy `sample_*_with_shift` plumbing).
+                let base = tcfg.sample_one(&mut rng);
+                wan22::apply_time_shift(base, args.shift).clamp(1.0e-4, 1.0 - 1.0e-4)
+            } else if use_logit_normal {
                 wan22::sample_logit_normal_with_shift(&mut rng, args.shift, args.sigmoid_scale)
             } else {
                 wan22::sample_uniform_with_shift(&mut rng, args.shift)

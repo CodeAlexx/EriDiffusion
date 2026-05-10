@@ -19,6 +19,8 @@ use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::ema_advanced::EmaConfig;
 use eridiffusion_core::training::features::{loss_weight, lr_schedule, noise_modifiers, timestep_bias, validation::ValidationLoop};
 use eridiffusion_core::training::training_features::OptimizerKind;
+use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
+use std::str::FromStr as _;
 use eridiffusion_core::debug as dbg;
 use eridiffusion_core::encoders::{mistral3b::Mistral3bEncoder, vae::KleinVaeDecoder};
 use eridiffusion_core::models::{ErnieModel, TrainableModel};
@@ -117,6 +119,13 @@ struct Args {
     #[arg(long, default_value_t = 0.0)] timestep_bias_multiplier: f32,
     #[arg(long, default_value_t = 0.0)] timestep_bias_range_min: f32,
     #[arg(long, default_value_t = 1.0)] timestep_bias_range_max: f32,
+    /// Timestep distribution. `logit_normal` (default — ERNIE preset),
+    /// `uniform`, `sigmoid`, `heavy_tail`, `cos_map`, `inverted_parabola`.
+    #[arg(long, default_value = "logit_normal")] timestep_distribution: String,
+    /// Distribution-specific weight knob (default 0.0 — ERNIE preset).
+    #[arg(long, default_value_t = 0.0)] noising_weight: f32,
+    /// Distribution-specific bias knob (default 0.0 — ERNIE preset).
+    #[arg(long, default_value_t = 0.0)] noising_bias: f32,
     #[arg(long)] tread_route_pattern: Option<String>,
     /// Phase 1: optimizer family CLI surface (Phase 5 wires full dispatch).
     #[arg(long, default_value = "adamw")] optimizer: String,
@@ -185,8 +194,8 @@ struct Args {
 }
 
 /// LOGIT_NORMAL timestep sample matching OT _get_timestep_discrete.
-/// Returns continuous timestep in [0, num_train_timesteps), passed to the model.
-/// Caller floors it to look up sigma.
+/// Superseded by the unified `TimestepConfig` dispatch — kept for reference.
+#[allow(dead_code)]
 fn sample_timestep_logit_normal(rng: &mut rand::rngs::StdRng) -> f32 {
     use rand_distr::{Distribution, Normal};
     let normal = Normal::new(LOGIT_NORMAL_BIAS, LOGIT_NORMAL_SCALE).unwrap();
@@ -200,6 +209,23 @@ fn sample_timestep_logit_normal(rng: &mut rand::rngs::StdRng) -> f32 {
         NUM_TRAIN_TIMESTEPS as f32 * TIMESTEP_SHIFT * t
             / ((TIMESTEP_SHIFT - 1.0) * t + NUM_TRAIN_TIMESTEPS as f32)
     }
+}
+
+/// Build the unified `TimestepConfig` from CLI args.
+fn build_timestep_config(
+    distribution: &str,
+    weight: f32,
+    bias: f32,
+) -> anyhow::Result<TimestepConfig> {
+    let dist = TimestepDistribution::from_str(distribution)
+        .map_err(|e| anyhow::anyhow!("--timestep-distribution: {e}"))?;
+    Ok(TimestepConfig {
+        distribution: dist,
+        noising_weight: weight,
+        noising_bias: bias,
+        min_strength: 0.0,
+        max_strength: 1.0,
+    })
 }
 
 fn main() -> anyhow::Result<()> {
@@ -424,6 +450,13 @@ fn main() -> anyhow::Result<()> {
         cfg
     };
 
+    // Unified OneTrainer timestep distribution dispatch.
+    let timestep_cfg = build_timestep_config(
+        &args.timestep_distribution,
+        args.noising_weight,
+        args.noising_bias,
+    )?;
+
     if let Some(resume_path) = args.resume_lora.as_ref() {
         log::info!("Resuming LoRA weights only (no optimizer state) from {}", resume_path.display());
         model.load_weights(&resume_path.to_string_lossy())?;
@@ -609,7 +642,7 @@ fn main() -> anyhow::Result<()> {
         // Flow-matching noise schedule (OT _add_noise_discrete with discrete sigmas):
         //   sigma_idx ∈ [0, 999], sigma = (sigma_idx + 1) / 1000.
         // Continuous timestep in [0, 1000) is what the transformer's sin/cos sees.
-        let raw_t = sample_timestep_logit_normal(&mut rng);
+        let raw_t = timestep_cfg.sample_one(&mut rng) * NUM_TRAIN_TIMESTEPS as f32;
         // Default-off: Strategy::None → returns raw_t unchanged.
         let t_continuous = timestep_bias::apply_bias(
             raw_t,
@@ -847,7 +880,7 @@ fn main() -> anyhow::Result<()> {
                     // uses its OWN run-side RNG so it does not perturb the
                     // training-side seeded sequence (byte invariance).
                     let mut vrng = rand::rngs::StdRng::seed_from_u64(SEED ^ (step as u64 + 1));
-                    let t_continuous = sample_timestep_logit_normal(&mut vrng);
+                    let t_continuous = timestep_cfg.sample_one(&mut vrng) * NUM_TRAIN_TIMESTEPS as f32;
                     let sigma_idx = (t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
                     let sigma = (sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32;
                     let v_noise = Tensor::randn(v_lat.shape().clone(), 0.0, 1.0, device.clone())?

@@ -35,6 +35,8 @@ use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::ema_advanced::EmaConfig;
 use eridiffusion_core::training::features::{loss_weight, lr_schedule, noise_modifiers, timestep_bias, validation::ValidationLoop};
 use eridiffusion_core::training::training_features::OptimizerKind;
+use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
+use std::str::FromStr as _;
 use std::path::PathBuf;
 
 const NUM_TRAIN_TIMESTEPS: usize = 1000;
@@ -111,6 +113,16 @@ struct Args {
     #[arg(long, default_value_t = 0.0)] timestep_bias_multiplier: f32,
     #[arg(long, default_value_t = 0.0)] timestep_bias_range_min: f32,
     #[arg(long, default_value_t = 1.0)] timestep_bias_range_max: f32,
+    /// Timestep distribution. `uniform` (default — SDXL preset, sampler
+    /// returns an integer-valued continuous t to feed alpha_bar[]),
+    /// `logit_normal`, `sigmoid`, `heavy_tail`, `cos_map`, `inverted_parabola`.
+    /// Non-uniform sampling is sound for SDXL but breaks byte-identity
+    /// against the pre-flag default.
+    #[arg(long, default_value = "uniform")] timestep_distribution: String,
+    /// Distribution-specific weight knob (default 0.0).
+    #[arg(long, default_value_t = 0.0)] noising_weight: f32,
+    /// Distribution-specific bias knob (default 0.0).
+    #[arg(long, default_value_t = 0.0)] noising_bias: f32,
     #[arg(long)] tread_route_pattern: Option<String>,
     /// Phase 1: optimizer family CLI surface (Phase 5 wires full dispatch).
     #[arg(long, default_value = "adamw")] optimizer: String,
@@ -457,6 +469,25 @@ fn main() -> anyhow::Result<()> {
         cfg
     };
 
+    // Unified OneTrainer timestep distribution dispatch. `None` ⇒ legacy
+    // integer-uniform path (default-off byte invariance).
+    let timestep_cfg: Option<TimestepConfig> = if args.timestep_distribution.eq_ignore_ascii_case("uniform")
+        && args.noising_weight == 0.0
+        && args.noising_bias == 0.0
+    {
+        None
+    } else {
+        let dist = TimestepDistribution::from_str(&args.timestep_distribution)
+            .map_err(|e| anyhow::anyhow!("--timestep-distribution: {e}"))?;
+        Some(TimestepConfig {
+            distribution: dist,
+            noising_weight: args.noising_weight,
+            noising_bias: args.noising_bias,
+            min_strength: 0.0,
+            max_strength: 1.0,
+        })
+    };
+
     // SDXL audit HIGH-4: caption-dropout uses the OT-parity ZERO-MULTIPLY
     // path (TE hidden × 0, pooled × 0). The legacy `--null-text-cache` swap
     // is no longer required; we still load it here when provided so the
@@ -661,8 +692,15 @@ fn main() -> anyhow::Result<()> {
         // ADM input `y` = concat(CLIP-G pool [1280], size_emb [1536]) → [1, 2816]
         let pooled = Tensor::cat(&[&pooled_clip_g, &size_t], 1)?.to_dtype(DType::BF16)?;
 
-        // Uniform integer timestep in [0, 1000)
-        let raw_t = rng.gen_range(0..NUM_TRAIN_TIMESTEPS) as f32;
+        // Timestep sample. Default `uniform` keeps the legacy integer-uniform
+        // path (`rng.gen_range`) for byte-equivalence with pre-flag runs;
+        // any other distribution dispatches through the unified
+        // `TimestepConfig::sample_one` and scales to `[0, NUM_TRAIN_TIMESTEPS)`.
+        let raw_t = if let Some(ref tcfg) = timestep_cfg {
+            tcfg.sample_one(&mut rng) * NUM_TRAIN_TIMESTEPS as f32
+        } else {
+            rng.gen_range(0..NUM_TRAIN_TIMESTEPS) as f32
+        };
         // Default-off: Strategy::None → returns raw_t unchanged.
         let t_continuous = timestep_bias::apply_bias(
             raw_t,
@@ -921,7 +959,11 @@ fn main() -> anyhow::Result<()> {
                     // Side-RNG: never touches training rng. Mirrors training
                     // step's uniform integer timestep + timestep_bias dispatch.
                     let mut vrng = rand::rngs::StdRng::seed_from_u64(SEED ^ (step as u64 + 1));
-                    let raw_t = vrng.gen_range(0..NUM_TRAIN_TIMESTEPS) as f32;
+                    let raw_t = if let Some(ref tcfg) = timestep_cfg {
+                        tcfg.sample_one(&mut vrng) * NUM_TRAIN_TIMESTEPS as f32
+                    } else {
+                        vrng.gen_range(0..NUM_TRAIN_TIMESTEPS) as f32
+                    };
                     let t_continuous = timestep_bias::apply_bias(
                         raw_t,
                         NUM_TRAIN_TIMESTEPS as f32,

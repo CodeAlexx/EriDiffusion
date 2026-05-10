@@ -40,6 +40,8 @@ use eridiffusion_core::training::features::{
     loss_weight as feat_loss_weight, lr_schedule, noise_modifiers, timestep_bias,
 };
 use eridiffusion_core::training::training_features::OptimizerKind;
+use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
+use std::str::FromStr as _;
 
 /// Slot class names for the 16 LoRA modules per Anima block. Used by debug
 /// gradient summaries. MUST match `anima::LORA_SLOT_KEYS` order.
@@ -137,6 +139,18 @@ struct Args {
     #[arg(long, default_value_t = 0.0)] timestep_bias_multiplier: f32,
     #[arg(long, default_value_t = 0.0)] timestep_bias_range_min: f32,
     #[arg(long, default_value_t = 1.0)] timestep_bias_range_max: f32,
+
+    /// Unified OneTrainer timestep distribution. When set to a value other
+    /// than `auto` (default) this overrides `--timestep-sampling`, allowing
+    /// any of the 6 OT distributions (uniform / sigmoid / logit_normal /
+    /// heavy_tail / cos_map / inverted_parabola). `auto` preserves the
+    /// existing `--timestep-sampling` byte-equivalent path (sigmoid default).
+    #[arg(long, default_value = "auto")] timestep_distribution: String,
+    /// Distribution-specific weight knob (default 0.0).
+    #[arg(long, default_value_t = 0.0)] noising_weight: f32,
+    /// Distribution-specific bias knob (default 0.0).
+    #[arg(long, default_value_t = 0.0)] noising_bias: f32,
+
     #[arg(long)] tread_route_pattern: Option<String>,
     /// Phase 1: optimizer family CLI surface (Phase 5 wires full dispatch).
     #[arg(long, default_value = "adamw")] optimizer: String,
@@ -482,6 +496,24 @@ fn main() -> anyhow::Result<()> {
         cfg
     };
 
+    // Unified OneTrainer timestep distribution dispatch (optional override).
+    // When `--timestep-distribution` is `auto`, the legacy `--timestep-sampling`
+    // path is used unchanged (default-off byte invariance). Otherwise we build
+    // a `TimestepConfig` and let it drive the sampler.
+    let unified_timestep_cfg: Option<TimestepConfig> = if args.timestep_distribution.eq_ignore_ascii_case("auto") {
+        None
+    } else {
+        let dist = TimestepDistribution::from_str(&args.timestep_distribution)
+            .map_err(|e| anyhow::anyhow!("--timestep-distribution: {e}"))?;
+        Some(TimestepConfig {
+            distribution: dist,
+            noising_weight: args.noising_weight,
+            noising_bias: args.noising_bias,
+            min_strength: 0.0,
+            max_strength: 1.0,
+        })
+    };
+
     if let Some(resume_path) = args.resume_lora.as_ref() {
         log::info!("Resuming LoRA weights only (no optimizer state) from {}", resume_path.display());
         model.load_weights(&resume_path.to_string_lossy())?;
@@ -598,16 +630,21 @@ fn main() -> anyhow::Result<()> {
         };
 
         // Timestep sampling.
-        let raw_t = match args.timestep_sampling.as_str() {
-            "sigmoid" => sample_timestep_sigmoid(&mut rng, args.sigmoid_scale),
-            "uniform" => sample_timestep_uniform(&mut rng),
-            "shift" => {
-                let raw = sample_timestep_sigmoid(&mut rng, args.sigmoid_scale);
-                let s = raw / NUM_TRAIN_TIMESTEPS as f32;
-                let shifted = apply_shift(s, args.discrete_flow_shift);
-                shifted * NUM_TRAIN_TIMESTEPS as f32
+        let raw_t = if let Some(ref tcfg) = unified_timestep_cfg {
+            // Unified dispatch: sample u in [0,1] then scale to [0, NUM_TRAIN_TIMESTEPS).
+            tcfg.sample_one(&mut rng) * NUM_TRAIN_TIMESTEPS as f32
+        } else {
+            match args.timestep_sampling.as_str() {
+                "sigmoid" => sample_timestep_sigmoid(&mut rng, args.sigmoid_scale),
+                "uniform" => sample_timestep_uniform(&mut rng),
+                "shift" => {
+                    let raw = sample_timestep_sigmoid(&mut rng, args.sigmoid_scale);
+                    let s = raw / NUM_TRAIN_TIMESTEPS as f32;
+                    let shifted = apply_shift(s, args.discrete_flow_shift);
+                    shifted * NUM_TRAIN_TIMESTEPS as f32
+                }
+                other => anyhow::bail!("unknown --timestep-sampling: {other}"),
             }
-            other => anyhow::bail!("unknown --timestep-sampling: {other}"),
         };
         // Default-off: Strategy::None → returns raw_t unchanged.
         let t_continuous = timestep_bias::apply_bias(

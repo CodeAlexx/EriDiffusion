@@ -43,7 +43,9 @@ use eridiffusion_core::training::features::ema_advanced::EmaConfig;
 use eridiffusion_core::training::features::validation::ValidationLoop;
 use eridiffusion_core::training::features::{loss_weight, lr_schedule, noise_modifiers, timestep_bias};
 use eridiffusion_core::training::training_features::OptimizerKind;
+use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
 use std::path::PathBuf;
+use std::str::FromStr as _;
 
 const NUM_TRAIN_TIMESTEPS: usize = 1000;
 const LOGIT_NORMAL_BIAS: f32 = 0.0;          // TrainConfig.noising_bias default
@@ -127,6 +129,13 @@ struct Args {
     #[arg(long, default_value_t = 0.0)] timestep_bias_multiplier: f32,
     #[arg(long, default_value_t = 0.0)] timestep_bias_range_min: f32,
     #[arg(long, default_value_t = 1.0)] timestep_bias_range_max: f32,
+    /// Timestep distribution. `logit_normal` (default — FLUX preset L27),
+    /// `uniform`, `sigmoid`, `heavy_tail`, `cos_map`, `inverted_parabola`.
+    #[arg(long, default_value = "logit_normal")] timestep_distribution: String,
+    /// Distribution-specific weight knob (default 0.0 — FLUX preset).
+    #[arg(long, default_value_t = 0.0)] noising_weight: f32,
+    /// Distribution-specific bias knob (default 0.0 — FLUX preset).
+    #[arg(long, default_value_t = 0.0)] noising_bias: f32,
     #[arg(long)] tread_route_pattern: Option<String>,
     /// Phase 1: optimizer family CLI surface (Phase 5 wires full dispatch).
     #[arg(long, default_value = "adamw")] optimizer: String,
@@ -180,6 +189,10 @@ struct Args {
 }
 
 /// LOGIT_NORMAL timestep sample matching OT `_get_timestep_discrete`.
+///
+/// Superseded by the unified `TimestepConfig` dispatch — kept for reference
+/// (Box-Muller-vs-Ziggurat divergence is documented in the wiring report).
+#[allow(dead_code)]
 fn sample_timestep_logit_normal(rng: &mut rand::rngs::StdRng) -> f32 {
     use rand_distr::{Distribution, Normal};
     let normal = Normal::new(LOGIT_NORMAL_BIAS, LOGIT_NORMAL_SCALE).unwrap();
@@ -192,6 +205,23 @@ fn sample_timestep_logit_normal(rng: &mut rand::rngs::StdRng) -> f32 {
         NUM_TRAIN_TIMESTEPS as f32 * TIMESTEP_SHIFT * t
             / ((TIMESTEP_SHIFT - 1.0) * t + NUM_TRAIN_TIMESTEPS as f32)
     }
+}
+
+/// Build the unified `TimestepConfig` from CLI args.
+fn build_timestep_config(
+    distribution: &str,
+    weight: f32,
+    bias: f32,
+) -> anyhow::Result<TimestepConfig> {
+    let dist = TimestepDistribution::from_str(distribution)
+        .map_err(|e| anyhow::anyhow!("--timestep-distribution: {e}"))?;
+    Ok(TimestepConfig {
+        distribution: dist,
+        noising_weight: weight,
+        noising_bias: bias,
+        min_strength: 0.0,
+        max_strength: 1.0,
+    })
 }
 
 fn collect_shards(path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -369,6 +399,13 @@ fn main() -> anyhow::Result<()> {
         cfg
     };
 
+    // Unified OneTrainer timestep distribution dispatch.
+    let timestep_cfg = build_timestep_config(
+        &args.timestep_distribution,
+        args.noising_weight,
+        args.noising_bias,
+    )?;
+
     // Phase 1: caption_dropout. Flux has no inline encoder, so the user
     // supplies a `--null-text-cache` produced by `prepare_flux` on a single
     // empty-caption sample. We load `t5_embed` + `clip_pool` once and swap
@@ -541,7 +578,7 @@ fn main() -> anyhow::Result<()> {
             .to_dtype(DType::BF16)?;
 
         // Flow-matching: t in [0, 1000), sigma = (idx+1)/1000.
-        let raw_t = sample_timestep_logit_normal(&mut rng);
+        let raw_t = timestep_cfg.sample_one(&mut rng) * NUM_TRAIN_TIMESTEPS as f32;
         // Default-off: Strategy::None → returns raw_t unchanged.
         let t_continuous = timestep_bias::apply_bias(
             raw_t,
@@ -745,7 +782,7 @@ fn main() -> anyhow::Result<()> {
 
                     // SIDE-RNG: do NOT touch training-side `rng`.
                     let mut vrng = rand::rngs::StdRng::seed_from_u64(SEED ^ (step as u64 + 1));
-                    let raw_t = sample_timestep_logit_normal(&mut vrng);
+                    let raw_t = timestep_cfg.sample_one(&mut vrng) * NUM_TRAIN_TIMESTEPS as f32;
                     let t_continuous = timestep_bias::apply_bias(
                         raw_t,
                         NUM_TRAIN_TIMESTEPS as f32,

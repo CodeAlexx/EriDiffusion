@@ -48,6 +48,8 @@ use eridiffusion_core::training::ema::ParameterEma;
 use eridiffusion_core::training::features::ema_advanced::EmaConfig;
 use eridiffusion_core::training::features::validation::ValidationLoop;
 use eridiffusion_core::training::features::{loss_weight, lr_schedule, noise_modifiers, timestep_bias};
+use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
+use std::str::FromStr as _;
 use eridiffusion_core::training::training_features::OptimizerKind;
 use std::path::PathBuf;
 
@@ -207,41 +209,31 @@ fn shift_for_resolution(h_lat: usize, w_lat: usize) -> f32 {
     1.0 + t * (3.0 - 1.0)
 }
 
-/// Sample a base timestep `u ∈ [0, 1]` from the configured distribution. With
-/// `(uniform, 0, 0)` this matches `let u: f32 = rng.gen()` byte-for-byte —
-/// the chroma archive's legacy default.
-fn sample_base_u(
-    rng: &mut rand::rngs::StdRng,
+/// Build a `TimestepConfig` from CLI args. Used to dispatch all 6 OT
+/// distributions through the unified sampler.
+///
+/// **Byte-equivalence note:** the chroma archive's `logit_normal` and
+/// `sigmoid` arms previously used `rand_distr::Normal` (Ziggurat) for the
+/// underlying gaussian. The unified `TimestepConfig::sample_one` uses
+/// Box-Muller polar form. With the same seed the two consume the same
+/// number of `r#gen::<f32>()` draws but produce different normal samples,
+/// so resumed runs that pinned a Ziggurat-derived sequence will diverge.
+/// `Uniform` is bit-identical (no normal involved). The default
+/// (`uniform, 0, 0`) is preserved exactly.
+fn build_timestep_config(
     distribution: &str,
     weight: f32,
     bias: f32,
-) -> anyhow::Result<f32> {
-    use rand::Rng;
-    use rand_distr::{Distribution, Normal};
-    match distribution {
-        "uniform" => Ok(rng.r#gen::<f32>()),
-        "logit_normal" => {
-            // OT semantics: noising_weight + 1.0 = scale, noising_bias = mean
-            let scale = (weight + 1.0).max(1.0e-6);
-            let normal = Normal::new(bias, scale)
-                .map_err(|e| anyhow::anyhow!("logit_normal Normal: {e}"))?;
-            let z = normal.sample(rng);
-            Ok(1.0 / (1.0 + (-z).exp()))
-        }
-        "sigmoid" => {
-            // Match musubi's sigmoid: u ~ N(bias, weight+1) then sigmoid.
-            // (For Chroma we keep this for parity with archive plumbing.)
-            let scale = (weight + 1.0).max(1.0e-6);
-            let normal = Normal::new(bias, scale)
-                .map_err(|e| anyhow::anyhow!("sigmoid Normal: {e}"))?;
-            let z = normal.sample(rng);
-            Ok(1.0 / (1.0 + (-z).exp()))
-        }
-        other => anyhow::bail!(
-            "--timestep-distribution `{other}` not yet wired in train_chroma; \
-             supported: uniform, logit_normal, sigmoid"
-        ),
-    }
+) -> anyhow::Result<TimestepConfig> {
+    let dist = TimestepDistribution::from_str(distribution)
+        .map_err(|e| anyhow::anyhow!("--timestep-distribution: {e}"))?;
+    Ok(TimestepConfig {
+        distribution: dist,
+        noising_weight: weight,
+        noising_bias: bias,
+        min_strength: 0.0,
+        max_strength: 1.0,
+    })
 }
 
 fn main() -> anyhow::Result<()> {
@@ -453,6 +445,13 @@ fn main() -> anyhow::Result<()> {
         cfg
     };
 
+    // Unified OneTrainer timestep distribution dispatch.
+    let timestep_cfg = build_timestep_config(
+        &args.timestep_distribution,
+        args.noising_weight,
+        args.noising_bias,
+    )?;
+
     // Caption dropout: chroma has no clip-pool, so we only swap T5.
     let mut effective_caption_dropout_prob = args.caption_dropout_probability;
     let null_t5: Option<Tensor> = if effective_caption_dropout_prob > 0.0 {
@@ -610,12 +609,7 @@ fn main() -> anyhow::Result<()> {
         };
 
         // Sample base u and apply FLUX shift remap.
-        let u_base = sample_base_u(
-            &mut rng,
-            &args.timestep_distribution,
-            args.noising_weight,
-            args.noising_bias,
-        )?;
+        let u_base = timestep_cfg.sample_one(&mut rng);
         // Default-off: Strategy::None returns u_base unchanged (the bias module
         // is in [0, NUM_TRAIN_TIMESTEPS] units, so we lift to that range and
         // back).
@@ -818,12 +812,7 @@ fn main() -> anyhow::Result<()> {
                         shift_for_resolution(vh, vw)
                     };
                     let mut vrng = rand::rngs::StdRng::seed_from_u64(SEED ^ (step as u64 + 1));
-                    let v_u = sample_base_u(
-                        &mut vrng,
-                        &args.timestep_distribution,
-                        args.noising_weight,
-                        args.noising_bias,
-                    )?;
+                    let v_u = timestep_cfg.sample_one(&mut vrng);
                     let v_u_t = timestep_bias::apply_bias(
                         v_u * NUM_TRAIN_TIMESTEPS as f32,
                         NUM_TRAIN_TIMESTEPS as f32,
