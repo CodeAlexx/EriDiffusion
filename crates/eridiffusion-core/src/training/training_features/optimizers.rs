@@ -1356,13 +1356,25 @@ impl RAdamScheduleFree {
     }
 
     /// Swap `p` from the train weight `y` to the eval weight
-    /// `x = y * beta1 + z * (1 - beta1)`. Stashes `y` for [`exit_eval_mode`].
-    /// Idempotent: if already in eval mode (stash non-empty), no-op.
+    /// `x = y * (1/beta1) + z * (1 - 1/beta1)`. Stashes `y` for
+    /// [`exit_eval_mode`]. Idempotent: if already in eval mode
+    /// (stash non-empty), no-op.
+    ///
+    /// Math reference: facebookresearch/schedule_free `eval()` does
+    /// `p.data.lerp_(z, weight=1-1/beta1)`, which is
+    /// `p_new = p*(1-(1-1/beta1)) + z*(1-1/beta1) = p*(1/beta1) + z*(1-1/beta1)`.
+    /// With p currently storing y (train sequence), the result is the
+    /// x-sequence. For beta1=0.9 this is `x = 1.111*y - 0.111*z` — a
+    /// modest forward-extrapolation of y away from z, NOT a convex
+    /// dampening toward z. An earlier version of this method used
+    /// `x = y*beta1 + z*(1-beta1)` (the inverse direction) which
+    /// silently corrupted samples drawn after the first training step.
     pub fn enter_eval_mode(&mut self, params: &[Parameter]) -> Result<()> {
         if !self.eval_stash.is_empty() {
             return Ok(()); // already in eval mode
         }
-        let beta1 = self.beta1;
+        let inv_beta1 = 1.0 / self.beta1;
+        let one_minus_inv = 1.0 - inv_beta1;
         for p in params {
             let id = p.id();
             let Some(z) = self.z.get(&id) else { continue }; // unseen param: no z, skip
@@ -1371,8 +1383,10 @@ impl RAdamScheduleFree {
             let p_f32 = if p_dtype == DType::F32 { p_data } else { p_data.to_dtype(DType::F32)? };
             // Stash the current y (F32, detached).
             self.eval_stash.insert(id, p_f32.detach()?);
-            // Compute x = y * beta1 + z * (1 - beta1).
-            let x = p_f32.mul_scalar(beta1)?.add(&z.mul_scalar(1.0 - beta1)?)?;
+            // Compute x = y * (1/beta1) + z * (1 - 1/beta1).
+            let x = p_f32
+                .mul_scalar(inv_beta1)?
+                .add(&z.mul_scalar(one_minus_inv)?)?;
             let cast = if p_dtype == DType::F32 { x } else { x.to_dtype(p_dtype)? };
             p.set_data(cast.detach()?)?;
         }
@@ -1680,13 +1694,15 @@ impl<B: ScheduleFreeBase> ScheduleFreeWrapper<B> {
     }
 
     /// Swap `p` from train weight `y` to eval weight
-    /// `x = y * momentum + z * (1 - momentum)`. See
-    /// [`RAdamScheduleFree::enter_eval_mode`] for rationale. Idempotent.
+    /// `x = y * (1/momentum) + z * (1 - 1/momentum)`. See
+    /// [`RAdamScheduleFree::enter_eval_mode`] for the math derivation.
+    /// Idempotent.
     pub fn enter_eval_mode(&mut self, params: &[Parameter]) -> Result<()> {
         if !self.eval_stash.is_empty() {
             return Ok(());
         }
-        let momentum = self.momentum;
+        let inv_m = 1.0 / self.momentum;
+        let one_minus_inv = 1.0 - inv_m;
         for p in params {
             let id = p.id();
             let Some(z) = self.z.get(&id) else { continue };
@@ -1694,7 +1710,9 @@ impl<B: ScheduleFreeBase> ScheduleFreeWrapper<B> {
             let p_dtype = p_data.dtype();
             let p_f32 = if p_dtype == DType::F32 { p_data } else { p_data.to_dtype(DType::F32)? };
             self.eval_stash.insert(id, p_f32.detach()?);
-            let x = p_f32.mul_scalar(momentum)?.add(&z.mul_scalar(1.0 - momentum)?)?;
+            let x = p_f32
+                .mul_scalar(inv_m)?
+                .add(&z.mul_scalar(one_minus_inv)?)?;
             let cast = if p_dtype == DType::F32 { x } else { x.to_dtype(p_dtype)? };
             p.set_data(cast.detach()?)?;
         }
