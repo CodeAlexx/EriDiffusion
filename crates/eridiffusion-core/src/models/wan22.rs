@@ -330,19 +330,47 @@ impl Wan22LoraBundle {
     /// the resident `block_weights` map into this method.
     pub fn apply_init_perturbed_normal(
         &self,
-        _base_weights: &HashMap<String, Tensor>,
+        base_weights: &HashMap<String, Tensor>,
         scale: f32,
     ) -> Result<()> {
         if self.algo != LycorisAlgo::LoKr || scale <= 0.0 {
             return Ok(());
         }
-        log::warn!(
-            "[wan22:{}] init_lokr_norm={scale} requested but trainer-side base-weight \
-             access is not yet wired for wan22 (block weights are streamed via \
-             BlockOffloader and not always resident at bundle-construction time). \
-             LoKr magnitude will use its lycoris-rs default init for this run. \
-             Phase 2c will plumb the resident `block_weights` map into this method.",
-            self.expert_label,
+        if base_weights.is_empty() {
+            log::warn!(
+                "[wan22:{}] init_lokr_norm={scale}: base_weights map is empty — \
+                 perturbed-normal init skipped (only-offloaded model).",
+                self.expert_label
+            );
+            return Ok(());
+        }
+        let mut applied = 0usize;
+        let mut skipped = 0usize;
+        for (&(block_idx, target), adapter) in &self.lycoris_adapters {
+            let suffix = target.key();
+            // wan2.2 on-disk block weights live under `blocks.{i}.{suffix}.weight`.
+            // BlockOffloader-resident maps may also use `transformer_blocks.{i}.{suffix}.weight`
+            // — try both for robustness.
+            let key = format!("blocks.{block_idx}.{suffix}.weight");
+            let alt = format!("transformer_blocks.{block_idx}.{suffix}.weight");
+            let base = base_weights.get(&key).or_else(|| base_weights.get(&alt));
+            let Some(base) = base else {
+                log::warn!(
+                    "[wan22:{}][init_lokr_norm] missing base weight `{key}` (also tried `{alt}`) — skipping",
+                    self.expert_label
+                );
+                skipped += 1;
+                continue;
+            };
+            let did = adapter.as_ref().init_perturbed_normal_lokr(base, scale)
+                .map_err(|e| flame_core::FlameError::InvalidOperation(format!(
+                    "init_perturbed_normal_lokr({key}): {e}"
+                )))?;
+            if did { applied += 1; } else { skipped += 1; }
+        }
+        log::info!(
+            "[wan22:{}][init_lokr_norm] applied={applied} skipped={skipped} scale={scale}",
+            self.expert_label
         );
         Ok(())
     }

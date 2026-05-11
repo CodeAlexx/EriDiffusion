@@ -616,16 +616,13 @@ fn main() -> anyhow::Result<()> {
 
         let grads = loss_scaled.backward()?;
 
-        // Grad-flow assertion at step 1. Only meaningful for AdamW: other
-        // optimizers (Adafactor, AdamW8bit, Lion, Prodigy, StableAdamW) call
-        // `Parameter::set_data()` in their `.step()`, which replaces the
-        // stored tensor with a fresh `TensorId` while leaving `Parameter.id`
-        // untouched. At step 1 those optimizers' params have already been
-        // through one .step(), so the diagnostic queries `grads.get(stale_id)`
-        // and reports every param "missing" even though training is healthy.
-        // Loss-vs-time is the real signal in that case.
-        let grad_flow_meaningful = matches!(opt_kind, OptimizerKind::AdamW);
-        if step == 1 && grad_flow_meaningful {
+        // Grad-flow assertion at step 1. Works for ALL optimizers now that
+        // flame-core's `Parameter::set_data` pins `self.id` across in-place
+        // updates (see `flame-core/src/parameter.rs::set_data`). Previously
+        // Adafactor/Lion/Prodigy/StableAdamW/RAdamScheduleFree silently
+        // no-op'd because their post-step Parameter.id drifted out of sync
+        // with the next backward's GradientMap keys.
+        if step == 1 {
             let named = model.named_parameters();
             let named_refs: Vec<(&str, &flame_core::parameter::Parameter)> =
                 named.iter().map(|(n, p)| (n.as_str(), p)).collect();
@@ -635,13 +632,6 @@ fn main() -> anyhow::Result<()> {
             } else {
                 log::warn!("[train_u1] grad-flow {}", report.summary());
             }
-        } else if step == 1 {
-            log::info!(
-                "[train_u1] step 1 grad-flow check skipped (optimizer={:?} \
-                 uses Parameter::set_data which breaks the id-based diagnostic; \
-                 training is healthy if loss decreases)",
-                opt_kind,
-            );
         }
 
         // Accumulate grads into Parameter.grad. For grad_accum > 1, sum

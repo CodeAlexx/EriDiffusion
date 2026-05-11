@@ -167,18 +167,38 @@ impl QwenImageLoraBundle {
     /// already resident at bundle-construction time.
     pub fn apply_init_perturbed_normal(
         &self,
-        _base_weights: &HashMap<String, Tensor>,
+        base_weights: &HashMap<String, Tensor>,
         scale: f32,
     ) -> Result<()> {
         if self.algo != LycorisAlgo::LoKr || scale <= 0.0 {
             return Ok(());
         }
-        log::warn!(
-            "[qwenimage] init_lokr_norm={scale} requested but trainer-side base-weight \
-             access is not yet wired for qwenimage (block weights are streamed via \
-             BlockOffloader, not resident at bundle-construction time). LoKr \
-             magnitude will use its lycoris-rs default init for this run. Phase 2c \
-             will plumb the resident `block_weights` map into this method."
+        if base_weights.is_empty() {
+            log::warn!(
+                "[qwenimage] init_lokr_norm={scale}: base_weights map is empty — \
+                 perturbed-normal init skipped. The trainer must pass the resident \
+                 block-weights HashMap (key format `transformer_blocks.{{i}}.{{suffix}}.weight`)."
+            );
+            return Ok(());
+        }
+        let mut applied = 0usize;
+        let mut skipped = 0usize;
+        for (&(block_idx, target), adapter) in &self.lycoris_adapters {
+            let suffix = Self::target_suffix(target);
+            let key = format!("transformer_blocks.{block_idx}.{suffix}.weight");
+            let Some(base) = base_weights.get(&key) else {
+                log::warn!("[qwenimage][init_lokr_norm] missing base weight `{key}` — skipping");
+                skipped += 1;
+                continue;
+            };
+            let did = adapter.as_ref().init_perturbed_normal_lokr(base, scale)
+                .map_err(|e| flame_core::FlameError::InvalidOperation(format!(
+                    "init_perturbed_normal_lokr({key}): {e}"
+                )))?;
+            if did { applied += 1; } else { skipped += 1; }
+        }
+        log::info!(
+            "[qwenimage][init_lokr_norm] applied={applied} skipped={skipped} scale={scale}"
         );
         Ok(())
     }

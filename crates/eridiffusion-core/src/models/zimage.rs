@@ -169,28 +169,128 @@ impl ZImageLoraBundle {
         })
     }
 
-    /// SimpleTuner-style perturbed-normal init for LoKr.
+    /// SimpleTuner-style perturbed-normal init for LoKr (Phase 2c — wired).
     ///
-    /// Phase 2b limitation: Z-Image's resident block weights live on
-    /// `ZImageModel::block_weights` (per-layer HashMap) but the trainer
-    /// doesn't yet pass that map into this method. Until that plumbing
-    /// lands (Phase 2c follow-up), this method logs a warning and returns
-    /// `Ok(())` without touching adapters. The user-facing flag
-    /// `--init_lokr_norm` therefore behaves as a no-op for zimage in
-    /// Phase 2b — matches the qwenimage pattern.
-    pub fn apply_init_perturbed_normal(&self, scale: f32) -> Result<()> {
+    /// Breaks the LoKr dead-leaf at step 0: default LoKr init zeros `w2_b`
+    /// so only `w2_b` receives non-zero gradient, leaving `w1` and `w2_a`
+    /// frozen for many steps (catastrophic with ScheduleFree optimizers).
+    /// Perturbed-normal init replaces both factors with small noise so
+    /// every leaf sees gradient from step 1.
+    ///
+    /// `block_weights[block_idx]` is the per-block weight map populated by
+    /// `ZImageModel::load`. Base key format: `layers.{block_idx}.{suffix}.weight`
+    /// where `suffix` matches `ai_toolkit_suffix(target)`.
+    ///
+    /// Returns the number of slots whose init was skipped (missing weight,
+    /// adapter declined). Logged but non-fatal.
+    pub fn apply_init_perturbed_normal(
+        &self,
+        block_weights: &[HashMap<String, Tensor>],
+        scale: f32,
+    ) -> Result<usize> {
         if self.algo != LycorisAlgo::LoKr || scale <= 0.0 {
-            return Ok(());
+            return Ok(0);
         }
-        log::warn!(
-            "[zimage] init_lokr_norm={scale} requested but trainer-side base-weight \
-             access is not yet wired for zimage (block weights are resident on \
-             `ZImageModel::block_weights` but not exposed at bundle-construction \
-             time). LoKr magnitude will use its lycoris-rs default init for this \
-             run. Phase 2c will plumb the resident `block_weights` map into this \
-             method (TODO)."
+        // On-disk Z-Image base weight keys (NOT the ai-toolkit save keys):
+        //   attention.qkv.weight    — fused [3*dim, dim], chunk(3, 0) into Q/K/V
+        //   attention.out.weight    — output projection [dim, dim]
+        //   feed_forward.w{1,2,3}.weight
+        // ai-toolkit save format (`to_q`/`to_out.0`) is for the LoRA file, not the model.
+        let mut applied = 0usize;
+        let mut skipped = 0usize;
+        let mut qkv_slice_cache: HashMap<usize, [Tensor; 3]> = HashMap::new();
+
+        for (&(block_idx, target), adapter) in &self.lycoris_adapters {
+            let Some(block_map) = block_weights.get(block_idx) else {
+                log::warn!(
+                    "[zimage][init_lokr_norm] block_idx={block_idx} out of range \
+                     (block_weights.len()={}) — skipping",
+                    block_weights.len()
+                );
+                skipped += 1;
+                continue;
+            };
+
+            // Resolve the actual base tensor for this LoRA target.
+            let base_owned: Option<Tensor> = match target {
+                LoraTarget::AttnQ | LoraTarget::AttnK | LoraTarget::AttnV => {
+                    // Fuse fetch once per block, slice into 3 chunks. Cached
+                    // so we don't reslice for K and V after Q.
+                    if !qkv_slice_cache.contains_key(&block_idx) {
+                        let qkv_key = format!("layers.{block_idx}.attention.qkv.weight");
+                        let Some(fused) = block_map.get(&qkv_key) else {
+                            log::warn!(
+                                "[zimage][init_lokr_norm] missing fused base weight \
+                                 `{qkv_key}` — skipping Q/K/V for block {block_idx}"
+                            );
+                            skipped += 1;
+                            continue;
+                        };
+                        // Fused shape is [3*dim, dim]; chunk along dim 0.
+                        let chunks = fused.chunk(3, 0).map_err(|e| {
+                            flame_core::FlameError::InvalidOperation(format!(
+                                "qkv chunk({qkv_key}): {e}"
+                            ))
+                        })?;
+                        if chunks.len() != 3 {
+                            log::warn!(
+                                "[zimage][init_lokr_norm] expected 3 qkv chunks from \
+                                 `{qkv_key}`, got {}", chunks.len()
+                            );
+                            skipped += 1;
+                            continue;
+                        }
+                        let arr: [Tensor; 3] = [
+                            chunks[0].clone(),
+                            chunks[1].clone(),
+                            chunks[2].clone(),
+                        ];
+                        qkv_slice_cache.insert(block_idx, arr);
+                    }
+                    let slice_idx = match target {
+                        LoraTarget::AttnQ => 0,
+                        LoraTarget::AttnK => 1,
+                        LoraTarget::AttnV => 2,
+                        _ => unreachable!(),
+                    };
+                    qkv_slice_cache.get(&block_idx).map(|arr| arr[slice_idx].clone())
+                }
+                LoraTarget::AttnOut => {
+                    let key = format!("layers.{block_idx}.attention.out.weight");
+                    block_map.get(&key).cloned()
+                }
+                LoraTarget::FfnW1 | LoraTarget::FfnW2 | LoraTarget::FfnW3 => {
+                    let leaf = match target {
+                        LoraTarget::FfnW1 => "feed_forward.w1",
+                        LoraTarget::FfnW2 => "feed_forward.w2",
+                        LoraTarget::FfnW3 => "feed_forward.w3",
+                        _ => unreachable!(),
+                    };
+                    let key = format!("layers.{block_idx}.{leaf}.weight");
+                    block_map.get(&key).cloned()
+                }
+            };
+
+            let Some(base) = base_owned else {
+                log::warn!(
+                    "[zimage][init_lokr_norm] base lookup failed for \
+                     (block={block_idx}, target={:?}) — skipping", target
+                );
+                skipped += 1;
+                continue;
+            };
+
+            let did = adapter.as_ref().init_perturbed_normal_lokr(&base, scale)
+                .map_err(|e| flame_core::FlameError::InvalidOperation(format!(
+                    "init_perturbed_normal_lokr(block={block_idx}, target={:?}): {e}",
+                    target
+                )))?;
+            if did { applied += 1; } else { skipped += 1; }
+        }
+        log::info!(
+            "[zimage][init_lokr_norm] applied={applied} skipped={skipped} scale={scale}"
         );
-        Ok(())
+        Ok(skipped)
     }
 
     /// Adapter accessor used by the per-block forward closures. Checks
@@ -670,6 +770,14 @@ impl ZImageModel {
 
     pub fn is_full_finetune(&self) -> bool {
         self.is_full_finetune
+    }
+
+    /// Per-block resident weight maps. Indexed by `block_idx`. Used by
+    /// `ZImageLoraBundle::apply_init_perturbed_normal` to look up base
+    /// weights for SimpleTuner-style LoKr init. LoRA mode only — in FFT
+    /// mode the block weights live in `fft_params` as F32 Parameters.
+    pub fn block_weights(&self) -> &[HashMap<String, Tensor>] {
+        &self.block_weights
     }
 
     /// Save weights: FFT saves ALL model weights as BF16 safetensors,

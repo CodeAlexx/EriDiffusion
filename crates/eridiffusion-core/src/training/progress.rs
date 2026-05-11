@@ -22,7 +22,12 @@ use crate::training::board::BoardWriter;
 /// (e.g. `SenseNova-U1-lora`, `zimage-lora`, `HiDream-O1-full-finetune`).
 /// Empty string suppresses the bracket.
 ///
-/// `step` is 0-indexed; the printed/stored step number is `step + 1`.
+/// `step` is 0-indexed within THIS run (the caller's for-loop counter).
+/// `resume_step` is the absolute step the run started from (0 for fresh
+/// run; e.g. 100 when resuming from a step-100 checkpoint). Displayed
+/// step number is `resume_step + step + 1`, the absolute training step;
+/// `total_steps` is the absolute target (so the bar reads e.g.
+/// `step 107/500` for a resume into a 500-step target).
 pub fn log_step(
     tag: &str,
     step: usize,
@@ -35,16 +40,47 @@ pub fn log_step(
     t_start: Instant,
     board: Option<&BoardWriter>,
 ) {
+    log_step_with_resume(
+        tag, step, 0, total_steps, dataset_len, batch_size,
+        loss, grad_norm, lr, t_start, board,
+    );
+}
+
+/// Resume-aware variant. Trainers with `--resume-step` / `--resume-lora`
+/// should pass the absolute starting step here so the UI and the
+/// SerenityBoard SQLite scalars use the cumulative step number.
+#[allow(clippy::too_many_arguments)]
+pub fn log_step_with_resume(
+    tag: &str,
+    step: usize,
+    resume_step: usize,
+    total_steps: usize,
+    dataset_len: usize,
+    batch_size: usize,
+    loss: f32,
+    grad_norm: f32,
+    lr: f32,
+    t_start: Instant,
+    board: Option<&BoardWriter>,
+) {
+    let absolute_step = resume_step + step; // 0-indexed absolute
+    let absolute_step_1based = absolute_step + 1;
+    let total = total_steps.max(absolute_step_1based);
+
     let bs = batch_size.max(1);
     let steps_per_epoch = (dataset_len.max(1) + bs - 1) / bs;
-    let cur_epoch = (step / steps_per_epoch.max(1)) + 1;
+    let cur_epoch = (absolute_step / steps_per_epoch.max(1)) + 1;
     let total_epochs =
-        (total_steps + steps_per_epoch.saturating_sub(1)) / steps_per_epoch.max(1);
+        (total + steps_per_epoch.saturating_sub(1)) / steps_per_epoch.max(1);
 
     let elapsed = t_start.elapsed().as_secs_f32();
-    let sec_per_step = elapsed / (step + 1) as f32;
+    // s/step is measured over THIS run's wall clock — divide by run-local
+    // step count, not absolute. ETA uses run-local s/step × remaining
+    // absolute steps.
+    let run_step_count = (step + 1) as f32;
+    let sec_per_step = elapsed / run_step_count;
     let elapsed_u = elapsed as u64;
-    let eta_secs = (sec_per_step * (total_steps.saturating_sub(step + 1)) as f32) as u64;
+    let eta_secs = (sec_per_step * (total.saturating_sub(absolute_step_1based)) as f32) as u64;
     let (eh, em, es) = (elapsed_u / 3600, (elapsed_u % 3600) / 60, elapsed_u % 60);
     let (ah, am, as_) = (eta_secs / 3600, (eta_secs % 3600) / 60, eta_secs % 60);
 
@@ -55,7 +91,7 @@ pub fn log_step(
     };
     log::info!(
         "{prefix}step {}/{} | epoch {}/{} | loss {:.4} | grad_norm {:.4} | {:.1}s/step | elapsed {}:{:02}:{:02} | ETA {}:{:02}:{:02}",
-        step + 1, total_steps, cur_epoch, total_epochs,
+        absolute_step_1based, total, cur_epoch, total_epochs,
         loss, grad_norm, sec_per_step,
         eh, em, es, ah, am, as_,
     );
@@ -63,7 +99,7 @@ pub fn log_step(
     if let Some(b) = board {
         let steps_per_sec = if sec_per_step > 0.0 { 1.0 / sec_per_step } else { 0.0 };
         b.log_scalars(
-            (step + 1) as u64,
+            absolute_step_1based as u64,
             &[
                 ("loss/train", loss as f64),
                 ("grad_norm", grad_norm as f64),

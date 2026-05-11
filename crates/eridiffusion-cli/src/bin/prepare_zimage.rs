@@ -182,10 +182,19 @@ fn main() -> anyhow::Result<()> {
         save_file(&tensors, &out_path)?;
         written += 1;
 
-        if written % 10 == 0 || written == 1 {
-            let elapsed = t_start.elapsed().as_secs_f32();
-            log::info!("  cached {written} (skipped {skipped}) — {:.2}/s", written as f32 / elapsed.max(1e-3));
-        }
+        // Universal tagged progress UI — one line per sample.
+        eridiffusion_core::training::progress::log_step(
+            "Z-Image-prep",
+            idx,
+            pairs.len(),
+            pairs.len(),
+            1, // batch_size — prep is per-sample
+            0.0, // no loss
+            0.0, // no grad
+            0.0, // no lr
+            t_start,
+            None,
+        );
     }
 
     log::info!("Done: wrote {written}, skipped {skipped}, total {} in {:.1}s",

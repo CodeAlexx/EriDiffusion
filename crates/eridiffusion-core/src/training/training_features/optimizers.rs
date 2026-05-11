@@ -227,6 +227,36 @@ impl Optimizer {
             Self::StableAdamWScheduleFree(o) => o.set_lr(lr),
         }
     }
+
+    /// Swap parameters from the train weight (`y`) to the eval weight
+    /// (`x = lerp(y, z, 1 - beta1_or_momentum)`) for sampling/inference.
+    /// Idempotent: a second call is a no-op. Pair with [`exit_eval_mode`]
+    /// to restore the train weight before the next [`step`].
+    ///
+    /// Only the ScheduleFree variants do anything; other optimizers no-op.
+    /// Required for correct samples mid-training: without this, the
+    /// sampler reads `y` (the fast/train weight) which produces noticeably
+    /// worse outputs than the SF eval weight, especially early in training.
+    pub fn enter_eval_mode(&mut self, params: &[Parameter]) -> Result<()> {
+        match self {
+            Self::RAdamScheduleFree(o) => o.enter_eval_mode(params),
+            Self::AdamWScheduleFree(o) => o.enter_eval_mode(params),
+            Self::StableAdamWScheduleFree(o) => o.enter_eval_mode(params),
+            _ => Ok(()),
+        }
+    }
+
+    /// Restore parameters from the eval-mode swap performed by
+    /// [`enter_eval_mode`]. Idempotent — safe to call when no swap is in
+    /// effect. No-op for non-ScheduleFree optimizers.
+    pub fn exit_eval_mode(&mut self, params: &[Parameter]) -> Result<()> {
+        match self {
+            Self::RAdamScheduleFree(o) => o.exit_eval_mode(params),
+            Self::AdamWScheduleFree(o) => o.exit_eval_mode(params),
+            Self::StableAdamWScheduleFree(o) => o.exit_eval_mode(params),
+            _ => Ok(()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1298,6 +1328,11 @@ pub struct RAdamScheduleFree {
     weight_sum: f64,
     z: HashMap<TensorId, Tensor>,
     exp_avg_sq: HashMap<TensorId, Tensor>,
+    /// When non-empty, parameters are currently in eval mode (`p = x`) and
+    /// this map holds the saved train weight (`y`) keyed by parameter id.
+    /// Populated by [`Self::enter_eval_mode`], consumed by
+    /// [`Self::exit_eval_mode`].
+    eval_stash: HashMap<TensorId, Tensor>,
 }
 
 impl RAdamScheduleFree {
@@ -1316,7 +1351,49 @@ impl RAdamScheduleFree {
             weight_sum: 0.0,
             z: HashMap::new(),
             exp_avg_sq: HashMap::new(),
+            eval_stash: HashMap::new(),
         }
+    }
+
+    /// Swap `p` from the train weight `y` to the eval weight
+    /// `x = y * beta1 + z * (1 - beta1)`. Stashes `y` for [`exit_eval_mode`].
+    /// Idempotent: if already in eval mode (stash non-empty), no-op.
+    pub fn enter_eval_mode(&mut self, params: &[Parameter]) -> Result<()> {
+        if !self.eval_stash.is_empty() {
+            return Ok(()); // already in eval mode
+        }
+        let beta1 = self.beta1;
+        for p in params {
+            let id = p.id();
+            let Some(z) = self.z.get(&id) else { continue }; // unseen param: no z, skip
+            let p_data = p.tensor()?;
+            let p_dtype = p_data.dtype();
+            let p_f32 = if p_dtype == DType::F32 { p_data } else { p_data.to_dtype(DType::F32)? };
+            // Stash the current y (F32, detached).
+            self.eval_stash.insert(id, p_f32.detach()?);
+            // Compute x = y * beta1 + z * (1 - beta1).
+            let x = p_f32.mul_scalar(beta1)?.add(&z.mul_scalar(1.0 - beta1)?)?;
+            let cast = if p_dtype == DType::F32 { x } else { x.to_dtype(p_dtype)? };
+            p.set_data(cast.detach()?)?;
+        }
+        Ok(())
+    }
+
+    /// Restore `p` from the train-weight stash populated by
+    /// [`enter_eval_mode`]. Safe to call when no swap is in effect (no-op).
+    pub fn exit_eval_mode(&mut self, params: &[Parameter]) -> Result<()> {
+        if self.eval_stash.is_empty() {
+            return Ok(());
+        }
+        for p in params {
+            let id = p.id();
+            let Some(y) = self.eval_stash.remove(&id) else { continue };
+            let p_dtype = p.dtype()?;
+            let cast = if p_dtype == DType::F32 { y } else { y.to_dtype(p_dtype)? };
+            p.set_data(cast.detach()?)?;
+        }
+        self.eval_stash.clear();
+        Ok(())
     }
 
     pub fn step(&mut self, params: &[Parameter]) -> Result<()> {
@@ -1578,10 +1655,12 @@ pub struct ScheduleFreeWrapper<B: ScheduleFreeBase> {
     weight_sum: f64,
     z: HashMap<TensorId, Tensor>,
     /// Whether the wrapped state is currently in "train" form — i.e., `p`
-    /// holds the y-sequence. We initialise to true and never expose
-    /// eval-mode toggling: the trainer calls `step()` repeatedly under
-    /// the same train-mode invariant.
+    /// holds the y-sequence. Toggled by [`enter_eval_mode`] / [`exit_eval_mode`].
     train_mode: bool,
+    /// When non-empty, parameters are in eval mode (`p = x`) and this map
+    /// holds the saved train weight `y`. Populated by [`enter_eval_mode`],
+    /// consumed by [`exit_eval_mode`].
+    eval_stash: HashMap<TensorId, Tensor>,
 }
 
 impl<B: ScheduleFreeBase> ScheduleFreeWrapper<B> {
@@ -1596,7 +1675,48 @@ impl<B: ScheduleFreeBase> ScheduleFreeWrapper<B> {
             weight_sum: 0.0,
             z: HashMap::new(),
             train_mode: true,
+            eval_stash: HashMap::new(),
         }
+    }
+
+    /// Swap `p` from train weight `y` to eval weight
+    /// `x = y * momentum + z * (1 - momentum)`. See
+    /// [`RAdamScheduleFree::enter_eval_mode`] for rationale. Idempotent.
+    pub fn enter_eval_mode(&mut self, params: &[Parameter]) -> Result<()> {
+        if !self.eval_stash.is_empty() {
+            return Ok(());
+        }
+        let momentum = self.momentum;
+        for p in params {
+            let id = p.id();
+            let Some(z) = self.z.get(&id) else { continue };
+            let p_data = p.tensor()?;
+            let p_dtype = p_data.dtype();
+            let p_f32 = if p_dtype == DType::F32 { p_data } else { p_data.to_dtype(DType::F32)? };
+            self.eval_stash.insert(id, p_f32.detach()?);
+            let x = p_f32.mul_scalar(momentum)?.add(&z.mul_scalar(1.0 - momentum)?)?;
+            let cast = if p_dtype == DType::F32 { x } else { x.to_dtype(p_dtype)? };
+            p.set_data(cast.detach()?)?;
+        }
+        self.train_mode = false;
+        Ok(())
+    }
+
+    /// Restore `p` from the train-weight stash. Safe when no swap active.
+    pub fn exit_eval_mode(&mut self, params: &[Parameter]) -> Result<()> {
+        if self.eval_stash.is_empty() {
+            return Ok(());
+        }
+        for p in params {
+            let id = p.id();
+            let Some(y) = self.eval_stash.remove(&id) else { continue };
+            let p_dtype = p.dtype()?;
+            let cast = if p_dtype == DType::F32 { y } else { y.to_dtype(p_dtype)? };
+            p.set_data(cast.detach()?)?;
+        }
+        self.eval_stash.clear();
+        self.train_mode = true;
+        Ok(())
     }
 
     pub fn set_lr(&mut self, lr: f32) {

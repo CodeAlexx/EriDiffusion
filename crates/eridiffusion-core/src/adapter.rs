@@ -296,11 +296,30 @@ impl LycorisLinear {
     ) -> FlameResult<bool> {
         match &self.adapter {
             LycorisAdapter::LoKr(m) => {
-                m.init_perturbed_normal(base_weight, scale)
-                    .map_err(|e| FlameError::InvalidOperation(format!(
-                        "LycorisLinear::init_perturbed_normal_lokr: {e}"
-                    )))?;
-                Ok(true)
+                // Full-W2 LoKr (rank ≥ max(out_k,in_n)/2) → SimpleTuner init.
+                // Factored W2 (rank < max(out_k,in_n)/2) → fall back to the
+                // factored variant that perturbs `w2_b` from zero so the
+                // dead-leaf at step 0 is broken (w1, w2_a, w2_b all receive
+                // gradient at step 1). Without this, ScheduleFree optimizers
+                // can't escape the zero-w2_b trap within a normal training
+                // budget.
+                match m.init_perturbed_normal(base_weight, scale) {
+                    Ok(()) => Ok(true),
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        if msg.contains("full W2") || msg.contains("full W1") {
+                            m.init_perturbed_normal_factored(base_weight, scale)
+                                .map_err(|e2| FlameError::InvalidOperation(format!(
+                                    "LycorisLinear::init_perturbed_normal_lokr (factored fallback): {e2}"
+                                )))?;
+                            Ok(true)
+                        } else {
+                            Err(FlameError::InvalidOperation(format!(
+                                "LycorisLinear::init_perturbed_normal_lokr: {e}"
+                            )))
+                        }
+                    }
+                }
             }
             _ => Ok(false),
         }

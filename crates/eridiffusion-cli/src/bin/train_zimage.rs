@@ -100,6 +100,12 @@ struct Args {
     // ── Periodic save + sample (every N steps) ─────────────────────────
     #[arg(long, default_value = "0")] sample_every: usize,
     #[arg(long, default_value = "")] sample_prompt: String,
+    /// Newline-separated file of additional prompts. When set, every sample
+    /// event (baseline at step 0, periodic --sample-every, and final) renders
+    /// ALL prompts in the file. Output filenames carry a per-prompt suffix:
+    /// `sample_step{N}_p{idx}.png`. The `--sample-prompt` single-string is
+    /// appended at the head of the list if non-empty.
+    #[arg(long)] sample_prompts_file: Option<PathBuf>,
     #[arg(long, default_value = "")] sample_neg_prompt: String,
     /// LDM Z-Image VAE safetensors (e.g. qwen_image_vae.safetensors).
     #[arg(long)] sample_vae: Option<PathBuf>,
@@ -385,16 +391,21 @@ fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("LyCORIS bundle construction: {e}"))?;
         model.bundle = new_bundle;
 
-        // SimpleTuner-style perturbed-normal init for LoKr. Z-Image block
-        // weights are resident at this point (loaded in `ZImageModel::load`)
-        // but the trainer doesn't expose them through a clean accessor yet,
-        // so the bundle method logs a warning + TODO instead of silently
-        // skipping. Phase 2c will plumb the resident `block_weights` map in.
+        // SimpleTuner-style perturbed-normal init for LoKr. Breaks the
+        // LoKr dead-leaf (default init zeros `w2_b` → only w2_b receives
+        // grad → catastrophic with ScheduleFree). With `--init-lokr-norm`
+        // both factors are seeded with small noise so every leaf trains
+        // from step 1.
         if matches!(algo, LycorisAlgo::LoKr) && args.init_lokr_norm > 0.0 {
-            model
+            let skipped = model
                 .bundle
-                .apply_init_perturbed_normal(args.init_lokr_norm)
+                .apply_init_perturbed_normal(model.block_weights(), args.init_lokr_norm)
                 .map_err(|e| anyhow::anyhow!("init_lokr_norm: {e}"))?;
+            log::info!(
+                "[zimage] --init-lokr-norm={} applied (skipped={} non-LoKr/missing)",
+                args.init_lokr_norm,
+                skipped,
+            );
         }
     } else {
         log::info!("[zimage] algo='lora' (legacy LoRALinear path, byte-identical)");
@@ -528,7 +539,9 @@ fn main() -> anyhow::Result<()> {
         );
         effective_caption_dropout_prob = 0.0;
     }
-    let (sample_cap, sample_cap_mask, sample_uncond, sample_uncond_mask, sample_vae_path) = if periodic {
+    let (sample_prompts, sample_uncond, sample_uncond_mask, sample_vae_path): (
+        Option<Vec<(Tensor, Tensor)>>, Option<Tensor>, Option<Tensor>, Option<PathBuf>,
+    ) = if periodic {
         let qwen3_path = args.sample_qwen3.as_ref()
             .ok_or_else(|| anyhow::anyhow!("--sample-every > 0 requires --sample-qwen3"))?;
         let tok_path = args.sample_tokenizer.as_ref()
@@ -569,38 +582,67 @@ fn main() -> anyhow::Result<()> {
                 .to_dtype(DType::BF16)?;
             Ok((hidden, mask))
         };
-        let (cap, cap_mask) = encode(&args.sample_prompt)?;
+        // Build list of prompts to render at each sample event. `--sample-prompt`
+        // (single str) is the first entry if non-empty. `--sample-prompts-file`
+        // (newline-separated) appends the rest. Result: Vec<(cap, cap_mask)>.
+        let mut prompts_text: Vec<String> = Vec::new();
+        if !args.sample_prompt.trim().is_empty() {
+            prompts_text.push(args.sample_prompt.clone());
+        }
+        if let Some(pf) = args.sample_prompts_file.as_ref() {
+            let raw = std::fs::read_to_string(pf)
+                .map_err(|e| anyhow::anyhow!("read sample-prompts-file {}: {e}", pf.display()))?;
+            for line in raw.lines() {
+                let l = line.trim();
+                if l.is_empty() || l.starts_with('#') { continue; }
+                prompts_text.push(l.to_string());
+            }
+        }
+        if prompts_text.is_empty() {
+            anyhow::bail!(
+                "--sample-every > 0 requires either --sample-prompt or --sample-prompts-file"
+            );
+        }
+        let mut encoded: Vec<(Tensor, Tensor)> = Vec::with_capacity(prompts_text.len());
+        for p in &prompts_text { encoded.push(encode(p)?); }
         let (unc, unc_mask) = encode(&args.sample_neg_prompt)?;
-        log::info!("[sample-setup] cap={:?} uncond={:?}; dropping Qwen3", cap.shape().dims(), unc.shape().dims());
+        log::info!(
+            "[sample-setup] {} prompt(s) encoded; uncond={:?}; dropping Qwen3",
+            encoded.len(), unc.shape().dims(),
+        );
         drop(qwen);
         flame_core::cuda_alloc_pool::clear_pool_cache();
         flame_core::trim_cuda_mempool(0);
         log::info!("[sample-setup] periodic sample enabled (every {} steps).", args.sample_every);
-        (Some(cap), Some(cap_mask), Some(unc), Some(unc_mask), Some(vae_path))
+        (Some(encoded), Some(unc), Some(unc_mask), Some(vae_path))
     } else {
-        (None, None, None, None, None)
+        (None, None, None, None)
     };
 
-    // Step-0 baseline (LoRA-init = base output)
+    // Step-0 baseline (LoRA-init = base output). Renders ALL configured
+    // prompts so the user can later eyeball drift across the full prompt set.
     if periodic {
-        let out_path = args.output_dir.join("sample_step0_base.png");
-        log::info!("[sample step=0] BASELINE → {}", out_path.display());
-        if let Err(e) = zimage_sampler::sample_image(
-            &mut model,
-            sample_cap.as_ref().unwrap(),
-            sample_cap_mask.as_ref(),
-            sample_uncond.as_ref(),
-            sample_uncond_mask.as_ref(),
-            args.sample_size, args.sample_size,
-            args.sample_steps,
-            args.sample_cfg,
-            args.sample_shift,
-            args.sample_seed,
-            sample_vae_path.as_ref().unwrap(),
-            &out_path,
-            &device,
-        ) {
-            log::warn!("[sample step=0] failed: {e}");
+        for (idx, (cap, cap_mask)) in sample_prompts.as_ref().unwrap().iter().enumerate() {
+            let out_path = args.output_dir.join(format!("sample_step0_base_p{idx}.png"));
+            log::info!("[sample step=0] BASELINE prompt {}/{} → {}",
+                idx + 1, sample_prompts.as_ref().unwrap().len(), out_path.display());
+            if let Err(e) = zimage_sampler::sample_image(
+                &mut model,
+                cap,
+                Some(cap_mask),
+                sample_uncond.as_ref(),
+                sample_uncond_mask.as_ref(),
+                args.sample_size, args.sample_size,
+                args.sample_steps,
+                args.sample_cfg,
+                args.sample_shift,
+                args.sample_seed,
+                sample_vae_path.as_ref().unwrap(),
+                &out_path,
+                &device,
+            ) {
+                log::warn!("[sample step=0 p{idx}] failed: {e}");
+            }
         }
     }
 
@@ -1084,25 +1126,43 @@ fn main() -> anyhow::Result<()> {
         }
         // ── Periodic inline sample ─────────────────────────────────────
         if periodic && step_num % args.sample_every == 0 && step_num < args.steps {
-            let sample_out = args.output_dir.join(format!("sample_step{step_num}.png"));
-            log::info!("[sample step={step_num}] → {}", sample_out.display());
-            if let Err(e) = zimage_sampler::sample_image(
-                &mut model,
-                sample_cap.as_ref().unwrap(),
-                sample_cap_mask.as_ref(),
-                sample_uncond.as_ref(),
-                sample_uncond_mask.as_ref(),
-                args.sample_size, args.sample_size,
-                args.sample_steps,
-                args.sample_cfg,
-                args.sample_shift,
-                args.sample_seed,
-                sample_vae_path.as_ref().unwrap(),
-                &sample_out,
-                &device,
-            ) {
-                log::warn!("[sample step={step_num}] failed: {e}");
+            let prompts = sample_prompts.as_ref().unwrap();
+            // ScheduleFree eval-mode swap: `p` currently holds the train
+            // weight `y`. Sampling at `y` produces visibly worse output than
+            // the eval weight `x = lerp(y, z, 1 - beta1)`. No-op for non-SF
+            // optimizers.
+            if let Err(e) = opt.enter_eval_mode(&params) {
+                log::warn!("[sample step={step_num}] enter_eval_mode failed: {e}");
             }
+            model.refresh_lora_cache();
+            for (idx, (cap, cap_mask)) in prompts.iter().enumerate() {
+                let sample_out = args.output_dir.join(format!("sample_step{step_num}_p{idx}.png"));
+                log::info!(
+                    "[sample step={step_num}] prompt {}/{} → {}",
+                    idx + 1, prompts.len(), sample_out.display(),
+                );
+                if let Err(e) = zimage_sampler::sample_image(
+                    &mut model,
+                    cap,
+                    Some(cap_mask),
+                    sample_uncond.as_ref(),
+                    sample_uncond_mask.as_ref(),
+                    args.sample_size, args.sample_size,
+                    args.sample_steps,
+                    args.sample_cfg,
+                    args.sample_shift,
+                    args.sample_seed,
+                    sample_vae_path.as_ref().unwrap(),
+                    &sample_out,
+                    &device,
+                ) {
+                    log::warn!("[sample step={step_num} p{idx}] failed: {e}");
+                }
+            }
+            if let Err(e) = opt.exit_eval_mode(&params) {
+                log::warn!("[sample step={step_num}] exit_eval_mode failed: {e}");
+            }
+            model.refresh_lora_cache();
         }
         if let (Some(backup), Some(ref e)) = (ema_backup, &ema) {
             let _g = AutogradContext::no_grad();
@@ -1152,26 +1212,39 @@ fn main() -> anyhow::Result<()> {
     }
     log::info!("Saved checkpoint to {}", ckpt.display());
 
-    // Final sample
+    // Final sample (all configured prompts) — swap to ScheduleFree eval weight.
     if periodic {
-        let sample_out = args.output_dir.join(format!("sample_step{}.png", args.steps));
-        log::info!("[sample step={} FINAL] → {}", args.steps, sample_out.display());
-        if let Err(e) = zimage_sampler::sample_image(
-            &mut model,
-            sample_cap.as_ref().unwrap(),
-            sample_cap_mask.as_ref(),
-            sample_uncond.as_ref(),
-            sample_uncond_mask.as_ref(),
-            args.sample_size, args.sample_size,
-            args.sample_steps,
-            args.sample_cfg,
-            args.sample_shift,
-            args.sample_seed,
-            sample_vae_path.as_ref().unwrap(),
-            &sample_out,
-            &device,
-        ) {
-            log::warn!("[sample final] failed: {e}");
+        let prompts = sample_prompts.as_ref().unwrap();
+        if let Err(e) = opt.enter_eval_mode(&params) {
+            log::warn!("[sample final] enter_eval_mode failed: {e}");
+        }
+        model.refresh_lora_cache();
+        for (idx, (cap, cap_mask)) in prompts.iter().enumerate() {
+            let sample_out = args.output_dir.join(format!("sample_step{}_p{}.png", args.steps, idx));
+            log::info!(
+                "[sample step={} FINAL] prompt {}/{} → {}",
+                args.steps, idx + 1, prompts.len(), sample_out.display(),
+            );
+            if let Err(e) = zimage_sampler::sample_image(
+                &mut model,
+                cap,
+                Some(cap_mask),
+                sample_uncond.as_ref(),
+                sample_uncond_mask.as_ref(),
+                args.sample_size, args.sample_size,
+                args.sample_steps,
+                args.sample_cfg,
+                args.sample_shift,
+                args.sample_seed,
+                sample_vae_path.as_ref().unwrap(),
+                &sample_out,
+                &device,
+            ) {
+                log::warn!("[sample final p{idx}] failed: {e}");
+            }
+        }
+        if let Err(e) = opt.exit_eval_mode(&params) {
+            log::warn!("[sample final] exit_eval_mode failed: {e}");
         }
     }
     Ok(())
