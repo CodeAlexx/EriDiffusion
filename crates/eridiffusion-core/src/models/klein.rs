@@ -392,6 +392,81 @@ impl KleinModel {
         })
     }
 
+    /// Phase 2c — SimpleTuner-style perturbed-normal LoKr init.
+    ///
+    /// Walks `lyc_adapters` in the same flat order they were constructed
+    /// (double blocks ×12 slots, then single blocks ×2 slots) and dispatches
+    /// `AdapterModule::init_perturbed_normal_lokr(base, scale)` on each.
+    /// Breaks the `factorize_w2 + zero-W2_B → dead-leaf` failure mode that
+    /// stalls factored LoKr training under ScheduleFree warmup damping.
+    ///
+    /// Klein on-disk layout: `double_blocks.{i}.{name}.weight` for double
+    /// blocks (12 slots), `single_blocks.{i}.{name}.weight` for single (2).
+    /// QKV-split adapter slots (img_attn.to_{q,k,v} and txt_attn.to_{q,k,v})
+    /// fall back to the FUSED `*_attn.qkv.weight` on disk — that's a
+    /// `[3*inner, inner]` tensor vs the adapter's `[inner, inner]`, but the
+    /// perturbed-normal math only consumes the base weight's mean/std, which
+    /// for a kaiming-uniform-initialized fused qkv equals the per-slice
+    /// stats. No-op when `algo != LoKr` or `scale <= 0.0`. Requires the
+    /// model to be loaded WITHOUT `enable_offload()` so `self.weights` still
+    /// holds `double_blocks.*` / `single_blocks.*`.
+    pub fn apply_init_perturbed_normal(&self, scale: f32) -> Result<usize> {
+        let Some(ref lyc) = self.lyc_adapters else {
+            return Ok(0);
+        };
+        let lyc_algo = self
+            .lyc_config
+            .as_ref()
+            .map(|c| c.algo)
+            .unwrap_or(LycorisAlgo::None);
+        if lyc_algo != LycorisAlgo::LoKr || scale <= 0.0 {
+            return Ok(0);
+        }
+        let num_double = self.kconfig.num_double;
+        let num_single = self.kconfig.num_single;
+        let mut applied = 0usize;
+        let mut skipped = 0usize;
+        for (flat_idx, adapter) in lyc.iter().enumerate() {
+            let double_count = num_double * DOUBLE_LORA_SLOTS;
+            let key = if flat_idx < double_count {
+                let block = flat_idx / DOUBLE_LORA_SLOTS;
+                let slot = flat_idx % DOUBLE_LORA_SLOTS;
+                let name = match slot {
+                    0..=2 => "img_attn.qkv",
+                    4..=6 => "txt_attn.qkv",
+                    _ => DOUBLE_LORA_KEYS[slot],
+                };
+                format!("double_blocks.{block}.{name}.weight")
+            } else {
+                let rel = flat_idx - double_count;
+                let block = rel / SINGLE_LORA_SLOTS;
+                let slot = rel % SINGLE_LORA_SLOTS;
+                if block >= num_single {
+                    log::warn!("[klein][init_lokr_norm] adapter index {flat_idx} out of range — skipping");
+                    skipped += 1;
+                    continue;
+                }
+                format!("single_blocks.{block}.{}.weight", SINGLE_LORA_KEYS[slot])
+            };
+            let Some(base) = self.weights.get(&key) else {
+                log::warn!("[klein][init_lokr_norm] missing base weight `{key}` — skipping");
+                skipped += 1;
+                continue;
+            };
+            let did = adapter
+                .as_ref()
+                .init_perturbed_normal_lokr(base, scale)
+                .map_err(|e| flame_core::FlameError::InvalidOperation(format!(
+                    "init_perturbed_normal_lokr({key}): {e}"
+                )))?;
+            if did { applied += 1; } else { skipped += 1; }
+        }
+        log::info!(
+            "[klein][init_lokr_norm] applied={applied} skipped={skipped} scale={scale}"
+        );
+        Ok(skipped)
+    }
+
     /// Enable per-block weight streaming via `BlockOffloader`. Drops
     /// `double_blocks.*`/`single_blocks.*` from VRAM; blocks are streamed from
     /// pinned host RAM into reusable GPU slots per block, per step.

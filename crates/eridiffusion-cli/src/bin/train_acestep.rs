@@ -308,9 +308,21 @@ fn main() -> anyhow::Result<()> {
         log::info!("[ACE-Step] algo='lora' (legacy LoRALinear path, byte-identical)");
     }
 
-    // Reference-only: silence unused-warning for dropout/init flags wired in
+    // Phase 2c — perturbed-normal LoKr init.
+    if matches!(algo, LycorisAlgo::LoKr) && args.init_lokr_norm > 0.0 {
+        let skipped = model
+            .apply_init_perturbed_normal(args.init_lokr_norm)
+            .map_err(|e| anyhow::anyhow!("init_lokr_norm: {e}"))?;
+        if skipped > 0 {
+            log::warn!(
+                "[ACE-Step] init_lokr_norm: {} slot(s) skipped (see warnings above)",
+                skipped
+            );
+        }
+    }
+    // Reference-only: silence unused-warning for dropout flags wired in
     // Block 2 but not yet plumbed past `LycorisBundleConfig` (Phase 2c).
-    let _ = (args.init_lokr_norm, args.lora_dropout, args.rank_dropout,
+    let _ = (args.lora_dropout, args.rank_dropout,
              args.module_dropout, args.rank_dropout_scale);
 
     let params = model.parameters();

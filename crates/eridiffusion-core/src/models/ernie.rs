@@ -154,6 +154,64 @@ impl ErnieModel {
         Ok(())
     }
 
+    /// Phase 2c — SimpleTuner-style perturbed-normal LoKr init.
+    ///
+    /// Walks `lycoris_adapters[layer*7 + slot]` and dispatches
+    /// `AdapterModule::init_perturbed_normal_lokr(base, scale)` for each
+    /// populated slot, looking up the base weight in `self.weights` under
+    /// the on-disk key for that (layer, slot). Breaks the
+    /// `factorize_w2 + zero-W2_B → dead-leaf` failure mode for factored
+    /// LoKr under ScheduleFree warmup damping.
+    ///
+    /// Slot→suffix mapping (matches `swap_lycoris_bundle` allocation order):
+    ///   0: `self_attention.to_q`, 1: `self_attention.to_k`, 2: `to_v`,
+    ///   3: `self_attention.to_out.0`, 4: `mlp.gate_proj`, 5: `mlp.up_proj`,
+    ///   6: `mlp.linear_fc2`.
+    ///
+    /// No-op when `algo != LoKr` or `scale <= 0.0`. Returns the count of
+    /// adapters skipped (offloader-resident base weights not present in
+    /// the in-RAM `self.weights` map are reported and skipped).
+    pub fn apply_init_perturbed_normal(&self, scale: f32) -> Result<usize> {
+        if self.algo != LycorisAlgo::LoKr || scale <= 0.0 {
+            return Ok(0);
+        }
+        const SLOT_SUFFIX: [&str; 7] = [
+            "self_attention.to_q",
+            "self_attention.to_k",
+            "self_attention.to_v",
+            "self_attention.to_out.0",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.linear_fc2",
+        ];
+        let mut applied = 0usize;
+        let mut skipped = 0usize;
+        for (flat_idx, slot) in self.lycoris_adapters.iter().enumerate() {
+            let Some(adapter) = slot.as_ref() else {
+                continue;
+            };
+            let layer = flat_idx / 7;
+            let slot_idx = flat_idx % 7;
+            let key = format!("layers.{layer}.{}.weight", SLOT_SUFFIX[slot_idx]);
+            let Some(base) = self.weights.get(&key) else {
+                log::warn!("[ernie][init_lokr_norm] missing base weight `{key}` — skipping");
+                skipped += 1;
+                continue;
+            };
+            let did = adapter
+                .as_ref()
+                .init_perturbed_normal_lokr(base, scale)
+                .map_err(|e| flame_core::FlameError::InvalidOperation(format!(
+                    "init_perturbed_normal_lokr({key}): {e}"
+                )))?;
+            if did { applied += 1; } else { skipped += 1; }
+        }
+        log::info!(
+            "[ernie][init_lokr_norm] applied={applied} skipped={skipped} scale={scale}"
+        );
+        Ok(skipped)
+    }
+
     /// Look up the active adapter at flat index `adapter_idx` (= `layer*7 + slot`).
     /// Prefers the LyCORIS slot when populated; falls back to the legacy
     /// `LoRALinear` entry. Returns `None` when neither is populated (e.g.

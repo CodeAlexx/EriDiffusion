@@ -343,6 +343,44 @@ impl AceStepLoRAModel {
         self.algo
     }
 
+    /// Phase 2c — SimpleTuner-style perturbed-normal LoKr init.
+    ///
+    /// Walks `lycoris_adapters` and dispatches
+    /// `AdapterModule::init_perturbed_normal_lokr(base, scale)` for each.
+    /// The adapter trait internally falls back from full-W2
+    /// `init_perturbed_normal` to factored-W2 `init_perturbed_normal_factored`,
+    /// breaking the `factorize_w2 + zero-W2_B → dead-leaf` failure mode that
+    /// stalls factored LoKr training under ScheduleFree warmup damping.
+    ///
+    /// AceStep on-disk weight keys: `decoder.layers.{i}.{suffix}.weight`.
+    /// No-op when `algo != LoKr` or `scale <= 0.0`.
+    pub fn apply_init_perturbed_normal(&self, scale: f32) -> Result<usize> {
+        if self.algo != LycorisAlgo::LoKr || scale <= 0.0 {
+            return Ok(0);
+        }
+        let mut applied = 0usize;
+        let mut skipped = 0usize;
+        for (&(layer_idx, target), adapter) in &self.lycoris_adapters {
+            let key = format!("decoder.layers.{layer_idx}.{}.weight", target.suffix());
+            let Some(base) = self.weights.get(&key) else {
+                log::warn!("[acestep][init_lokr_norm] missing base weight `{key}` — skipping");
+                skipped += 1;
+                continue;
+            };
+            let did = adapter
+                .as_ref()
+                .init_perturbed_normal_lokr(base, scale)
+                .map_err(|e| flame_core::FlameError::InvalidOperation(format!(
+                    "init_perturbed_normal_lokr({key}): {e}"
+                )))?;
+            if did { applied += 1; } else { skipped += 1; }
+        }
+        log::info!(
+            "[acestep][init_lokr_norm] applied={applied} skipped={skipped} scale={scale}"
+        );
+        Ok(skipped)
+    }
+
     /// Collect all trainable LoRA parameters for the optimizer.
     /// When a LyCORIS bundle is installed, only the LyCORIS adapters are
     /// emitted (the legacy `adapters` Vec is left untouched in memory but

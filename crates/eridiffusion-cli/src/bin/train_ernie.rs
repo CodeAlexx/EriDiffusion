@@ -334,14 +334,22 @@ fn main() -> anyhow::Result<()> {
         model.swap_lycoris_bundle(&lyc_config)
             .map_err(|e| anyhow::anyhow!("LyCORIS bundle swap: {e}"))?;
         if matches!(algo, LycorisAlgo::LoKr) && args.init_lokr_norm > 0.0 {
-            log::warn!(
-                "[ernie] init_lokr_norm={} requested but trainer-side base-weight \
-                 access is not yet wired for ernie (transformer block weights are \
-                 streamed via BlockOffloader, not resident at bundle-construction time). \
-                 LoKr magnitude will use its lycoris-rs default init for this run. \
-                 Phase 2c will plumb the resident block-weight map into this path.",
-                args.init_lokr_norm,
-            );
+            // Phase 2c — perturbed-normal LoKr init. Walks lycoris_adapters
+            // and looks up `layers.{N}.{slot_suffix}.weight` in
+            // `model.weights`. When the model is loaded with `--offload`
+            // the per-layer weights are absent from the resident map and
+            // the apply method logs per-key warnings and skips them.
+            let skipped = model
+                .apply_init_perturbed_normal(args.init_lokr_norm)
+                .map_err(|e| anyhow::anyhow!("init_lokr_norm: {e}"))?;
+            if skipped > 0 {
+                log::warn!(
+                    "[ernie] init_lokr_norm: {} slot(s) skipped (see warnings above; \
+                     usually means model was loaded with --offload and base weights \
+                     are streamed rather than resident).",
+                    skipped
+                );
+            }
         }
         // Suppress unused-warnings for dropout flags until LycorisLinear
         // exposes a per-call dropout knob (Phase 2c).

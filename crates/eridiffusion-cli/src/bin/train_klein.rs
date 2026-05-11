@@ -285,6 +285,13 @@ struct Args {
     /// over input dims, magnitude `[out, 1]`. `false` (OneTrainer) =
     /// norm over output dim, magnitude `[1, in]`.
     #[arg(long, default_value_t = true)] pub dora_wd_on_out: bool,
+    /// SimpleTuner-style perturbed-normal LoKr init magnitude. `0.0`
+    /// (default) keeps the canonical zero-W2 init. With factored LoKr
+    /// (rank < max(out_k, in_n) / 2), zero-W2_B dead-leafs gradients
+    /// under ScheduleFree warmup; a small `1e-3..1e-2` perturbation
+    /// breaks the dead-leaf in a base-weight-statistical envelope. No-
+    /// op unless `--algo lokr`.
+    #[arg(long, default_value_t = 0.0)] pub init_lokr_norm: f32,
 }
 
 /// LOGIT_NORMAL timestep sample. Returns continuous t in [0, 1000).
@@ -498,6 +505,23 @@ fn main() -> anyhow::Result<()> {
         device.clone(),
         if use_lycoris { Some(lycoris_cfg.clone()) } else { None },
     )?;
+    // Phase 2c — perturbed-normal LoKr init. MUST happen BEFORE
+    // `enable_offload` because the apply method reads from `self.weights`,
+    // which `enable_offload` strips of `double_blocks.*` / `single_blocks.*`.
+    if use_lycoris
+        && lycoris_cfg.algo == eridiffusion_core::lycoris::LycorisAlgo::LoKr
+        && args.init_lokr_norm > 0.0
+    {
+        let skipped = model
+            .apply_init_perturbed_normal(args.init_lokr_norm)
+            .map_err(|e| anyhow::anyhow!("init_lokr_norm: {e}"))?;
+        if skipped > 0 {
+            log::warn!(
+                "[klein] init_lokr_norm: {} slot(s) skipped (see warnings above)",
+                skipped
+            );
+        }
+    }
     if args.offload {
         model.enable_offload(shards.clone())?;
         log::info!("  block-offload enabled — per-block streaming from {} shard(s)", shards.len());

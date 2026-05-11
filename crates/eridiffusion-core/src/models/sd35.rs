@@ -1106,4 +1106,46 @@ impl SD35Model {
         }
         out
     }
+
+    /// Phase 2c — SimpleTuner-style perturbed-normal LoKr init.
+    ///
+    /// Walks `lycoris_adapters`, looks up the corresponding base weight in
+    /// `self.weights` under `joint_blocks.{block_idx}.{target.suffix()}.weight`,
+    /// and calls `AdapterModule::init_perturbed_normal_lokr(base, scale)` on
+    /// each. The adapter method internally dispatches between the full-W2
+    /// `init_perturbed_normal` (perturbs W2 in its statistical envelope) and
+    /// the factored fallback `init_perturbed_normal_factored` (perturbs W2_B
+    /// to break the `factorize_w2 + zero-init → dead-leaf` failure mode that
+    /// stalls factored LoKr training under ScheduleFree warmup damping).
+    ///
+    /// No-op when `algo != LoKr` or `scale <= 0.0`. Returns the number of
+    /// adapters skipped (missing base weight or skipped by `is_last`/dual-
+    /// attention gating); applied count is logged at info level.
+    pub fn apply_init_perturbed_normal(&self, scale: f32) -> Result<usize> {
+        use crate::adapter::AdapterModule;
+        if self.algo != LycorisAlgo::LoKr || scale <= 0.0 {
+            return Ok(0);
+        }
+        let mut applied = 0usize;
+        let mut skipped = 0usize;
+        for (&(block_idx, target), adapter) in &self.lycoris_adapters {
+            let key = format!("joint_blocks.{block_idx}.{}.weight", target.suffix());
+            let Some(base) = self.weights.get(&key) else {
+                log::warn!("[sd35][init_lokr_norm] missing base weight `{key}` — skipping");
+                skipped += 1;
+                continue;
+            };
+            let did = adapter
+                .as_ref()
+                .init_perturbed_normal_lokr(base, scale)
+                .map_err(|e| EriDiffusionError::Model(format!(
+                    "init_perturbed_normal_lokr({key}): {e}"
+                )))?;
+            if did { applied += 1; } else { skipped += 1; }
+        }
+        log::info!(
+            "[sd35][init_lokr_norm] applied={applied} skipped={skipped} scale={scale}"
+        );
+        Ok(skipped)
+    }
 }
