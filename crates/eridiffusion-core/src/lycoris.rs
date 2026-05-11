@@ -312,6 +312,13 @@ pub struct LycorisBundleConfig {
     pub neumann_terms: usize,
     /// LoCon / LoHa / LoKr conv variant — Tucker decomposition for non-1×1 kernels.
     pub use_tucker: bool,
+    /// Per-LyCORIS conv-layer rank override. `0` (default) → fall back to
+    /// the top-level `rank` for conv targets. Mirrors ai-toolkit /
+    /// SimpleTuner `network.conv` setting.
+    pub conv_rank: usize,
+    /// Per-LyCORIS conv-layer alpha override. `0.0` (default) → fall back
+    /// to top-level `alpha`. Pairs with `conv_rank`.
+    pub conv_alpha: f32,
     /// LoKr only: factorize both W1 *and* W2 (default false: only W2).
     pub decompose_both: bool,
     /// LoKr scalar gating flag — accepted for API stability, currently ignored
@@ -351,6 +358,8 @@ impl Default for LycorisBundleConfig {
             block_size: 32,
             neumann_terms: 5,
             use_tucker: false,
+            conv_rank: 0,
+            conv_alpha: 0.0,
             decompose_both: false,
             use_scalar: false,
             dora: false,
@@ -1277,6 +1286,8 @@ impl LycorisBundleConfig {
             block_size: args.lycoris_block_size,
             neumann_terms: args.lycoris_neumann_terms,
             use_tucker: args.lycoris_tucker,
+            conv_rank: 0,
+            conv_alpha: 0.0,
             decompose_both: args.lycoris_decompose_both,
             use_scalar: args.lycoris_use_scalar,
             dora: args.lycoris_decompose,

@@ -292,6 +292,14 @@ struct Args {
     /// breaks the dead-leaf in a base-weight-statistical envelope. No-
     /// op unless `--algo lokr`.
     #[arg(long, default_value_t = 0.0)] pub init_lokr_norm: f32,
+    /// SimpleTuner / ai-toolkit `network.conv` — per-LyCORIS rank for
+    /// CONV-layer targets (separate from linear `--rank`). `0` (default)
+    /// = fall back to linear rank. Inert when no conv targets are wired
+    /// in the model bundle (current state on all EDv2 trainers).
+    #[arg(long, default_value_t = 0)] conv_rank: usize,
+    /// SimpleTuner / ai-toolkit `network.conv_alpha` — alpha for CONV
+    /// targets. `0.0` (default) = fall back to linear `--lora-alpha`.
+    #[arg(long, default_value_t = 0.0)] conv_alpha: f32,
 }
 
 /// LOGIT_NORMAL timestep sample. Returns continuous t in [0, 1000).
@@ -372,6 +380,8 @@ fn main() -> anyhow::Result<()> {
         cfg.rank = args.rank;
         cfg.alpha = args.lora_alpha as f32;
         cfg.factor = args.lokr_factor;
+        cfg.conv_rank = args.conv_rank;
+        cfg.conv_alpha = args.conv_alpha;
         cfg.block_size = args.oft_block_size;
         cfg.neumann_terms = args.oft_neumann_terms;
         cfg.use_tucker = args.use_tucker;

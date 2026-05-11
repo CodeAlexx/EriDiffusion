@@ -199,6 +199,14 @@ struct Args {
     /// BlockOffloader; the helper warns when a slot's base is not
     /// resident at swap time.
     #[arg(long, default_value_t = 0.0)] init_lokr_norm: f32,
+    /// SimpleTuner / ai-toolkit `network.conv` — per-LyCORIS rank for
+    /// CONV-layer targets (separate from linear `--rank`). `0` (default)
+    /// = fall back to linear rank. Inert when no conv targets are wired
+    /// in the model bundle (current state on all EDv2 trainers).
+    #[arg(long, default_value_t = 0)] conv_rank: usize,
+    /// SimpleTuner / ai-toolkit `network.conv_alpha` — alpha for CONV
+    /// targets. `0.0` (default) = fall back to linear `--lora-alpha`.
+    #[arg(long, default_value_t = 0.0)] conv_alpha: f32,
 }
 
 /// Resolution-dependent timestep shift (matches the chroma archive's
@@ -309,6 +317,8 @@ fn main() -> anyhow::Result<()> {
         rank: args.rank,
         alpha: args.lora_alpha as f32,
         factor: args.lokr_factor,
+        conv_rank: args.conv_rank,
+        conv_alpha: args.conv_alpha,
         block_size: args.oft_block_size,
         neumann_terms: args.oft_neumann_terms,
         use_tucker: args.use_tucker,
