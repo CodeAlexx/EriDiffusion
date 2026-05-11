@@ -113,10 +113,17 @@ struct Args {
     /// adapters from spec, preserving Parameter TensorIds so AdamW state
     /// (built on first opt.step) is still keyed correctly. Optimizer m/v
     /// state itself is NOT restored — momentum re-warms over ~10-20 steps.
-    /// Step counter restarts from 0 in logs (cosmetic; the LoRA weights
-    /// continue from where they left off).
+    /// Combine with --resume-step to keep the progress UI honest.
     #[arg(long)]
     resume_lora: Option<PathBuf>,
+
+    /// Absolute step the resumed run picks up at (e.g. 100 when resuming
+    /// from a `.step000100.safetensors` checkpoint). Display shows
+    /// `step (resume_step + i + 1)/steps`; ETA = run-local s/step ×
+    /// remaining absolute steps. Auto-detected from the resume filename
+    /// when omitted (parses `.stepNNNNNN.safetensors` suffix).
+    #[arg(long, default_value = "0")]
+    resume_step: usize,
 
     /// Save a checkpoint every N steps. 0 disables.
     #[arg(long, default_value = "0")]
@@ -345,12 +352,33 @@ fn main() -> anyhow::Result<()> {
     // newly-attached Parameters' TensorIds (not the discarded fresh-init
     // ones). Loaded adapters fully replace per-key entries in the model's
     // LoRA HashMap.
+    // Auto-detect resume_step from filename pattern `.stepNNNNNN.safetensors`
+    // when the user didn't pass --resume-step explicitly.
+    let mut resume_step = args.resume_step;
     if let Some(resume_path) = args.resume_lora.as_ref() {
         if !use_lora {
             anyhow::bail!(
                 "--resume-lora requires --lora-preset or --lora-spec (resume \
                  needs the same LoRA target shape as the saved checkpoint)"
             );
+        }
+        if resume_step == 0 {
+            // Parse `.stepNNNNNN.safetensors` suffix from the filename.
+            if let Some(stem) = resume_path.file_stem().and_then(|s| s.to_str()) {
+                if let Some(idx) = stem.rfind(".step") {
+                    let tail = &stem[idx + 5..];
+                    let num_str: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if !num_str.is_empty() {
+                        if let Ok(n) = num_str.parse::<usize>() {
+                            resume_step = n;
+                            log::info!(
+                                "[train_u1] auto-detected resume_step={} from filename",
+                                resume_step,
+                            );
+                        }
+                    }
+                }
+            }
         }
         log::info!("[train_u1] resuming LoRA from {}", resume_path.display());
         let loaded = u1lora::load_adapters(resume_path, device.clone())?;
@@ -393,10 +421,15 @@ fn main() -> anyhow::Result<()> {
     );
 
     // ---- Geometry --------------------------------------------------------
-    let (p, merge, fm_dim, t_eps, bos_id) = {
+    let (p, merge, fm_dim, t_eps, bos_id,
+         add_ns_embed, ns_max, ns_base_seq, ns_value) = {
         let cfg = model.config();
         (cfg.patch_size, cfg.merge_size(), cfg.fm_head_out_dim(),
-         cfg.t_eps, cfg.bos_token_id)
+         cfg.t_eps, cfg.bos_token_id,
+         cfg.add_noise_scale_embedding,
+         cfg.noise_scale_max_value,
+         cfg.noise_scale_base_image_seq_len,
+         cfg.noise_scale)
     };
     let token_p = p * merge;
     if args.image_hw % token_p != 0 {
@@ -415,6 +448,28 @@ fn main() -> anyhow::Result<()> {
     log::info!(
         "[train_u1] geometry: HxW={}x{}  grid={}x{}  tokens={}x{}={}  fm_dim={}",
         h_img, w_img, grid_h, grid_w, token_h, token_w, n_image, fm_dim,
+    );
+
+    // Resolution-dependent noise scale (mirror Python collators.py:256-261):
+    //   eff_noise_scale = min(noise_scale_max, sqrt(N_image / base_seq_len) * noise_scale)
+    // At 256² N=64   → eff=1.0
+    // At 512² N=256  → eff=2.0
+    // At 1024² N=1024 → eff=4.0
+    // At 2048² N=4096 → eff=8.0 (clamped to noise_scale_max)
+    //
+    // Python pre-multiplies eps by this BEFORE z_t = t·x0 + (1-t)·eps, and
+    // also passes the scale to `noise_scale_embedder` (which divides by
+    // noise_scale_max internally). Without this, the model trains on noise
+    // 8× smaller than what inference sees → LoRA fails to generalize.
+    let eff_noise_scale: f32 = if add_ns_embed {
+        let scale = (n_image as f32 / ns_base_seq as f32).sqrt() * ns_value;
+        scale.min(ns_max)
+    } else {
+        1.0
+    };
+    log::info!(
+        "[train_u1] eff_noise_scale={:.4} (N={}, base={}, max={}, value={})",
+        eff_noise_scale, n_image, ns_base_seq, ns_max, ns_value,
     );
 
     // ---- Decide mode ----------------------------------------------------
@@ -473,20 +528,24 @@ fn main() -> anyhow::Result<()> {
         };
 
         // Build (noisy_pixel_values, x0_patch, eps, input_ids) for this step.
+        // eps is scaled by `eff_noise_scale` BEFORE going into z_t, matching
+        // Python's `collators.py:268-269`.
         let (noisy_pixel_values_step, x0_patch_step, eps_step, input_ids_step): (Tensor, Tensor, Tensor, Vec<i32>) =
             if samples.is_empty() {
+                let eps_raw = gaussian_bf16(args.seed.wrapping_add(2_000_000 + step as u64), &[1, n_image, fm_dim], &device)?;
+                let eps_scaled = eps_raw.mul_scalar(eff_noise_scale)?;
                 (
                     smoke_noisy.as_ref().unwrap().clone(),
                     smoke_x0.as_ref().unwrap().clone(),
-                    // Resample eps each step from the same seed for repro
-                    gaussian_bf16(args.seed.wrapping_add(2_000_000 + step as u64), &[1, n_image, fm_dim], &device)?,
+                    eps_scaled,
                     smoke_input_ids.clone(),
                 )
             } else {
                 let s = &samples[idx];
                 let img = load_image_x0(&s.image_path, h_img, &device)?;
                 let x0 = sensenova_u1::patchify(&img, token_p, false)?;
-                let eps = gaussian_bf16(args.seed.wrapping_add(2_000_000 + step as u64), &[1, n_image, fm_dim], &device)?;
+                let eps_raw = gaussian_bf16(args.seed.wrapping_add(2_000_000 + step as u64), &[1, n_image, fm_dim], &device)?;
+                let eps_scaled = eps_raw.mul_scalar(eff_noise_scale)?;
                 let caption = std::fs::read_to_string(&s.caption_path)
                     .with_context(|| format!("read {}", s.caption_path.display()))?;
                 let query = build_t2i_query(
@@ -495,7 +554,7 @@ fn main() -> anyhow::Result<()> {
                     "<think>\n\n</think>\n\n<img>",
                 );
                 let ids = encode_query(tokenizer.as_ref().unwrap(), &query)?;
-                (img, x0, eps, ids)
+                (img, x0, eps_scaled, ids)
             };
 
         // Compute noisy = unpatchify(z_t) so vision tower sees the noisy-pixel input.
@@ -518,6 +577,19 @@ fn main() -> anyhow::Result<()> {
             sensenova_u1::unpatchify(&z_t, token_p, h_img, w_img)?
         };
 
+        // Pass eff_noise_scale to forward so noise_scale_embedder conditions
+        // on it (matching Python wrapper.py:144-146). forward_t2i_step
+        // internally does `ns / noise_scale_max_value` before the embedder.
+        let noise_scale_tensor: Option<Tensor> = if add_ns_embed {
+            let t = Tensor::from_vec(
+                vec![eff_noise_scale],
+                Shape::from_dims(&[1]),
+                device.clone(),
+            )?
+            .to_dtype(DType::BF16)?;
+            Some(t)
+        } else { None };
+
         let out = model.forward_t2i_step(
             &noisy_pixel_for_gen,
             &x0_patch_step,
@@ -526,7 +598,7 @@ fn main() -> anyhow::Result<()> {
             grid_h,
             grid_w,
             &input_ids_step,
-            None,
+            noise_scale_tensor.as_ref(),
             None,
         )?;
 
@@ -627,10 +699,13 @@ fn main() -> anyhow::Result<()> {
         // Universal progress line (used across EDv2 trainers — see
         // crates/eridiffusion-core/src/training/progress.rs). Emits
         // `[<tag>] step N/T | epoch | loss | grad_norm | s/step | elapsed | ETA`.
+        // Step N is the ABSOLUTE step (resume_step + run-local + 1), so a
+        // resumed run reads as e.g. `step 107/500`, not `step 7/400`.
         let tag = if use_lora { "SenseNova-U1-lora" } else { "SenseNova-U1-mvp" };
-        eridiffusion_core::training::progress::log_step(
+        eridiffusion_core::training::progress::log_step_with_resume(
             tag,
             step,
+            resume_step,
             args.steps,
             n_samples,
             1, // batch_size = 1
@@ -639,6 +714,14 @@ fn main() -> anyhow::Result<()> {
             args.lr,
             t_run,
             None, // BoardWriter — wired in follow-up
+        );
+        // t value for diagnostic (loss varies massively with t at single-
+        // step granularity; the rolling mean is the real signal).
+        log::debug!(
+            "[train_u1] step={} t={:.3} loss={:.6} sample={}",
+            resume_step + step + 1,
+            t_val, loss_val,
+            if samples.is_empty() { "synthetic".to_string() } else { samples[idx].sample_id.clone() },
         );
 
         // Periodic checkpoint
