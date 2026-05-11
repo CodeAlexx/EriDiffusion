@@ -1582,57 +1582,46 @@ fn build_1d_rope(cap_seq: usize, device: &Arc<cudarc::driver::CudaDevice>) -> Re
 /// half = dim // 2
 /// freqs = exp(-log(max_period) * arange(0, half) / half)
 /// args = t[:, None] * freqs[None]
-/// Manual RMS norm built from primitive autograd ops.
+/// RMSNorm wrapper. Now a thin delegate to `flame_core::norm::rms_norm`.
 ///
-/// `flame_core::norm::rms_norm` records `Op::RMSNorm` whose backward
-/// kernel produces *exactly zero* `grad_input` on the Q/K-after-LoRA-delta
-/// pattern in this trainer (verified by Q_B/K_B staying at zero-init
-/// across all training steps while V_B trains normally). Reproducing the
-/// math with mul/sum_dim/add_scalar/rsqrt/mul makes the autograd chain
-/// explicit and gradient flows correctly.
+/// History: this function used to build the norm by hand from primitive
+/// autograd ops (mul + sum_dim_keepdim + add_scalar + rsqrt + mul + cast)
+/// because the older `flame_core::norm::rms_norm` backward suffered a
+/// BF16-accumulation drift that compounded across the 30-block stack —
+/// per-call grad direction error of 1-22%, gradient magnitude blow-up of
+/// ~1.25× per layer. That bug was fixed in flame-core commit `bcc37a7`
+/// (forward + backward kernels now F32-accumulate internally over BF16
+/// storage). Parity pinned by
+/// `flame-core/tests/rms_norm_vs_primitive_zimage.rs`:
 ///
-/// Math: `y = (x / sqrt(mean(x^2, dim=-1) + eps)) * weight`.
+///   forward [1,4096,2560]      max_rel = 7.8e-3 (BF16 floor)
+///   forward [1,24,4096,128]    max_rel = 7.5e-3 (BF16 floor)
+///   backward grad_x            cos = 1.000000, mag_ratio = 1.000000
+///   backward grad_w            cos = 1.000000, L1 = 1.0399e7 (both)
 ///
-/// Shapes: `x: [..., dim]`, `weight: [dim]`, output: `[..., dim]`.
-///
-/// Internal chain runs in F32 to keep backward direction faithful.
-/// BF16 accumulation in `sum_dim_keepdim` and BF16 arithmetic across the
-/// rsqrt+mul chain shifts the gradient direction by 1-22% per call (per
-/// the `block_parity` harness in `bin/zimage_block_parity_dump.rs`).
-/// Per-call direction error compounds geometrically across 30 layers,
-/// driving cos_sim against EriDiffusion to ~0 (random) and amplifying
-/// gradient magnitude by ~1.25× per layer (1000× by layer 0). Casting
-/// to F32 here makes the autograd-recorded chain operate in F32 so
-/// backward propagates with full precision; output is cast back to the
-/// caller's dtype.
+/// i.e. bit-exact backward against the primitive F32 chain. Name kept
+/// for source-diff minimization; signature unchanged.
 fn primitive_rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
-    let out_dtype = x.dtype();
-    let x_f32 = if out_dtype == DType::F32 { x.clone() } else { x.to_dtype(DType::F32)? };
-    let weight_f32 = if weight.dtype() == DType::F32 {
-        weight.clone()
-    } else {
-        weight.to_dtype(DType::F32)?
-    };
-    let sq = x_f32.mul(&x_f32)?;
-    let dims = sq.shape().dims().to_vec();
-    let last = dims.len() - 1;
-    let n = dims[last] as f32;
-    let mean_sq = sq.sum_dim_keepdim(last)?.mul_scalar(1.0 / n)?;
-    let inv_rms = mean_sq.add_scalar(eps)?.rsqrt()?;
-    let normed = x_f32.mul(&inv_rms)?;
-    let scaled = normed.mul(&weight_f32)?;
-    if out_dtype == DType::F32 {
-        Ok(scaled)
-    } else {
-        scaled.to_dtype(out_dtype)
-    }
+    let last_dim = weight
+        .shape()
+        .dims()
+        .last()
+        .copied()
+        .unwrap_or_else(|| x.shape().dims()[x.shape().dims().len() - 1]);
+    flame_core::norm::rms_norm(x, &[last_dim], Some(weight), eps)
 }
 
 /// Primitive LayerNorm (no scale/bias) with F32-internal chain.
-/// Replaces `flame_core::layer_norm::layer_norm` whose fused-kernel
-/// backward suffers the same BF16-accumulation issue documented for
-/// `primitive_rms_norm` above. F32 internals + autograd-recorded chain
-/// keeps backward direction faithful.
+///
+/// Kept as a primitive chain pending tighter parity work. The fused
+/// `flame_core::layer_norm::layer_norm` agrees in forward (max_rel 7.8e-3,
+/// BF16 floor) and on backward magnitude (mag_ratio 1.003) but currently
+/// drifts in backward direction at cos ≈ 0.997 — see
+/// `flame-core/tests/rms_norm_vs_primitive_zimage.rs::
+/// layer_norm_no_affine_backward_parity_zimage_block_shape`. That ~0.3%
+/// per-call drift may compound across the 30-block stack; revisit after
+/// fused LN backward switches to a two-pass `E[(x-mean)^2]` accumulator
+/// matching this primitive chain.
 fn primitive_layer_norm(x: &Tensor, eps: f32) -> Result<Tensor> {
     let out_dtype = x.dtype();
     let x_f32 = if out_dtype == DType::F32 { x.clone() } else { x.to_dtype(DType::F32)? };
