@@ -1083,6 +1083,7 @@ fn main() -> anyhow::Result<()> {
         AutogradContext::clear();
 
         eridiffusion_core::training::progress::log_step(
+            "Wan2.2-lora",
             step, steps, cache_files.len(), args.batch_size.max(1),
             loss_val, total_norm, cur_lr, t_start, board.as_ref(),
         );

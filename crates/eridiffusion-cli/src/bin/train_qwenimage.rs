@@ -1038,6 +1038,7 @@ fn main() -> anyhow::Result<()> {
         let step_num = step + 1;
         let _ = total_loss;
         eridiffusion_core::training::progress::log_step(
+            "QwenImage-lora",
             step, args.steps, cache_files.len(), 1,
             loss_val, grad_norm, current_lr, t_start, board.as_ref(),
         );

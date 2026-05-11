@@ -2,7 +2,10 @@
 //! of truth for all trainer binaries.
 //!
 //! Stdout format:
-//! `step N/T | epoch e/E | loss X.XXXX | grad_norm X.XXXX | X.Xs/step | elapsed H:MM:SS | ETA H:MM:SS`
+//! `[<tag>] step N/T | epoch e/E | loss X.XXXX | grad_norm X.XXXX | X.Xs/step | elapsed H:MM:SS | ETA H:MM:SS`
+//!
+//! `tag` is the trainer/run identifier, e.g. `u1-lora`, `zimage-lora`,
+//! `klein-full-finetune`. An empty `tag` suppresses the bracket prefix.
 //!
 //! Board scalars (when writer is present): `loss/train`, `grad_norm`,
 //! `lr/default`, `perf/steps_per_sec`. SerenityBoard's `training_reader.py`
@@ -15,8 +18,13 @@ use crate::training::board::BoardWriter;
 /// Log a single training step. Writes both human-readable stdout via `log::info!`
 /// AND, when `board` is `Some`, writes scalars to SerenityBoard's SQLite DB.
 ///
+/// `tag` is the run identifier shown in `[…]` brackets at the line start
+/// (e.g. `SenseNova-U1-lora`, `zimage-lora`, `HiDream-O1-full-finetune`).
+/// Empty string suppresses the bracket.
+///
 /// `step` is 0-indexed; the printed/stored step number is `step + 1`.
 pub fn log_step(
+    tag: &str,
     step: usize,
     total_steps: usize,
     dataset_len: usize,
@@ -40,8 +48,13 @@ pub fn log_step(
     let (eh, em, es) = (elapsed_u / 3600, (elapsed_u % 3600) / 60, elapsed_u % 60);
     let (ah, am, as_) = (eta_secs / 3600, (eta_secs % 3600) / 60, eta_secs % 60);
 
+    let prefix = if tag.is_empty() {
+        String::new()
+    } else {
+        format!("[{tag}] ")
+    };
     log::info!(
-        "step {}/{} | epoch {}/{} | loss {:.4} | grad_norm {:.4} | {:.1}s/step | elapsed {}:{:02}:{:02} | ETA {}:{:02}:{:02}",
+        "{prefix}step {}/{} | epoch {}/{} | loss {:.4} | grad_norm {:.4} | {:.1}s/step | elapsed {}:{:02}:{:02} | ETA {}:{:02}:{:02}",
         step + 1, total_steps, cur_epoch, total_epochs,
         loss, grad_norm, sec_per_step,
         eh, em, es, ah, am, as_,

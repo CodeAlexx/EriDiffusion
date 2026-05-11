@@ -832,6 +832,7 @@ fn main() -> anyhow::Result<()> {
 
         let _ = total_loss;
         eridiffusion_core::training::progress::log_step(
+            "ERNIE-lora",
             step, args.steps, cache_files.len(), 1,
             loss_val, total_norm, cur_lr, t_start, board.as_ref(),
         );

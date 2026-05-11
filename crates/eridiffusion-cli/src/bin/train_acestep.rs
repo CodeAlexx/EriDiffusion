@@ -733,6 +733,7 @@ fn main() -> anyhow::Result<()> {
 
         let _ = loss_sum; let _ = loss_count;
         eridiffusion_core::training::progress::log_step(
+            "AceStep-lora",
             step, args.steps, cache_files.len(), 1,
             loss_val, grad_norm, current_lr, t_start, board.as_ref(),
         );

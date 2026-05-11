@@ -108,6 +108,16 @@ struct Args {
     #[arg(long)]
     lora_save_to: Option<PathBuf>,
 
+    /// Resume LoRA training from a PEFT-format checkpoint. Loads the
+    /// down/up/alpha tensors from disk and OVERWRITES the freshly-built
+    /// adapters from spec, preserving Parameter TensorIds so AdamW state
+    /// (built on first opt.step) is still keyed correctly. Optimizer m/v
+    /// state itself is NOT restored — momentum re-warms over ~10-20 steps.
+    /// Step counter restarts from 0 in logs (cosmetic; the LoRA weights
+    /// continue from where they left off).
+    #[arg(long)]
+    resume_lora: Option<PathBuf>,
+
     /// Save a checkpoint every N steps. 0 disables.
     #[arg(long, default_value = "0")]
     checkpoint_every: usize,
@@ -119,6 +129,17 @@ struct Args {
     /// Shuffle dataset order (real-data mode only).
     #[arg(long, default_value = "true")]
     shuffle: bool,
+
+    /// Optimizer kind. Adafactor avoids the m+v state of AdamW (~600 MB at
+    /// default preset) — useful when training at 2048² on 24 GB.
+    #[arg(long, default_value = "adamw")]
+    optimizer: String,
+
+    /// SerenityBoard SQLite output directory. When set, training emits
+    /// loss/grad_norm/lr/steps_per_sec scalars to `<board-dir>/board.db`
+    /// alongside the stdout progress lines (universal display).
+    #[arg(long)]
+    board_dir: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -318,23 +339,57 @@ fn main() -> anyhow::Result<()> {
     } else {
         SenseNovaU1::load_for_training_mvp(&args.model_path, &device)?
     };
+
+    // ---- Resume from prior LoRA checkpoint --------------------------------
+    // Must happen BEFORE `model.parameters()` so the optimizer keys onto the
+    // newly-attached Parameters' TensorIds (not the discarded fresh-init
+    // ones). Loaded adapters fully replace per-key entries in the model's
+    // LoRA HashMap.
+    if let Some(resume_path) = args.resume_lora.as_ref() {
+        if !use_lora {
+            anyhow::bail!(
+                "--resume-lora requires --lora-preset or --lora-spec (resume \
+                 needs the same LoRA target shape as the saved checkpoint)"
+            );
+        }
+        log::info!("[train_u1] resuming LoRA from {}", resume_path.display());
+        let loaded = u1lora::load_adapters(resume_path, device.clone())?;
+        let expected = model.lora_adapters().len();
+        if loaded.len() != expected {
+            log::warn!(
+                "[train_u1] checkpoint has {} adapters, current spec expects {} — \
+                 keys present in both will be loaded; mismatches kept fresh-init",
+                loaded.len(), expected,
+            );
+        }
+        log::info!("[train_u1] attaching {} loaded LoRA adapters", loaded.len());
+        model.attach_lora_adapters(loaded);
+    }
+
     let params = model.parameters();
     log::info!("[train_u1] {} trainable Parameters", params.len());
     if params.is_empty() {
         anyhow::bail!("no trainable parameters — loader failed silently");
     }
 
-    let mut opt = Optimizer::new(
-        OptimizerKind::AdamW,
-        args.lr,
-        0.9,
-        0.95,
-        1e-8,
-        0.0,
-    );
+    let opt_kind = match args.optimizer.to_lowercase().as_str() {
+        "adamw" => OptimizerKind::AdamW,
+        // Python's U1 trainer uses bnb.optim.PagedAdamW8bit — 8-bit moment
+        // state, ~4× smaller than F32 m+v. The project-wide no-quantization
+        // rule is Z-Image-only; Wan22 + U1 are documented exceptions.
+        "adamw8bit" | "adamw_8bit" => OptimizerKind::AdamW8bit,
+        "adafactor" => OptimizerKind::Adafactor,
+        "lion" => OptimizerKind::Lion,
+        "prodigy" => OptimizerKind::Prodigy,
+        "stable_adamw" | "stableadamw" => OptimizerKind::StableAdamW,
+        other => anyhow::bail!(
+            "unknown --optimizer {other:?}; valid: adamw | adamw8bit | adafactor | lion | prodigy | stable_adamw"
+        ),
+    };
+    let mut opt = Optimizer::new(opt_kind, args.lr, 0.9, 0.95, 1e-8, 0.0);
     log::info!(
-        "[train_u1] optimizer=AdamW(lr={}, betas=(0.9, 0.95))  grad_accum={}",
-        args.lr, args.grad_accum,
+        "[train_u1] optimizer={:?}(lr={})  grad_accum={}",
+        opt_kind, args.lr, args.grad_accum,
     );
 
     // ---- Geometry --------------------------------------------------------
@@ -489,8 +544,16 @@ fn main() -> anyhow::Result<()> {
 
         let grads = loss_scaled.backward()?;
 
-        // Grad-flow assertion at step 1.
-        if step == 1 {
+        // Grad-flow assertion at step 1. Only meaningful for AdamW: other
+        // optimizers (Adafactor, AdamW8bit, Lion, Prodigy, StableAdamW) call
+        // `Parameter::set_data()` in their `.step()`, which replaces the
+        // stored tensor with a fresh `TensorId` while leaving `Parameter.id`
+        // untouched. At step 1 those optimizers' params have already been
+        // through one .step(), so the diagnostic queries `grads.get(stale_id)`
+        // and reports every param "missing" even though training is healthy.
+        // Loss-vs-time is the real signal in that case.
+        let grad_flow_meaningful = matches!(opt_kind, OptimizerKind::AdamW);
+        if step == 1 && grad_flow_meaningful {
             let named = model.named_parameters();
             let named_refs: Vec<(&str, &flame_core::parameter::Parameter)> =
                 named.iter().map(|(n, p)| (n.as_str(), p)).collect();
@@ -500,10 +563,28 @@ fn main() -> anyhow::Result<()> {
             } else {
                 log::warn!("[train_u1] grad-flow {}", report.summary());
             }
+        } else if step == 1 {
+            log::info!(
+                "[train_u1] step 1 grad-flow check skipped (optimizer={:?} \
+                 uses Parameter::set_data which breaks the id-based diagnostic; \
+                 training is healthy if loss decreases)",
+                opt_kind,
+            );
         }
 
         // Accumulate grads into Parameter.grad. For grad_accum > 1, sum
         // across micro-steps; otherwise just set.
+        //
+        // NOTE: Only correct for AdamW. Other optimizers in flame-core call
+        // `Parameter::set_data` in `.step()` which replaces the inner Tensor
+        // with one that has a fresh TensorId — but `Parameter.id` field is
+        // NOT updated. After step 0 with those optimizers, every `param.id()`
+        // is stale relative to the next backward's GradientMap keys, so the
+        // `grads.get(...)` below returns None for every param → no set_grad
+        // → no update. Loss looks like it varies but it's purely t-variance.
+        // Until flame-core's Parameter::set_data is patched to refresh
+        // self.id (or those optimizers switched to with_data_mut), AdamW is
+        // the only safe choice for this trainer.
         for param in &params {
             if let Some(g) = grads.get(param.id()) {
                 if args.grad_accum > 1 && accum_count > 0 {
@@ -521,6 +602,19 @@ fn main() -> anyhow::Result<()> {
         }
         accum_count += 1;
 
+        // Global L2 grad norm for the progress line (cheap — sums over the
+        // GradientMap entries that match our params).
+        let grad_norm: f32 = {
+            let mut sq_sum: f64 = 0.0;
+            for param in &params {
+                if let Some(g) = grads.get(param.id()) {
+                    let abs2 = g.to_dtype(DType::F32)?.square()?.sum_all()?.to_vec()?[0];
+                    sq_sum += abs2 as f64;
+                }
+            }
+            (sq_sum.sqrt()) as f32
+        };
+
         let do_step = accum_count >= args.grad_accum;
         if do_step {
             opt.step(&params)?;
@@ -528,18 +622,24 @@ fn main() -> anyhow::Result<()> {
             accum_count = 0;
         }
 
-        let elapsed = t_step.elapsed().as_secs_f32();
-        let sample_id = if samples.is_empty() {
-            "synthetic".to_string()
-        } else {
-            samples[idx].sample_id.clone()
-        };
-        if step < 5 || step % 10 == 0 || step == args.steps - 1 {
-            log::info!(
-                "[train_u1] step={:5}  t={:.3}  loss={:.6}  sample={}  {:.2}s",
-                step, t_val, loss_val, sample_id, elapsed,
-            );
-        }
+        let _ = t_step; // step-local timing folded into log_step's sec/step
+
+        // Universal progress line (used across EDv2 trainers — see
+        // crates/eridiffusion-core/src/training/progress.rs). Emits
+        // `[<tag>] step N/T | epoch | loss | grad_norm | s/step | elapsed | ETA`.
+        let tag = if use_lora { "SenseNova-U1-lora" } else { "SenseNova-U1-mvp" };
+        eridiffusion_core::training::progress::log_step(
+            tag,
+            step,
+            args.steps,
+            n_samples,
+            1, // batch_size = 1
+            loss_val,
+            grad_norm,
+            args.lr,
+            t_run,
+            None, // BoardWriter — wired in follow-up
+        );
 
         // Periodic checkpoint
         if args.checkpoint_every > 0

@@ -581,6 +581,7 @@ fn main() -> anyhow::Result<()> {
 
         let _ = total_loss;
         eridiffusion_core::training::progress::log_step(
+            "LTX-2-lora",
             step, args.steps, cache_files.len(), args.batch_size.max(1),
             loss_val, total_norm, cur_lr, t_start, board.as_ref(),
         );

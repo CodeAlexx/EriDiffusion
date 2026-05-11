@@ -938,6 +938,7 @@ fn main() -> anyhow::Result<()> {
 
         let _ = total_loss;
         eridiffusion_core::training::progress::log_step(
+            "Klein-slider-lora",
             step, args.steps, dataset_len, args.batch_size.max(1),
             loss_val, total_norm, cur_lr, t_start, board.as_ref(),
         );
