@@ -408,17 +408,28 @@ impl ZImageLoraBundle {
     /// fallback in `inference-flame/src/lora.rs:255`).
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
         let mut tensors = HashMap::new();
+        // Legacy plain-LoRA path (used when --algo lora). Empty when a
+        // LyCORIS algo is active.
         for (&(block_idx, target), lora) in &self.adapters {
             let suffix = Self::ai_toolkit_suffix(target);
             let prefix = format!("diffusion_model.layers.{block_idx}.{suffix}");
-            // ai-toolkit uses `.lora_A.weight` / `.lora_B.weight`. We've
-            // historically saved bare `.lora_A` / `.lora_B`. Format the
-            // explicit `.weight`-suffixed keys here so the on-disk format
-            // is byte-exchangeable with ai-toolkit.
+            // ai-toolkit uses `.lora_A.weight` / `.lora_B.weight`.
             let lora_a = lora.lora_a().tensor()?;
             let lora_b = lora.lora_b().tensor()?;
             tensors.insert(format!("{prefix}.lora_A.weight"), lora_a);
             tensors.insert(format!("{prefix}.lora_B.weight"), lora_b);
+        }
+        // LyCORIS path — must save when --algo lokr/loha/locon/... is active,
+        // otherwise the ckpt is just an empty `{}` safetensors file (10 bytes).
+        // Each adapter contributes its own per-leaf tensors via
+        // `named_tensors()`: LoKr → (lokr_w1, lokr_w2 or lokr_w2_a/b),
+        // LoCon → (lora_down/up), LoHa → (hada_*), etc.
+        for (&(block_idx, target), adapter) in &self.lycoris_adapters {
+            let suffix = Self::ai_toolkit_suffix(target);
+            let prefix = format!("diffusion_model.layers.{block_idx}.{suffix}");
+            for (leaf, t) in adapter.named_tensors() {
+                tensors.insert(format!("{prefix}.{leaf}"), t);
+            }
         }
         flame_core::serialization::save_tensors(
             &tensors,
