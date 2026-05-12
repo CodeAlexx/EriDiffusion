@@ -77,6 +77,12 @@ struct Args {
     /// Per-block weight streaming via BlockOffloader (required for 24GB VRAM
     /// at 1024² with 57 blocks resident).
     #[arg(long)] offload: bool,
+    /// Reserved for future activation-offload pool sizing. As of 2026-05-12
+    /// the pool is NOT installed for Chroma (see the comment block before
+    /// `let params = model.parameters();` for the empirical reason). The
+    /// flag is preserved so existing config files / CLI invocations remain
+    /// valid when the pool is re-enabled.
+    #[arg(long, default_value = "512")] offload_resolution: usize,
     /// Save a LoRA checkpoint every N steps (0 = end-only).
     #[arg(long, default_value = "0")] save_every: usize,
     /// Resume LoRA weights only (no optimizer state).
@@ -399,6 +405,26 @@ fn main() -> anyhow::Result<()> {
         // Explicit log: legacy path — no swap.
         log::info!("[Chroma] algo='lora' (legacy LoRALinear path, byte-identical)");
     }
+
+    // ── Activation offload pool ─────────────────────────────────────────────
+    // INTENTIONALLY NOT INSTALLED for Chroma as of 2026-05-12 — same
+    // empirical reason as Z-Image (Stage 1, plan keen-crafting-jellyfish).
+    // Chroma's per-block sub-tape (57 blocks × ~7 BF16-grad saves per
+    // tape entry × many entries) consistently exhausts any slot budget
+    // that fits in 62 GB host RAM, triggering partial offload + recompute
+    // fallback. The fallback path produces NaN loss starting at step 2
+    // (verified 5-step smoke: 944 slots / 16 per-block, raw BF16 = 42 GB
+    // pinned, exhausted after 138 entries, NaN from step 2 onward,
+    // 10–15 s/step vs ~5–7 s/step baseline).
+    //
+    // The `checkpoint_offload` call sites at models/chroma.rs:1352 and
+    // :1397 are PRESERVED — they fall back to `checkpoint()` (recompute)
+    // when no pool is installed (autograd.rs:1876-1879), giving the
+    // existing baseline behaviour byte-equivalent.
+    //
+    // To revisit when flame-core gains per-block slot reservation +
+    // eviction OR when the partial-offload NaN propagation bug is fixed.
+    let _ = args.offload_resolution; // arg accepted for forward-compatibility
 
     let params = model.parameters();
     log::info!("[Chroma] {} trainable tensors", params.len());

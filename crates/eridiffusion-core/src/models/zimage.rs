@@ -1051,7 +1051,15 @@ impl ZImageModel {
                 // block's F32 Parameters, so backward flows through
                 // Cast → Parameter. In LoRA mode it's a plain clone.
                 let block_w_c = self.fft_block_cast(i)?;
-                h_state = AutogradContext::checkpoint(
+                // 2026-05-12: migrated from `checkpoint` to `checkpoint_offload`
+                // (Stage 1, plan keen-crafting-jellyfish). Signatures are
+                // identical; `checkpoint_offload` falls back to `checkpoint`
+                // when no ActivationOffloadPool is installed (autograd.rs:
+                // 1876-1879), so this is byte-equivalent without the pool.
+                // With the pool installed by `train_zimage.rs`, saved
+                // activations live on CPU instead of being recomputed,
+                // eliminating ~1.5 s/step of recompute overhead per block.
+                h_state = AutogradContext::checkpoint_offload(
                     &[h_c.clone()],
                     move || {
                         bundle_c.refresh_caches();

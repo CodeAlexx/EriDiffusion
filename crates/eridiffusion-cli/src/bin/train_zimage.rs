@@ -87,6 +87,12 @@ struct Args {
     /// Per-step batch size — N cached samples stacked along dim 0. OT
     /// Python preset uses batch=2; ED-v2 default 1 keeps single-image flow.
     #[arg(long, default_value = "1")] batch_size: usize,
+    /// Reserved for future activation-offload pool sizing. As of 2026-05-12
+    /// the pool is NOT installed for Z-Image (see the comment block before
+    /// `let params = model.parameters();` for the empirical reason). The
+    /// flag is preserved so existing config files / CLI invocations remain
+    /// valid when the pool is re-enabled.
+    #[arg(long, default_value = "512")] offload_resolution: usize,
     /// Save a LoRA checkpoint every N steps WITHOUT rendering an image
     /// (independent from `--sample-every`). 0 disables. Useful for protecting
     /// long runs against crashes.
@@ -435,6 +441,37 @@ fn main() -> anyhow::Result<()> {
         model.bundle.load(resume_path, &device)?;
         model.refresh_lora_cache();
     }
+
+    // ── Activation offload pool ─────────────────────────────────────────────
+    // INTENTIONALLY NOT INSTALLED for Z-Image as of 2026-05-12. The migration
+    // of `zimage.rs:1054` from `checkpoint` to `checkpoint_offload` (Stage 1
+    // of plan `keen-crafting-jellyfish`) is byte-equivalent without a pool —
+    // `checkpoint_offload` falls back to `checkpoint()` when no pool is
+    // installed (autograd.rs:1876-1879).
+    //
+    // Empirical finding from the same session: Z-Image's per-block sub-tape
+    // has ~21 BF16 grad-required saves per tape entry × ~13 entries per
+    // block × 30 blocks ≈ 8000 push attempts per forward. At 38 MB/slot
+    // (raw BF16 @ 512²) this needs ~300 GB pinned host RAM, which is 5×
+    // the 62 GB system budget. Pool sizing experiments (slots_per_block=8
+    // → 32) all hit pool exhaustion in the first block, triggering partial
+    // offload + recompute fallback that runs 2-3× SLOWER than pure
+    // recompute (5.9 s/step vs 1.8 s baseline) AND triggered both NaN loss
+    // and CUDA OOM in backward. Pool install is therefore actively harmful.
+    //
+    // To revisit: would need either (a) per-block pool slot reservation
+    // with eviction (flame-core change), (b) sparse-save model rewrite, or
+    // (c) selectively offloading only "expensive" saves (heuristic in
+    // flame-core). All are out of scope for Stage 1.
+    //
+    // The migration alone is kept because it is a strict no-op without a
+    // pool, and enables future re-enable without a model code change.
+    //
+    // Chroma hits the same failure mode at smaller numbers (see
+    // train_chroma.rs) — pool install is currently not productive for any
+    // EDv2 trainer until flame-core fixes the partial-offload path.
+    let _ = args.offload_resolution; // arg accepted for forward-compatibility
+
     let params = model.parameters();
     log::info!("Loaded {} trainable LoRA tensors", params.len());
     if params.is_empty() {
