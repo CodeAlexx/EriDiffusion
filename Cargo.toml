@@ -22,3 +22,10 @@ safetensors = "0.4"
 parking_lot = "0.12"
 lazy_static = "1.4"
 clap = { version = "4", features = ["derive"] }
+
+# 2026-05-12 (launch-storm Phase 4): vendored cudarc 0.11.9 with the
+# bind_to_thread thread-local fast-path. Must mirror flame-core's
+# [patch.crates-io] so the same cudarc rmeta is used across the
+# entire dependency graph.
+[patch.crates-io]
+cudarc = { path = "../cudarc-pinctx" }
