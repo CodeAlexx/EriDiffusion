@@ -1,0 +1,10 @@
+# Generated input artifacts and per-run results (regenerable via run_all.sh)
+*.safetensors
+*.nsys-rep
+*.sqlite
+matched_config/pt_results.json
+matched_config/flame_results.json
+matched_config/results.md
+kernel_count_diff/pt_results.json
+kernel_count_diff/flame_results.json
+kernel_count_diff/results.md
