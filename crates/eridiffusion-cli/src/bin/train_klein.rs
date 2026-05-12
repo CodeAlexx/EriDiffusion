@@ -1199,6 +1199,20 @@ fn main() -> anyhow::Result<()> {
             );
         }
 
+        // FORWARD-ONLY BENCH MODE: skip backward + optimizer when
+        // FLAME_FORWARD_ONLY_BENCH=1. Used only for isolating forward
+        // vs backward s/step.
+        let forward_only_bench = std::env::var("FLAME_FORWARD_ONLY_BENCH").is_ok();
+        if forward_only_bench {
+            AutogradContext::clear();
+            eridiffusion_core::training::progress::log_step(
+                "Klein-fwd-only",
+                step, args.steps, dataset_len, args.batch_size.max(1),
+                loss_val, 0.0, 0.0, t_start, board.as_ref(),
+            );
+            continue;
+        }
+
         let mut grads = loss.backward()?;
 
         // clip_grad_norm = 1.0 (klein preset default; ERNIE memory: convergence killer

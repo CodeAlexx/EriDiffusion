@@ -856,6 +856,21 @@ fn main() -> anyhow::Result<()> {
         let loss_val = loss.to_vec()?[0];
         total_loss += loss_val;
 
+        // FORWARD-ONLY BENCH MODE: skip backward + optimizer when
+        // FLAME_FORWARD_ONLY_BENCH=1. Used only for isolating forward
+        // vs backward s/step. Loss + autograd recording still happen.
+        let forward_only_bench = std::env::var("FLAME_FORWARD_ONLY_BENCH").is_ok();
+        if forward_only_bench {
+            AutogradContext::clear();
+            // Still emit the per-step progress log so we get s/step timing.
+            eridiffusion_core::training::progress::log_step(
+                "Z-Image-fwd-only",
+                step, args.steps, cache_files.len(), args.batch_size.max(1),
+                loss_val, 0.0, 0.0, t_start, board.as_ref(),
+            );
+            continue;
+        }
+
         let mut grads = loss.backward()?;
 
         // Grad-flow diagnostic.  Runs at step 1 — NOT step 0 — because every
