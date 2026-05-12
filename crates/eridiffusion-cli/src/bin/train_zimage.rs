@@ -41,6 +41,15 @@ use eridiffusion_core::training::features::{
 use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
 use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
 use std::str::FromStr as _;
+use std::sync::{Mutex, OnceLock};
+
+// Process-wide cache for the multi-tensor scale metadata buffer. Used only
+// when `FLAME_MT_SCALE=1` enables the multi-tensor clip-scale path. The
+// per-step buffer is small (2N u64 entries for N LoRA params) and reused
+// across steps once `N` stabilizes. See
+// EriDiffusion-v2/HANDOFF_2026-05-12_PHASE2_SCALE_FOLLOWUP.md.
+static MT_SCALE_CACHE: OnceLock<Mutex<flame_core::ops::multi_tensor::MultiTensorMetaCache>> =
+    OnceLock::new();
 
 const ZIMAGE_TEMPLATE_PRE: &str = "<|im_start|>user\n";
 const ZIMAGE_TEMPLATE_POST: &str = "<|im_end|>\n<|im_start|>assistant\n";
@@ -847,7 +856,7 @@ fn main() -> anyhow::Result<()> {
         let loss_val = loss.to_vec()?[0];
         total_loss += loss_val;
 
-        let grads = loss.backward()?;
+        let mut grads = loss.backward()?;
 
         // Grad-flow diagnostic.  Runs at step 1 — NOT step 0 — because every
         // LoRA-style algo (LoRA, LoCon, LoHa, LoKr) initializes one factor
@@ -880,10 +889,74 @@ fn main() -> anyhow::Result<()> {
         let total_norm = flame_core::ops::grad_norm::global_l2_norm(&grad_refs)?
             .item()? as f32;
         let scale = if total_norm > CLIP_GRAD_NORM { CLIP_GRAD_NORM / total_norm } else { 1.0 };
-        for param in &params {
-            if let Some(g) = grads.get(param.id()) {
-                let g_scaled = if scale < 1.0 { g.mul_scalar(scale)? } else { g.clone() };
-                param.set_grad(g_scaled)?;
+
+        // FLAME_MT_SCALE=1 collapses the per-parameter mul_scalar loop into a
+        // single multi-tensor kernel launch when the clip path fires. Default
+        // off: zimage's grad_norm stays well below 1.0 in production configs,
+        // so the multi-tensor path adds no value. See
+        // EriDiffusion-v2/HANDOFF_2026-05-12_PHASE2_SCALE_FOLLOWUP.md.
+        let mt_scale_enabled = std::env::var("FLAME_MT_SCALE")
+            .ok()
+            .as_deref()
+            .map(|v| matches!(v, "1" | "true" | "TRUE"))
+            .unwrap_or(false);
+
+        if mt_scale_enabled && scale < 1.0 {
+            // Multi-tensor in-place scale. Extract device pointers as u64
+            // values so the &mut Tensor borrow from get_mut releases between
+            // iterations — Rust won't let us hold N concurrent &mut into the
+            // map.
+            let mut ptrs: Vec<u64> = Vec::with_capacity(params.len());
+            let mut sizes: Vec<u64> = Vec::with_capacity(params.len());
+            let mut device_opt: Option<std::sync::Arc<flame_core::CudaDevice>> = None;
+            for param in &params {
+                if let Some(g) = grads.get_mut(param.id()) {
+                    if g.dtype() != flame_core::DType::F32 {
+                        anyhow::bail!(
+                            "FLAME_MT_SCALE expects F32 grads (GradientMap policy is F32), got {:?}",
+                            g.dtype()
+                        );
+                    }
+                    if device_opt.is_none() {
+                        device_opt = Some(g.device().clone());
+                    }
+                    ptrs.push(g.as_mut_device_ptr_f32("mt_scale:g")?);
+                    sizes.push(g.shape().elem_count() as u64);
+                }
+            }
+            let n = ptrs.len();
+            if n > 0 {
+                let mut packed: Vec<u64> = Vec::with_capacity(2 * n);
+                packed.extend(ptrs);
+                packed.extend(sizes);
+                let device = device_opt.expect("at least one grad present");
+                let cache_cell = MT_SCALE_CACHE
+                    .get_or_init(|| Mutex::new(flame_core::ops::multi_tensor::MultiTensorMetaCache::new()));
+                let mut cache = cache_cell
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("MT_SCALE_CACHE mutex poisoned"))?;
+                flame_core::ops::multi_tensor::multi_tensor_scale_inplace_packed(
+                    &mut cache,
+                    &device,
+                    n,
+                    &packed,
+                    scale,
+                    /* is_bf16 = */ false,
+                )?;
+            }
+            // Grads now hold scaled values in place. set_grad clones the
+            // (already-scaled) tensor into the parameter's grad slot.
+            for param in &params {
+                if let Some(g) = grads.get(param.id()) {
+                    param.set_grad(g.clone())?;
+                }
+            }
+        } else {
+            for param in &params {
+                if let Some(g) = grads.get(param.id()) {
+                    let g_scaled = if scale < 1.0 { g.mul_scalar(scale)? } else { g.clone() };
+                    param.set_grad(g_scaled)?;
+                }
             }
         }
         // Phase 5: dispatch LR. Default sched=Constant + warmup_steps=0
@@ -916,6 +989,11 @@ fn main() -> anyhow::Result<()> {
             step, args.steps, cache_files.len(), args.batch_size.max(1),
             loss_val, total_norm, cur_lr, t_start, board.as_ref(),
         );
+
+        // Per-step permute_generic tally dump. Default off; enable with
+        // `FLAME_TRACE_PERMUTE_GENERIC=1`. Dumps + resets after each step
+        // so the printed counts are "this step only".
+        flame_core::cuda_kernels::permute_generic_trace::dump();
 
         // Phase 2: validation eval pass (no_grad) every `validation_every_steps`.
         // Mirrors the training step under AutogradContext::no_grad() with the

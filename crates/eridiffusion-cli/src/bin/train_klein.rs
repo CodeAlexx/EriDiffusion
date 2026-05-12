@@ -34,6 +34,13 @@ use eridiffusion_core::training::features::webhook::WebhookClient;
 use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
 use eridiffusion_core::training::training_features::timestep_dist::{TimestepConfig, TimestepDistribution};
 use std::str::FromStr as _;
+use std::sync::{Mutex, OnceLock};
+
+// Process-wide cache for the multi-tensor scale metadata buffer. Used only
+// when `FLAME_MT_SCALE=1` enables the multi-tensor clip-scale path. See
+// EriDiffusion-v2/HANDOFF_2026-05-12_PHASE2_SCALE_FOLLOWUP.md.
+static MT_SCALE_CACHE: OnceLock<Mutex<flame_core::ops::multi_tensor::MultiTensorMetaCache>> =
+    OnceLock::new();
 
 const NUM_TRAIN_TIMESTEPS: usize = 1000;
 const LOGIT_NORMAL_BIAS: f32 = 0.0;
@@ -1192,7 +1199,7 @@ fn main() -> anyhow::Result<()> {
             );
         }
 
-        let grads = loss.backward()?;
+        let mut grads = loss.backward()?;
 
         // clip_grad_norm = 1.0 (klein preset default; ERNIE memory: convergence killer
         // if omitted).
@@ -1212,14 +1219,72 @@ fn main() -> anyhow::Result<()> {
             eprintln!("[OT_DEBUG step={:5}] grad_norm_pre_clip={:.4e}", step, total_norm);
         }
         let scale = if total_norm > CLIP_GRAD_NORM { CLIP_GRAD_NORM / total_norm } else { 1.0 };
-        for param in &params {
-            if let Some(g) = grads.get(param.id()) {
-                let g_scaled = if scale < 1.0 {
-                    g.mul_scalar(scale)?
-                } else {
-                    g.clone()
-                };
-                param.set_grad(g_scaled)?;
+
+        // FLAME_MT_SCALE=1 collapses the per-parameter mul_scalar loop into a
+        // single multi-tensor kernel launch when the clip path fires. Default
+        // off: klein's grad_norm sits at 0.004–0.17 in production configs and
+        // never trips the clip path, so the multi-tensor path adds no value.
+        // See EriDiffusion-v2/HANDOFF_2026-05-12_PHASE2_SCALE_FOLLOWUP.md.
+        let mt_scale_enabled = std::env::var("FLAME_MT_SCALE")
+            .ok()
+            .as_deref()
+            .map(|v| matches!(v, "1" | "true" | "TRUE"))
+            .unwrap_or(false);
+
+        if mt_scale_enabled && scale < 1.0 {
+            let mut ptrs: Vec<u64> = Vec::with_capacity(params.len());
+            let mut sizes: Vec<u64> = Vec::with_capacity(params.len());
+            let mut device_opt: Option<std::sync::Arc<flame_core::CudaDevice>> = None;
+            for param in &params {
+                if let Some(g) = grads.get_mut(param.id()) {
+                    if g.dtype() != flame_core::DType::F32 {
+                        anyhow::bail!(
+                            "FLAME_MT_SCALE expects F32 grads (GradientMap policy is F32), got {:?}",
+                            g.dtype()
+                        );
+                    }
+                    if device_opt.is_none() {
+                        device_opt = Some(g.device().clone());
+                    }
+                    ptrs.push(g.as_mut_device_ptr_f32("mt_scale:g")?);
+                    sizes.push(g.shape().elem_count() as u64);
+                }
+            }
+            let n = ptrs.len();
+            if n > 0 {
+                let mut packed: Vec<u64> = Vec::with_capacity(2 * n);
+                packed.extend(ptrs);
+                packed.extend(sizes);
+                let device = device_opt.expect("at least one grad present");
+                let cache_cell = MT_SCALE_CACHE
+                    .get_or_init(|| Mutex::new(flame_core::ops::multi_tensor::MultiTensorMetaCache::new()));
+                let mut cache = cache_cell
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("MT_SCALE_CACHE mutex poisoned"))?;
+                flame_core::ops::multi_tensor::multi_tensor_scale_inplace_packed(
+                    &mut cache,
+                    &device,
+                    n,
+                    &packed,
+                    scale,
+                    /* is_bf16 = */ false,
+                )?;
+            }
+            for param in &params {
+                if let Some(g) = grads.get(param.id()) {
+                    param.set_grad(g.clone())?;
+                }
+            }
+        } else {
+            for param in &params {
+                if let Some(g) = grads.get(param.id()) {
+                    let g_scaled = if scale < 1.0 {
+                        g.mul_scalar(scale)?
+                    } else {
+                        g.clone()
+                    };
+                    param.set_grad(g_scaled)?;
+                }
             }
         }
         if step < 5 || (step + 1) % 50 == 0 {

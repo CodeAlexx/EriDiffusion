@@ -1710,18 +1710,36 @@ fn block_forward_standalone(
             .ok_or_else(|| flame_core::Error::InvalidInput(format!("missing: {key}")))
     };
 
+    // Was: `weight.transpose()?.contiguous()?` + `matmul` → materialized
+    // every weight transpose via `permute_generic_bf16_kernel` (rank-2 [1,0]
+    // is not a fast-path perm). 6 linears × 30 blocks × ~2 (checkpoint
+    // replay) ≈ 360 permute_generic launches/step, ~70 ms wall.
+    //
+    // `fused_linear3d_native` takes weight in PyTorch `[Cout, Cin]` layout
+    // and lets cuBLASLt apply TRANSA=T inline — zero transposes, zero
+    // materialize. Autograd records `Op::Linear` whose backward is also
+    // transpose-free (autograd.rs:3019).
     let linear_no_bias = |x: &Tensor, suffix: &str| -> Result<Tensor> {
         let weight = bw(suffix)?;
-        // `transpose()` returns a strided view; flame's BF16 matmul backward
-        // reads saved tensors as if contiguous (CONVENTIONS doc + sd-trainer
-        // conv2d grep). Force contiguous to keep the grad path correct.
-        let wt = weight.transpose()?.contiguous()?;
-        x.matmul(&wt)
+        let orig_rank = x.shape().dims().len();
+        let out_3d = flame_core::ops::fused_inference::fused_linear3d_native(
+            &ensure_3d(x)?,
+            weight,
+            None,
+        )?;
+        Ok(squeeze_if_needed(out_3d, orig_rank))
     };
 
     let linear_bias = |x: &Tensor, w_suffix: &str, b_suffix: &str| -> Result<Tensor> {
-        let out = linear_no_bias(x, w_suffix)?;
-        out.add(bw(b_suffix)?)
+        let weight = bw(w_suffix)?;
+        let bias = bw(b_suffix)?;
+        let orig_rank = x.shape().dims().len();
+        let out_3d = flame_core::ops::fused_inference::fused_linear3d_native(
+            &ensure_3d(x)?,
+            weight,
+            Some(bias),
+        )?;
+        Ok(squeeze_if_needed(out_3d, orig_rank))
     };
 
     let rms_norm = |x: &Tensor, suffix: &str| -> Result<Tensor> {

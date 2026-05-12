@@ -1143,6 +1143,23 @@ impl KleinModel {
         let mut txt = txt_proj;
         let img_mods_arc = std::sync::Arc::new(img_mods.clone());
         let txt_mods_arc = std::sync::Arc::new(txt_mods.clone());
+
+        // 2026-05-11 perf: prime the transfer-stream H2D pipeline. Each
+        // iteration `i` awaits block i (event-gated, no host stall) and then
+        // kicks off `prefetch_block(i+1)` so the next iteration's H2D
+        // overlaps with this iteration's default-stream compute. Without the
+        // prime call, iter 0 would pay full sync H2D for block 0.
+        // Backward checkpoint replay does NOT use the pipeline (slot miss
+        // → sync fallback inside `await_block_handle`); same as pre-2026-05-11.
+        if use_checkpoint {
+            if let Some(ref off) = self.offloader {
+                off.lock()
+                    .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
+                    .prefetch_block(0)
+                    .map_err(|e| crate::EriDiffusionError::Model(format!("prefetch_block(0): {e}")))?;
+            }
+        }
+
         for i in 0..self.kconfig.num_double {
             let prefix = format!("double_blocks.{i}.");
             let lora_base = i * DOUBLE_LORA_SLOTS;
@@ -1187,21 +1204,33 @@ impl KleinModel {
                 flame_core::autograd::AutogradContext::checkpoint(
                     &[img_in.clone(), txt_in.clone()],
                     move || {
-                        let lw: HashMap<String, Tensor> = if let Some(ref off) = offloader_for_closure {
-                            let arc = off.lock()
-                                .map_err(|e| flame_core::FlameError::InvalidInput(
-                                    format!("Klein double {bi}: offloader lock: {e}")))?
-                                .ensure_block(bi)
-                                .map_err(|e| flame_core::FlameError::InvalidInput(
-                                    format!("Klein double {bi}: offloader ensure_block({bi}): {e}")))?;
-                            let mut m = HashMap::with_capacity(arc.len());
-                            for (k, v) in arc.iter() {
-                                if k.starts_with(&prefix_for_closure) { m.insert(k.clone(), v.clone()); }
-                            }
-                            m
-                        } else {
-                            layer_weights.clone()
-                        };
+                        // 2026-05-11 perf: `await_block_handle` gates the
+                        // default stream on the slot's h2d_done event (no
+                        // host stall) when block bi was prefetched by the
+                        // previous iter's main-thread `prefetch_block(bi)`.
+                        // Backward replay misses the slot and falls into
+                        // await_block's slow path (sync prefetch+await) —
+                        // same as legacy `ensure_block`. Holding the
+                        // BlockHandle until the end of this closure means
+                        // its Drop records `compute_done` on the default
+                        // stream AFTER `Tensor::cat`, so the next prefetch
+                        // can reuse the slot via stream_wait_event.
+                        let (lw, _handle): (HashMap<String, Tensor>, Option<crate::training::block_offload::BlockHandle>) =
+                            if let Some(ref off) = offloader_for_closure {
+                                let handle = off.lock()
+                                    .map_err(|e| flame_core::FlameError::InvalidInput(
+                                        format!("Klein double {bi}: offloader lock: {e}")))?
+                                    .await_block_handle(bi)
+                                    .map_err(|e| flame_core::FlameError::InvalidInput(
+                                        format!("Klein double {bi}: offloader await_block_handle({bi}): {e}")))?;
+                                let mut m = HashMap::with_capacity(handle.weights().len());
+                                for (k, v) in handle.weights().iter() {
+                                    if k.starts_with(&prefix_for_closure) { m.insert(k.clone(), v.clone()); }
+                                }
+                                (m, Some(handle))
+                            } else {
+                                (layer_weights.clone(), None)
+                            };
                         let (ni, nt) = double_block_forward_standalone(
                             img_in.clone(), txt_in.clone(),
                             (*img_mods_c).clone(), (*txt_mods_c).clone(),
@@ -1211,6 +1240,8 @@ impl KleinModel {
                         // Concat `(new_img, new_txt)` along the seq dim so
                         // the checkpoint API (single output) works. We
                         // narrow back to (img, txt) after the call.
+                        // `_handle` drops after this expression returns,
+                        // recording compute_done on the default stream.
                         Tensor::cat(&[&ni, &nt], 1)
                     },
                 )?
@@ -1241,6 +1272,33 @@ impl KleinModel {
                 }
                 Tensor::cat(&[&ni, &nt], 1)?
             };
+
+            // 2026-05-11 perf: kick off async H2D for the NEXT block on the
+            // transfer stream. Goes to the non-active slot, which previously
+            // held block (i-1); its `compute_done` was recorded by the prior
+            // iter's handle drop, so the transfer stream waits GPU-side
+            // (no host stall) before reusing the slot.
+            //   * within double-block loop: next = i+1
+            //   * at end of double-block loop: bridge to first single block
+            //     (unified_idx = num_double) so the H2D overlaps with the
+            //     `cat(txt, img)` + TREAD setup below
+            if use_checkpoint {
+                if let Some(ref off) = self.offloader {
+                    let next: Option<usize> = if i + 1 < self.kconfig.num_double {
+                        Some(i + 1)
+                    } else if self.kconfig.num_single > 0 {
+                        Some(self.kconfig.num_double)
+                    } else {
+                        None
+                    };
+                    if let Some(n) = next {
+                        off.lock()
+                            .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
+                            .prefetch_block(n)
+                            .map_err(|e| crate::EriDiffusionError::Model(format!("prefetch_block({n}): {e}")))?;
+                    }
+                }
+            }
 
             // Split `block_out` back into (img, txt) along the seq dim.
             // Chroma uses the same narrow-after-cat pattern. Recording
@@ -1366,29 +1424,32 @@ impl KleinModel {
                 flame_core::autograd::AutogradContext::checkpoint(
                     &[x_in.clone()],
                     move || {
-                        // Build per-block weight map: from offloader (re-fetch
-                        // a slot on every call so backward replay works) or
-                        // from the captured resident snapshot.
-                        let lw: HashMap<String, Tensor> = if let Some(ref off) = offloader_for_closure {
-                            let arc = off.lock()
-                                .map_err(|e| flame_core::FlameError::InvalidInput(
-                                    format!("Klein single {i}: offloader lock: {e}")))?
-                                .ensure_block(unified_idx)
-                                .map_err(|e| flame_core::FlameError::InvalidInput(
-                                    format!("Klein single {i}: offloader ensure_block({unified_idx}): {e}")))?;
-                            // Strip the "single_blocks.{i}." prefix-key check
-                            // is a no-op since the offloader returns exactly
-                            // this block's tensors keyed by their full name.
-                            let mut m = HashMap::with_capacity(arc.len());
-                            for (k, v) in arc.iter() {
-                                if k.starts_with(&prefix_for_closure) {
-                                    m.insert(k.clone(), v.clone());
+                        // 2026-05-11 perf: same async-prefetch protocol as
+                        // the double-block loop. `await_block_handle` gates
+                        // the default stream on h2d_done (no host stall) for
+                        // the block already prefetched by the prior iter's
+                        // main-thread `prefetch_block` call. Handle drops at
+                        // end of closure body — Tensor result has been
+                        // produced by then, kernels queued, so compute_done
+                        // is recorded AFTER all weight-reading kernels.
+                        let (lw, _handle): (HashMap<String, Tensor>, Option<crate::training::block_offload::BlockHandle>) =
+                            if let Some(ref off) = offloader_for_closure {
+                                let handle = off.lock()
+                                    .map_err(|e| flame_core::FlameError::InvalidInput(
+                                        format!("Klein single {i}: offloader lock: {e}")))?
+                                    .await_block_handle(unified_idx)
+                                    .map_err(|e| flame_core::FlameError::InvalidInput(
+                                        format!("Klein single {i}: offloader await_block_handle({unified_idx}): {e}")))?;
+                                let mut m = HashMap::with_capacity(handle.weights().len());
+                                for (k, v) in handle.weights().iter() {
+                                    if k.starts_with(&prefix_for_closure) {
+                                        m.insert(k.clone(), v.clone());
+                                    }
                                 }
-                            }
-                            m
-                        } else {
-                            layer_weights.clone()
-                        };
+                                (m, Some(handle))
+                            } else {
+                                (layer_weights.clone(), None)
+                            };
                         single_block_forward_standalone(
                             x_in.clone(), mods_c.clone(),
                             pe_cos_c.clone(), pe_sin_c.clone(),
@@ -1420,6 +1481,19 @@ impl KleinModel {
                 }
                 out
             };
+
+            // 2026-05-11 perf: kick off async H2D for the next single block
+            // on the transfer stream. Mirrors the double-block loop pattern;
+            // skipped on the last iter or in non-offload mode.
+            if use_checkpoint && i + 1 < self.kconfig.num_single {
+                if let Some(ref off) = self.offloader {
+                    let next_unified = self.kconfig.num_double + i + 1;
+                    off.lock()
+                        .map_err(|e| crate::EriDiffusionError::Model(format!("offloader lock: {e}")))?
+                        .prefetch_block(next_unified)
+                        .map_err(|e| crate::EriDiffusionError::Model(format!("prefetch_block({next_unified}): {e}")))?;
+                }
+            }
 
             // ---- TREAD: exit routed range — scatter back ----
             // route_block_end is half-open (block end is the FIRST block
