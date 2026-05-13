@@ -506,10 +506,18 @@ impl KleinModel {
             .collect();
         let path_refs: Vec<&str> = shard_strs.iter().map(|s| s.as_str()).collect();
 
+        // 2026-05-12 (head-to-head vs OneTrainer): pinned-RAM mode is ~28% faster
+        // than streaming-mmap on klein 9B at matched config (3.5 vs 4.83 s/step,
+        // measured, loss bit-identical). Pinned uses ~16.6 GB pinned host RAM —
+        // safe on 32+ GB host systems where klein 9B is realistically trained.
+        // Set `KLEIN_BLOCK_STREAMING=1` to opt back into the disk-mmap streaming
+        // path (needed only when the model + activations + optimizer state don't
+        // fit in pinned host RAM). See
+        // EriDiffusion-v2/docs/HEADTOHEAD_2026-05-12_DIAGNOSTIC.md.
         let use_streaming = std::env::var("KLEIN_BLOCK_STREAMING")
             .ok()
             .map(|v| !matches!(v.as_str(), "0" | "" | "false" | "False"))
-            .unwrap_or(true);
+            .unwrap_or(false);
 
         let offloader = if use_streaming {
             log::info!("Klein BlockOffloader: streaming mode");
