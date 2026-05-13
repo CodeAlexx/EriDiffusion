@@ -260,7 +260,7 @@ impl ErnieModel {
             .map(|v| !matches!(v.as_str(), "0" | "" | "false" | "False"))
             .unwrap_or(true);
 
-        let offloader = if use_streaming {
+        let mut offloader = if use_streaming {
             log::info!("Ernie BlockOffloader: streaming mode");
             crate::training::block_offload::BlockOffloader::load_streaming(
                 &path_refs, &ErnieFacilitator, self.device.clone(),
@@ -275,6 +275,24 @@ impl ErnieModel {
         // Ernie model code calls `.transpose()` itself before matmul.
         .map(|o| o.with_native_layout(true))
         .map_err(|e| crate::EriDiffusionError::Model(format!("BlockOffloader: {e}")))?;
+
+        // Phase 2 FlexTensor port: opt into Adaptive resident-set strategy
+        // when `FLAME_OFFLOAD_ADAPTIVE=1`. Default behavior (no env var or
+        // "0"/"false") is the pre-Phase-2 fixed 2-slot mechanic — unchanged.
+        // Adaptive bounds the resident set against measured VRAM headroom
+        // with hysteresis (shrink at ≥0.85 used, grow at ≤0.60 used). Use
+        // for high-resolution / heavy-activation training where the fixed
+        // 2-slot may otherwise OOM under pressure.
+        if matches!(
+            std::env::var("FLAME_OFFLOAD_ADAPTIVE").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        ) {
+            use flame_core::offload::strategy::Adaptive;
+            offloader.set_strategy(Box::new(Adaptive::new()));
+            log::info!(
+                "[ernie] BlockOffloader: Adaptive strategy enabled (FLAME_OFFLOAD_ADAPTIVE=1)"
+            );
+        }
 
         self.offloader = Some(std::sync::Arc::new(std::sync::Mutex::new(offloader)));
         log::info!("Ernie BlockOffloader ready ({} layers)", LAYERS);
