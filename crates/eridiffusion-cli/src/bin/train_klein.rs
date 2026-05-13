@@ -307,6 +307,12 @@ struct Args {
     /// SimpleTuner / ai-toolkit `network.conv_alpha` — alpha for CONV
     /// targets. `0.0` (default) = fall back to linear `--lora-alpha`.
     #[arg(long, default_value_t = 0.0)] conv_alpha: f32,
+
+    // ── Phase 5b: autograd v2 bridge opt-in ────────────────────────────────
+    /// Route the backward pass through `AutogradContext::backward_v2`
+    /// (`MatchInsertedDtype` policy → BF16 grads end-to-end). Default OFF
+    /// preserves v3 byte-equivalence. See train_zimage.rs:269 for full doc.
+    #[arg(long, default_value_t = false)] use_autograd_v2: bool,
 }
 
 /// LOGIT_NORMAL timestep sample. Returns continuous t in [0, 1000).
@@ -1213,7 +1219,23 @@ fn main() -> anyhow::Result<()> {
             continue;
         }
 
-        let mut grads = loss.backward()?;
+        // Phase 5b: Route (ii) bridge. `--use-autograd-v2` flips the
+        // backward entry to construct a `MatchInsertedDtype` GradientMap.
+        let mut grads = if args.use_autograd_v2 {
+            #[cfg(feature = "autograd_v2")]
+            {
+                flame_core::AutogradContext::backward_v2(&loss)?
+            }
+            #[cfg(not(feature = "autograd_v2"))]
+            {
+                anyhow::bail!(
+                    "--use-autograd-v2 set, but flame-core was built without the \
+                     `autograd_v2` feature. Rebuild with `--features autograd_v2`."
+                );
+            }
+        } else {
+            loss.backward()?
+        };
 
         // clip_grad_norm = 1.0 (klein preset default; ERNIE memory: convergence killer
         // if omitted).
@@ -1239,11 +1261,15 @@ fn main() -> anyhow::Result<()> {
         // off: klein's grad_norm sits at 0.004–0.17 in production configs and
         // never trips the clip path, so the multi-tensor path adds no value.
         // See EriDiffusion-v2/HANDOFF_2026-05-12_PHASE2_SCALE_FOLLOWUP.md.
+        // Phase 5b: under `--use-autograd-v2`, grads are BF16 in the map;
+        // the FLAME_MT_SCALE fast path asserts F32 and would bail. Fall
+        // back to the per-param mul_scalar loop in that case.
         let mt_scale_enabled = std::env::var("FLAME_MT_SCALE")
             .ok()
             .as_deref()
             .map(|v| matches!(v, "1" | "true" | "TRUE"))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            && !args.use_autograd_v2;
 
         if mt_scale_enabled && scale < 1.0 {
             let mut ptrs: Vec<u64> = Vec::with_capacity(params.len());
