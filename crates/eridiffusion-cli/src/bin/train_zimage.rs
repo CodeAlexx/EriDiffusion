@@ -492,10 +492,27 @@ fn main() -> anyhow::Result<()> {
     // EDv2 trainer until flame-core fixes the partial-offload path.
     let _ = args.offload_resolution; // arg accepted for forward-compatibility
 
-    let params = model.parameters();
+    let mut params = model.parameters();
     log::info!("Loaded {} trainable LoRA tensors", params.len());
     if params.is_empty() {
         anyhow::bail!("No trainable parameters — ZImageModel produced empty param list");
+    }
+
+    // Phase 5d item #2: when `--use-autograd-v2` is on, flip every trainable
+    // LoRA Parameter to `MatchParamDtype` so the BF16 grads coming out of the
+    // bridge stay BF16 in `param.set_grad` (instead of being upcast to F32 by
+    // the default `CastToF32` policy on `Parameter::new`). `Parameter` is
+    // `Clone` but its `grad_dtype_policy` field is per-instance (data and
+    // grad are Arc<Mutex<...>>, shared) — so mutating the trainer-owned `params`
+    // Vec is sufficient. AdamW dispatch reads each param's policy at step time.
+    if args.use_autograd_v2 {
+        for p in &mut params {
+            p.set_grad_dtype_policy(flame_core::parameter::GradDtypePolicy::MatchParamDtype);
+        }
+        log::info!(
+            "[autograd_v2] flipped {} params to MatchParamDtype grad policy",
+            params.len()
+        );
     }
 
     let opt_kind = OptimizerKind::parse(&args.optimizer)
