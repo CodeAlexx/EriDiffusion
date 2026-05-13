@@ -265,6 +265,26 @@ struct Args {
     #[arg(long, default_value_t = 0.0)] module_dropout: f32,
     /// Rescale rank-mask by `1/mean(mask)` to preserve expectation. Phase 2c.
     #[arg(long, default_value_t = false)] rank_dropout_scale: bool,
+
+    // ── Phase 5b: autograd v2 bridge opt-in ────────────────────────────────
+    /// Phase 5b (autograd v2 Route ii). When set, the backward pass goes
+    /// through `AutogradContext::backward_v2`, which constructs a
+    /// `GradientMap` under the `MatchInsertedDtype` policy and casts each
+    /// emitted gradient to the loss tensor's dtype (BF16 end-to-end) at
+    /// grad-map-write time. The v3 op dispatch is unchanged — this flag
+    /// only flips the grad-storage policy on the returned map.
+    ///
+    /// Default OFF preserves byte-equivalent v3 behavior. When ON, the
+    /// existing `param.set_grad(...)` (CastToF32 policy on `Parameter::new`)
+    /// converts BF16 grads back to F32 before the AdamW step, so the
+    /// optimizer surface is unaffected. The `FLAME_MT_SCALE` fast-path
+    /// asserts F32 grads; under v2 it is skipped (the default per-param
+    /// `mul_scalar` loop runs instead).
+    ///
+    /// See `flame-core/docs/BF16_GRAD_DECISION.md` and
+    /// `flame-core/docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md` §Phase 5
+    /// Deliverable C Route (ii).
+    #[arg(long, default_value_t = false)] use_autograd_v2: bool,
 }
 
 /// LOGIT_NORMAL timestep sample matching OT _get_timestep_discrete.
@@ -908,7 +928,25 @@ fn main() -> anyhow::Result<()> {
             continue;
         }
 
-        let mut grads = loss.backward()?;
+        // Phase 5b: Route (ii) bridge. `--use-autograd-v2` flips the
+        // backward entry to construct a `MatchInsertedDtype` GradientMap;
+        // the returned grads are at loss.dtype() (BF16 end-to-end). v3
+        // path is the default and byte-equivalent to pre-flag behaviour.
+        let mut grads = if args.use_autograd_v2 {
+            #[cfg(feature = "autograd_v2")]
+            {
+                flame_core::AutogradContext::backward_v2(&loss)?
+            }
+            #[cfg(not(feature = "autograd_v2"))]
+            {
+                anyhow::bail!(
+                    "--use-autograd-v2 set, but flame-core was built without the \
+                     `autograd_v2` feature. Rebuild with `--features autograd_v2`."
+                );
+            }
+        } else {
+            loss.backward()?
+        };
 
         // Grad-flow diagnostic.  Runs at step 1 — NOT step 0 — because every
         // LoRA-style algo (LoRA, LoCon, LoHa, LoKr) initializes one factor
@@ -947,11 +985,15 @@ fn main() -> anyhow::Result<()> {
         // off: zimage's grad_norm stays well below 1.0 in production configs,
         // so the multi-tensor path adds no value. See
         // EriDiffusion-v2/HANDOFF_2026-05-12_PHASE2_SCALE_FOLLOWUP.md.
+        // Phase 5b: under `--use-autograd-v2`, grads are BF16 in the map;
+        // the FLAME_MT_SCALE fast path asserts F32 and would bail. Fall
+        // back to the per-param mul_scalar loop in that case.
         let mt_scale_enabled = std::env::var("FLAME_MT_SCALE")
             .ok()
             .as_deref()
             .map(|v| matches!(v, "1" | "true" | "TRUE"))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            && !args.use_autograd_v2;
 
         if mt_scale_enabled && scale < 1.0 {
             // Multi-tensor in-place scale. Extract device pointers as u64
