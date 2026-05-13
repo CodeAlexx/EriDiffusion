@@ -313,6 +313,15 @@ struct Args {
     /// (`MatchInsertedDtype` policy → BF16 grads end-to-end). Default OFF
     /// preserves v3 byte-equivalence. See train_zimage.rs:269 for full doc.
     #[arg(long, default_value_t = false)] use_autograd_v2: bool,
+
+    // ── Gap 2 (2026-05-13): activation offload opt-in ──────────────────────
+    /// Install the global activation-offload pool. When set, klein.rs's
+    /// `checkpoint_offload` saves block sub-tape activations into pinned RAM
+    /// instead of recomputing at backward. For Klein 9B at 512²/batch=1 the
+    /// per-block MLP intermediate is ~100 MB and the pool can't fit them all
+    /// (system gracefully falls back to recompute) — the win is at higher
+    /// resolution / batch where the model would otherwise OOM. Default OFF.
+    #[arg(long, default_value_t = false)] activation_offload: bool,
 }
 
 /// LOGIT_NORMAL timestep sample. Returns continuous t in [0, 1000).
@@ -571,6 +580,57 @@ fn main() -> anyhow::Result<()> {
         model.enable_offload(shards.clone())?;
         log::info!("  block-offload enabled — per-block streaming from {} shard(s)", shards.len());
     }
+
+    // 2026-05-13 Gap 2: install the global activation-offload pool when block
+    // offload is on. `checkpoint_offload` in `klein.rs` consults this pool to
+    // route saved sub-tape tensors into pinned RAM instead of recomputing the
+    // block at backward time. Falls back to plain recompute when the pool
+    // isn't installed (autograd.rs:2021-2024) — safe on both paths.
+    //
+    // Sizing — empirical Klein 9B observation 2026-05-13: the biggest saved
+    // activation inside a Klein block is the MLP intermediate at shape
+    // `[1, seq, inner*6]` (SwiGLU gate+up concat × ratio). 9B: 1008*24576*2 ≈
+    // 47 MB BF16. 4B: scales with inner_dim=3072. First wiring (4096*2048*2 =
+    // 16 MB slot) was too small — every save hit "exceeds slot capacity" and
+    // fell back to recompute, losing the benefit. Slot now sized for the
+    // worst case: `max_seq * inner_dim * 6 * 2`.
+    //
+    // FP8 compression halves pinned bytes per slot (and roughly doubles
+    // effective slot count); per-slot GPU staging is uncompressed BF16 size.
+    // slots_per_block=2 keeps GPU staging within budget on 24 GB cards.
+    if args.activation_offload {
+        use eridiffusion_core::training::offload::{setup_activation_offload, OffloadConfig};
+        use flame_core::activation_offload::OffloadCompression;
+        let num_blocks = model.kconfig.num_double + model.kconfig.num_single;
+        let inner_dim = model.kconfig.inner_dim;
+        // Conservative max_seq: 1568 (44×24 image + 512 text) → 2048 padding.
+        // Klein 9B per-block MLP intermediate is `[1, seq, inner*9]` BF16 ≈
+        // 112 MB raw at seq=1520/inner=4096; observed via warning logs
+        // 2026-05-13. We size for inner*9 to fit; FP8 halves pinned cost.
+        let max_seq = 2048usize;
+        let mlp_factor = 9usize;
+        let max_activation_bytes = max_seq * inner_dim * mlp_factor * 2;
+        let slots_per_block = 2usize;
+        let total_slots = num_blocks * slots_per_block + 8;
+        let cfg = OffloadConfig {
+            num_blocks,
+            max_activation_bytes,
+            compression: OffloadCompression::FP8,
+            extra_slots: total_slots - num_blocks,
+        };
+        match setup_activation_offload(&device, &cfg) {
+            Ok((slots, bytes)) => log::info!(
+                "[activation_offload] {slots} slots, {:.2} GB pinned (FP8), slot={:.1} MB raw",
+                bytes as f64 / 1e9,
+                max_activation_bytes as f64 / 1e6,
+            ),
+            Err(e) => log::warn!(
+                "[activation_offload] setup failed ({e}); klein.rs:checkpoint_offload \
+                 will fall back to recompute (slower but no crash)"
+            ),
+        }
+    }
+
     let params = model.parameters();
     log::info!("Loaded {} trainable LoRA tensors", params.len());
     if params.is_empty() {

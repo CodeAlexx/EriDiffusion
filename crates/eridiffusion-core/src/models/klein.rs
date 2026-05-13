@@ -1227,7 +1227,13 @@ impl KleinModel {
             let prefix_for_closure = prefix.clone();
 
             let block_out = if use_checkpoint {
-                flame_core::autograd::AutogradContext::checkpoint(
+                // 2026-05-13 Gap 2: route through `checkpoint_offload` so the
+                // saved sub-tape goes to pinned RAM (via the global
+                // `ACTIVATION_POOL`) instead of being recomputed at backward
+                // time. Falls back to standard `checkpoint` when no pool is
+                // installed (see autograd.rs:2021-2024). Wiring in trainer:
+                // `setup_activation_offload(&device, &cfg)`.
+                flame_core::autograd::AutogradContext::checkpoint_offload(
                     &[img_in.clone(), txt_in.clone()],
                     move || {
                         // 2026-05-11 perf: `await_block_handle` gates the
@@ -1447,7 +1453,8 @@ impl KleinModel {
             let prefix_for_closure = prefix.clone();
 
             x = if use_checkpoint {
-                flame_core::autograd::AutogradContext::checkpoint(
+                // 2026-05-13 Gap 2: see double-block site for rationale.
+                flame_core::autograd::AutogradContext::checkpoint_offload(
                     &[x_in.clone()],
                     move || {
                         // 2026-05-11 perf: same async-prefetch protocol as
