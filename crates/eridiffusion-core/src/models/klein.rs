@@ -519,7 +519,7 @@ impl KleinModel {
             .map(|v| !matches!(v.as_str(), "0" | "" | "false" | "False"))
             .unwrap_or(false);
 
-        let offloader = if use_streaming {
+        let mut offloader = if use_streaming {
             log::info!("Klein BlockOffloader: streaming mode");
             crate::training::block_offload::BlockOffloader::load_streaming(
                 &path_refs, &facilitator, self.device.clone(),
@@ -534,6 +534,24 @@ impl KleinModel {
         // Klein model code calls `.transpose()` itself (via linear_3d) before matmul.
         .map(|o| o.with_native_layout(true))
         .map_err(|e| crate::EriDiffusionError::Model(format!("BlockOffloader: {e}")))?;
+
+        // Phase 2 FlexTensor port: opt into Adaptive resident-set strategy via
+        // FLAME_OFFLOAD_ADAPTIVE=1. Default (env unset / "0" / "false") preserves
+        // the pre-Phase-2 fixed 2-slot mechanic — klein 9B has stable VRAM
+        // headroom in pinned-RAM mode, so the default keeps its current
+        // step time. Adaptive opt-in is here for parity with the heavier-OOM
+        // trainers (qwenimage, chroma, wan22, sensenova_u1, ernie) so the
+        // path can be exercised on klein for parity/perf testing.
+        if matches!(
+            std::env::var("FLAME_OFFLOAD_ADAPTIVE").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        ) {
+            use flame_core::offload::strategy::Adaptive;
+            offloader.set_strategy(Box::new(Adaptive::new()));
+            log::info!(
+                "Klein BlockOffloader: Adaptive strategy enabled (FLAME_OFFLOAD_ADAPTIVE=1)"
+            );
+        }
 
         self.offloader = Some(std::sync::Arc::new(std::sync::Mutex::new(offloader)));
         log::info!("Klein BlockOffloader ready ({} unified blocks)", num_double + num_single);
