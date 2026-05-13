@@ -953,8 +953,26 @@ impl ChromaTrainingModel {
 
         // Create BlockOffloader — reads block weights into pinned CPU memory
         let facilitator = ChromaFacilitator;
-        let offloader = BlockOffloader::load(&path_refs, &facilitator, device.clone())
+        let mut offloader = BlockOffloader::load(&path_refs, &facilitator, device.clone())
             .map_err(|e| flame_core::Error::InvalidInput(format!("BlockOffloader load: {e}")))?;
+
+        // Phase 2 FlexTensor port: opt into Adaptive resident-set strategy
+        // when `FLAME_OFFLOAD_ADAPTIVE=1`. Default behavior (no env var or
+        // "0"/"false") is the pre-Phase-2 fixed 2-slot mechanic — unchanged.
+        // Adaptive bounds the resident set against measured VRAM headroom
+        // with hysteresis (shrink at ≥0.85 used, grow at ≤0.60 used). Use
+        // for high-resolution / heavy-activation training where the fixed
+        // 2-slot may otherwise OOM under pressure.
+        if matches!(
+            std::env::var("FLAME_OFFLOAD_ADAPTIVE").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        ) {
+            use flame_core::offload::strategy::Adaptive;
+            offloader.set_strategy(Box::new(Adaptive::new()));
+            log::info!(
+                "[chroma] BlockOffloader: Adaptive strategy enabled (FLAME_OFFLOAD_ADAPTIVE=1)"
+            );
+        }
 
         // Load ONLY shared (non-block) weights to GPU
         let mut resident = HashMap::new();
