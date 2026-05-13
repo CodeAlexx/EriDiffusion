@@ -370,6 +370,28 @@ fn collect_klein_shards(path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> 
 
 fn main() -> anyhow::Result<()> {
     use rand::SeedableRng;
+    // Disable the flame-core CUDA alloc pool before any flame_core call.
+    // The pool is initialized via OnceLock on first read of FLAME_ALLOC_POOL,
+    // so this MUST be set before env_logger::init() (which itself doesn't
+    // touch the pool, but any subsequent flame_core call would lock it in).
+    //
+    // Why this matters for Klein 9B + --offload: empirical bisect (2026-05-13)
+    // showed Klein 9B + --offload hits `CUDA_ERROR_INVALID_VALUE` at step 2's
+    // `load_file` when the pool is enabled. Step 0 + 1 succeed; pool state
+    // gets corrupted somewhere between backward replay (which exercises the
+    // BlockOffloader) and step 2's first cudaMalloc. Disabling the pool
+    // (every drop → direct cudaFree) makes step 2+ run cleanly. Same root
+    // cause as the `feedback_prepare_bins_pool_off` memory and the
+    // HANDOFF_2026-05-08_KLEIN9B_TRAINING.md "FLAME_ALLOC_POOL=0 MANDATORY"
+    // note — we now enforce it in-trainer so users don't have to remember.
+    //
+    // Klein 4B without --offload still works either way (no offloader →
+    // no pool corruption), so this only changes behavior for the case
+    // that was broken without it.
+    if std::env::var_os("FLAME_ALLOC_POOL").is_none() {
+        // SAFETY: single-threaded at this point (before main's first action).
+        unsafe { std::env::set_var("FLAME_ALLOC_POOL", "0"); }
+    }
     env_logger::init();
     let args = Args::parse();
     std::fs::create_dir_all(&args.output_dir)?;
