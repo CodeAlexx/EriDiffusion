@@ -565,10 +565,28 @@ impl SenseNovaU1 {
         let facilitator = SenseNovaFacilitator {
             num_blocks: config.num_layers,
         };
-        let offloader = BlockOffloader::load(&shard_refs, &facilitator, device.clone())
+        let mut offloader = BlockOffloader::load(&shard_refs, &facilitator, device.clone())
             .map_err(|e| {
                 Error::InvalidInput(format!("SenseNovaU1 BlockOffloader::load: {e}"))
             })?;
+
+        // Phase 2 FlexTensor port: opt into Adaptive resident-set strategy
+        // when `FLAME_OFFLOAD_ADAPTIVE=1`. Default behavior (no env var or
+        // "0"/"false") is the pre-Phase-2 fixed 2-slot mechanic — unchanged.
+        // Adaptive bounds the resident set against measured VRAM headroom
+        // with hysteresis (shrink at ≥0.85 used, grow at ≤0.60 used). Use
+        // for high-resolution / heavy-activation training where the fixed
+        // 2-slot may otherwise OOM under pressure.
+        if matches!(
+            std::env::var("FLAME_OFFLOAD_ADAPTIVE").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        ) {
+            use flame_core::offload::strategy::Adaptive;
+            offloader.set_strategy(Box::new(Adaptive::new()));
+            log::info!(
+                "[sensenova_u1] BlockOffloader: Adaptive strategy enabled (FLAME_OFFLOAD_ADAPTIVE=1)"
+            );
+        }
 
         // 3) Resident shared weights: filter every shard for SHARED_PREFIXES.
         let mut shared: HashMap<String, Tensor> = HashMap::new();
