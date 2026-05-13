@@ -576,7 +576,7 @@ impl QwenImageTrainingModel {
                 .ok()
                 .map(|v| !matches!(v.as_str(), "0" | "" | "false" | "False"))
                 .unwrap_or(false);
-            let offloader = if use_streaming {
+            let mut offloader = if use_streaming {
                 log::info!("[qwenimage-trainer] BlockOffloader: streaming mode (QWEN_BLOCK_STREAMING=1)");
                 crate::training::block_offload::BlockOffloader::load_streaming(
                     &path_refs, &QwenImageFacilitator, device.clone(),
@@ -591,6 +591,24 @@ impl QwenImageTrainingModel {
             // 2D `.weight` tensors to `[Cin, Cout]` so the inline
             // `linear_bias` closure can pass them directly to `Tensor::matmul`
             // (which expects [Cin, Cout] for the rhs operand).
+
+            // Phase 2 FlexTensor port: opt into Adaptive resident-set strategy
+            // when `FLAME_OFFLOAD_ADAPTIVE=1`. Default behavior (no env var or
+            // "0"/"false") is the pre-Phase-2 fixed 2-slot mechanic — unchanged.
+            // Adaptive bounds the resident set against measured VRAM headroom
+            // with hysteresis (shrink at ≥0.85 used, grow at ≤0.60 used). Use
+            // for high-resolution / heavy-activation training where the fixed
+            // 2-slot may otherwise OOM under pressure.
+            if matches!(
+                std::env::var("FLAME_OFFLOAD_ADAPTIVE").ok().as_deref(),
+                Some("1") | Some("true") | Some("TRUE")
+            ) {
+                use flame_core::offload::strategy::Adaptive;
+                offloader.set_strategy(Box::new(Adaptive::new()));
+                log::info!(
+                    "[qwenimage-trainer] BlockOffloader: Adaptive strategy enabled (FLAME_OFFLOAD_ADAPTIVE=1)"
+                );
+            }
 
             log::info!("[qwenimage-trainer] BlockOffloader: {} blocks, {} shared weights",
                 offloader.block_count(), resident.len());
