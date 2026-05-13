@@ -186,6 +186,12 @@ struct Args {
     /// DoRA axis convention. `true` (default) = lycoris-upstream norm over
     /// input dims; `false` = OneTrainer norm over output dim.
     #[arg(long, default_value_t = true)] dora_wd_on_out: bool,
+
+    // ── Phase 5b: autograd v2 bridge opt-in ────────────────────────────────
+    /// Route the backward pass through `AutogradContext::backward_v2`
+    /// (`MatchInsertedDtype` policy → BF16 grads end-to-end). Default OFF
+    /// preserves v3 byte-equivalence. See train_zimage.rs:269 for full doc.
+    #[arg(long, default_value_t = false)] use_autograd_v2: bool,
 }
 
 /// LOGIT_NORMAL timestep sample matching OT `_get_timestep_discrete`.
@@ -686,7 +692,23 @@ fn main() -> anyhow::Result<()> {
         let loss_val = loss.to_vec()?[0];
         total_loss += loss_val;
 
-        let grads = loss.backward()?;
+        // Phase 5b: Route (ii) bridge. `--use-autograd-v2` flips the
+        // backward entry to construct a `MatchInsertedDtype` GradientMap.
+        let grads = if args.use_autograd_v2 {
+            #[cfg(feature = "autograd_v2")]
+            {
+                flame_core::AutogradContext::backward_v2(&loss)?
+            }
+            #[cfg(not(feature = "autograd_v2"))]
+            {
+                anyhow::bail!(
+                    "--use-autograd-v2 set, but flame-core was built without the \
+                     `autograd_v2` feature. Rebuild with `--features autograd_v2`."
+                );
+            }
+        } else {
+            loss.backward()?
+        };
 
         // clip_grad_norm = 1.0 (preset default; matches OT BaseFluxSetup).
         // Fusion Sprint Phase 5: device-resident global L2 norm — one D2H per step.

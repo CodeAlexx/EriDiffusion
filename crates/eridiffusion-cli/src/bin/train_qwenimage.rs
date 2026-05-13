@@ -258,6 +258,12 @@ struct Args {
     #[arg(long, default_value_t = 0.0)] module_dropout: f32,
     /// Rescale rank-mask by `1/mean(mask)` to preserve expectation.
     #[arg(long, default_value_t = false)] rank_dropout_scale: bool,
+
+    // ── Phase 5b: autograd v2 bridge opt-in ────────────────────────────────
+    /// Route the backward pass through `AutogradContext::backward_v2`
+    /// (`MatchInsertedDtype` policy → BF16 grads end-to-end). Default OFF
+    /// preserves v3 byte-equivalence. See train_zimage.rs:269 for full doc.
+    #[arg(long, default_value_t = false)] use_autograd_v2: bool,
 }
 
 /// Self-adjusting shift based on image sequence length.
@@ -939,7 +945,23 @@ fn main() -> anyhow::Result<()> {
         total_loss += loss_val;
 
         // Backward.
-        let grads = loss.backward()?;
+        // Phase 5b: Route (ii) bridge. `--use-autograd-v2` flips the
+        // backward entry to construct a `MatchInsertedDtype` GradientMap.
+        let grads = if args.use_autograd_v2 {
+            #[cfg(feature = "autograd_v2")]
+            {
+                flame_core::AutogradContext::backward_v2(&loss)?
+            }
+            #[cfg(not(feature = "autograd_v2"))]
+            {
+                anyhow::bail!(
+                    "--use-autograd-v2 set, but flame-core was built without the \
+                     `autograd_v2` feature. Rebuild with `--features autograd_v2`."
+                );
+            }
+        } else {
+            loss.backward()?
+        };
 
         // Step-1 grad-flow diagnostic.  Catches the recurring "BF16 fused
         // inference op missing autograd registration" bug class before it

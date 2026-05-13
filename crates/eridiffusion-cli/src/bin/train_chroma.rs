@@ -213,6 +213,12 @@ struct Args {
     /// SimpleTuner / ai-toolkit `network.conv_alpha` — alpha for CONV
     /// targets. `0.0` (default) = fall back to linear `--lora-alpha`.
     #[arg(long, default_value_t = 0.0)] conv_alpha: f32,
+
+    // ── Phase 5b: autograd v2 bridge opt-in ────────────────────────────────
+    /// Route the backward pass through `AutogradContext::backward_v2`
+    /// (`MatchInsertedDtype` policy → BF16 grads end-to-end). Default OFF
+    /// preserves v3 byte-equivalence. See train_zimage.rs:269 for full doc.
+    #[arg(long, default_value_t = false)] use_autograd_v2: bool,
 }
 
 /// Resolution-dependent timestep shift (matches the chroma archive's
@@ -732,7 +738,23 @@ fn main() -> anyhow::Result<()> {
 
         let _t_bwd_start = std::time::Instant::now();
         if _profile_step { let _ = device.synchronize(); }
-        let grads = loss.backward()?;
+        // Phase 5b: Route (ii) bridge. `--use-autograd-v2` flips the
+        // backward entry to construct a `MatchInsertedDtype` GradientMap.
+        let grads = if args.use_autograd_v2 {
+            #[cfg(feature = "autograd_v2")]
+            {
+                flame_core::AutogradContext::backward_v2(&loss)?
+            }
+            #[cfg(not(feature = "autograd_v2"))]
+            {
+                anyhow::bail!(
+                    "--use-autograd-v2 set, but flame-core was built without the \
+                     `autograd_v2` feature. Rebuild with `--features autograd_v2`."
+                );
+            }
+        } else {
+            loss.backward()?
+        };
         if _profile_step { let _ = device.synchronize(); }
         let _bwd_ms = _t_bwd_start.elapsed().as_secs_f64() * 1000.0;
         if _profile_step {

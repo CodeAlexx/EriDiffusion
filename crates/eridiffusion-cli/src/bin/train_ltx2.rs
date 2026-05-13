@@ -138,6 +138,12 @@ struct Args {
     #[arg(long, default_value_t = 0)] warmup_steps: usize,
     /// Phase 5: cosine-with-restarts cycle count.
     #[arg(long, default_value_t = 1.0)] lr_cycles: f32,
+
+    // ── Phase 5b: autograd v2 bridge opt-in ────────────────────────────────
+    /// Route the backward pass through `AutogradContext::backward_v2`
+    /// (`MatchInsertedDtype` policy → BF16 grads end-to-end). Default OFF
+    /// preserves v3 byte-equivalence. See train_zimage.rs:269 for full doc.
+    #[arg(long, default_value_t = false)] use_autograd_v2: bool,
 }
 
 fn debug_enabled() -> bool {
@@ -527,7 +533,23 @@ fn main() -> anyhow::Result<()> {
         total_loss += loss_val;
 
         // ── Backward + clip-grad-norm + step ──
-        let grads = loss.backward()?;
+        // Phase 5b: Route (ii) bridge. `--use-autograd-v2` flips the
+        // backward entry to construct a `MatchInsertedDtype` GradientMap.
+        let grads = if args.use_autograd_v2 {
+            #[cfg(feature = "autograd_v2")]
+            {
+                flame_core::AutogradContext::backward_v2(&loss)?
+            }
+            #[cfg(not(feature = "autograd_v2"))]
+            {
+                anyhow::bail!(
+                    "--use-autograd-v2 set, but flame-core was built without the \
+                     `autograd_v2` feature. Rebuild with `--features autograd_v2`."
+                );
+            }
+        } else {
+            loss.backward()?
+        };
 
         if debug_enabled() && (step < 3 || (step + 1) % 100 == 0) {
             let p_st = dbg::stats(&pred);

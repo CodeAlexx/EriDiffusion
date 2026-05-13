@@ -147,6 +147,12 @@ struct Args {
     /// alongside the stdout progress lines (universal display).
     #[arg(long)]
     board_dir: Option<PathBuf>,
+
+    // ── Phase 5b: autograd v2 bridge opt-in ────────────────────────────────
+    /// Route the backward pass through `AutogradContext::backward_v2`
+    /// (`MatchInsertedDtype` policy → BF16 grads end-to-end). Default OFF
+    /// preserves v3 byte-equivalence. See train_zimage.rs:269 for full doc.
+    #[arg(long, default_value_t = false)] use_autograd_v2: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -614,7 +620,23 @@ fn main() -> anyhow::Result<()> {
             loss.mul_scalar(1.0 / args.grad_accum as f32)?
         } else { loss };
 
-        let grads = loss_scaled.backward()?;
+        // Phase 5b: Route (ii) bridge. `--use-autograd-v2` flips the
+        // backward entry to construct a `MatchInsertedDtype` GradientMap.
+        let grads = if args.use_autograd_v2 {
+            #[cfg(feature = "autograd_v2")]
+            {
+                flame_core::AutogradContext::backward_v2(&loss_scaled)?
+            }
+            #[cfg(not(feature = "autograd_v2"))]
+            {
+                anyhow::bail!(
+                    "--use-autograd-v2 set, but flame-core was built without the \
+                     `autograd_v2` feature. Rebuild with `--features autograd_v2`."
+                );
+            }
+        } else {
+            loss_scaled.backward()?
+        };
 
         // Grad-flow assertion at step 1. Works for ALL optimizers now that
         // flame-core's `Parameter::set_data` pins `self.id` across in-place
