@@ -379,20 +379,14 @@ fn collect_klein_shards(path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> 
 
 fn main() -> anyhow::Result<()> {
     use rand::SeedableRng;
-    // Klein 9B + --offload pool corruption: documented in memory
-    // `project_klein9b_step2_crash_isolation` and HANDOFF_2026-05-14.
-    // Failure mode is a CUDA driver mempool layer issue under offload
-    // fwd/bwd event/stream patterns — step-N+1 `cudaMalloc` returns
-    // `CUDA_ERROR_INVALID_VALUE`. Per-step `clear_pool_cache + trim`
-    // attempted 2026-05-14 produced NaN gradients at step 4 — the
-    // workaround is worse than the disease. The known-good fix is
-    // running with the pool off; the real flame-core-side fix
-    // (stream-event-aware pool reuse) is open work tracked at
-    // `flame-core/HANDOFF_2026-05-14_TRAINER_REGRESSION_FAILURE.md`.
-    if std::env::var_os("FLAME_ALLOC_POOL").is_none() {
-        // SAFETY: single-threaded at this point (before main's first action).
-        unsafe { std::env::set_var("FLAME_ALLOC_POOL", "0"); }
-    }
+    // Phase 2 (post-reboot, 2026-05-13): the pool is now safe under
+    // offload. `BlockOffloader::prefetch_block_inner` /
+    // `prefetch_block_streaming_inner` route their BF16 slot allocations
+    // through a ring-backed allocator and tag the pointers as external
+    // in the global `cuda_alloc_pool` so `push_u16` reconstructs-and-
+    // forgets them on return instead of caching aliasing ring bytes.
+    // The previous `FLAME_ALLOC_POOL=0` force-disable here has been
+    // removed; trainers run with the pool active by default.
     env_logger::init();
     let args = Args::parse();
     std::fs::create_dir_all(&args.output_dir)?;
