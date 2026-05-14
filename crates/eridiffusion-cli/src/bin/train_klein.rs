@@ -379,35 +379,11 @@ fn collect_klein_shards(path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> 
 
 fn main() -> anyhow::Result<()> {
     use rand::SeedableRng;
-    // Phase 2 round-2 (2026-05-14): the BF16 ring-allocator path
-    // (`BlockOffloader::alloc_bf16_via_ring`) is now safe — the round-2
-    // refcount fix in `flame_core::cuda_alloc_pool::external_ptrs`
-    // resolves the ring-wrap double-free that crashed `clear_cache`.
-    //
-    // HOWEVER: the pre-existing F32 step-2 crash documented in
-    // `project_klein9b_step2_crash_isolation` is a DIFFERENT failure
-    // mode at the cudaMemcpyHtoDAsync level — `cuMemAllocAsync` returns
-    // a valid ptr but the following H2D fails with
-    // `CUDA_ERROR_INVALID_VALUE` once the F32 mempool has been through
-    // a full step's worth of alloc/clear_cache cycles. The Phase 2 ring
-    // doesn't fix that (F32 routing through the ring is disabled in
-    // `RingPoolAdapter::alloc_f32` — see its comment for why).
-    //
-    // The documented workaround (commit 4511140) is to disable the
-    // F32/u16 caching pool entirely for the trainer process. Drops
-    // call `cudaFree` directly, no caching. Costs ~0.7-1.0 s/step but
-    // is the only proven-stable path for Klein 9B + --offload until
-    // the F32-mempool root-cause work lands.
-    //
-    // Phase 2c (2026-05-14): tested cheap hypotheses H1 (finite mempool
-    // release threshold = 1 GiB) and H3 (skip per-checkpoint
-    // clear_pool_cache). Both FAILED — H1 crashed at step 2 with same
-    // signature; H3 crashed earlier (during step-1 backward op #42).
-    // Workaround remains active until Bug Fixer round 3 (H2/H4/H5).
+    // 2026-05-14: pool workaround REMAINS active by default. The slab
+    // redesign (Phase A) is wired but opt-in via FLAME_USE_LOAD_SCRATCH=1
+    // pending lifetime-vs-autograd correctness work — see
+    // `flame-core/HANDOFF_2026-05-14_OT_PORT_PLAN.md`.
     if std::env::var_os("FLAME_ALLOC_POOL").is_none() {
-        // SAFETY: single-threaded at this point, before env_logger
-        // init or any flame_core call. Env-var override preserved
-        // (set FLAME_ALLOC_POOL=1 to re-enable for experimentation).
         unsafe { std::env::set_var("FLAME_ALLOC_POOL", "0"); }
     }
     env_logger::init();
@@ -1453,6 +1429,12 @@ fn main() -> anyhow::Result<()> {
             }
         }
         AutogradContext::clear();
+        // 2026-05-14 Phase A: reset the static load-scratch slab AFTER
+        // the autograd tape is cleared. Saved tensors in the tape may
+        // hold references to slab-resident F32 sample tensors; resetting
+        // before tape clear would alias the next step's data into
+        // backward's saved values and scramble grads. Now safe.
+        flame_core::static_slab::reset_load_scratch();
 
         let _ = total_loss;
         eridiffusion_core::training::progress::log_step(
