@@ -398,6 +398,12 @@ fn main() -> anyhow::Result<()> {
     // call `cudaFree` directly, no caching. Costs ~0.7-1.0 s/step but
     // is the only proven-stable path for Klein 9B + --offload until
     // the F32-mempool root-cause work lands.
+    //
+    // Phase 2c (2026-05-14): tested cheap hypotheses H1 (finite mempool
+    // release threshold = 1 GiB) and H3 (skip per-checkpoint
+    // clear_pool_cache). Both FAILED — H1 crashed at step 2 with same
+    // signature; H3 crashed earlier (during step-1 backward op #42).
+    // Workaround remains active until Bug Fixer round 3 (H2/H4/H5).
     if std::env::var_os("FLAME_ALLOC_POOL").is_none() {
         // SAFETY: single-threaded at this point, before env_logger
         // init or any flame_core call. Env-var override preserved
