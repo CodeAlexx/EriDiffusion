@@ -978,7 +978,58 @@ fn main() -> anyhow::Result<()> {
     // is captured once for the bounds; reloads after that may change `cache_files.len()`.
     let mut last_epoch: Option<usize> = None;
 
+    // ── R2b: static-slab opt-in (post-load env-set) ──────────────────────
+    // Default-enable `FLAME_USE_STATIC_SLAB=1` HERE — after all persistent
+    // allocations (model weights, LoRA params, optimizer state, sampler
+    // buffers) are done. The slab dispatch is gated on BOTH this env var
+    // AND an active `StepSlabGuard` on the calling thread, so any
+    // allocations that happened during model load went through the legacy
+    // pool path regardless. Setting it now communicates intent: from this
+    // point on, allocations made INSIDE a guard scope are slab-routed.
+    //
+    // We respect a pre-existing value: passing `FLAME_USE_STATIC_SLAB=0`
+    // on the command line opts out and is the recommended regression test
+    // (see R2c smoke gate 1). This mirrors the `FLAME_ALLOC_POOL` pattern
+    // at the top of `main()`.
+    //
+    // DECISION: default-on (rather than default-off) matches the R2b spec
+    // ("DECISION: set FLAME_USE_STATIC_SLAB=1 ... right before entering
+    // the step loop"). R2c smoke gates run with the env explicitly set on
+    // the command line in either case; this default-on lets follow-on
+    // training commands pick up the slab path without any env plumbing.
+    if std::env::var_os("FLAME_USE_STATIC_SLAB").is_none() {
+        unsafe { std::env::set_var("FLAME_USE_STATIC_SLAB", "1"); }
+    }
+
     for step in start_step..args.steps {
+        // ── R2b: per-step transient slab scope ───────────────────────────
+        // The `StepSlabGuard` MUST be the FIRST allocation-creating local
+        // in this loop body. Rust's reverse drop order then guarantees
+        // every step-local Tensor's `CudaSlice` (and therefore its slab
+        // range registration) drops BEFORE the guard's `Drop` runs the
+        // strict reset/live-count check. Any allocation inserted above
+        // this line would cause that ordering to break — the
+        // `r2b_wiring_lint` test catches future drift.
+        //
+        // SAFETY: `StepSlabGuard` is intentionally !Send-by-convention
+        // (the thread-local active flag is per-thread); do NOT move this
+        // guard across threads.
+        //
+        // Validation and inline-sample blocks live OUTSIDE this scope
+        // (after the closing `}` below) because their lifetime patterns
+        // are different (they may retain tensors across what the trainer
+        // treats as a step boundary).
+        //
+        // DECISION: yield `loss_val` from the block — the save+sample
+        // block at the bottom of this iteration needs it for the
+        // iteration-tracker JSON sidecar. `total_loss` mutates inside the
+        // block (line `total_loss += loss_val;`) so it does not need to
+        // escape. `cur_lr` and `total_norm` are consumed inside the block
+        // by `log_step` and `OT_DEBUG`; they do not escape either.
+        let loss_val: f32 = {
+            let _slab_step =
+                flame_core::static_slab_v2::StepSlabGuard::enter(device.clone())?;
+
         // Phase 7: GPU health gate. When the monitor is unset (default) this
         // load is never reached. When set, abort flips on temp/ECC fault.
         if let Some(ref h) = health_handle {
@@ -1437,6 +1488,16 @@ fn main() -> anyhow::Result<()> {
             loss_val, total_norm, cur_lr, t_start, board.as_ref(),
         );
 
+        // ── R2b: end of per-step transient slab scope ─────────────────
+        // `_slab_step` is the LAST local in this inner block; Rust's
+        // reverse drop order drops every step-local `Tensor` first (and
+        // with it, its `CudaSlice` slab range), then runs the guard's
+        // strict `Drop`. The guard panics on `live_count != 0`, which
+        // is the contract that catches leaked slab tensors. Yield
+        // `loss_val` for the save+sample block below.
+            loss_val
+        };
+
         // Phase 2: validation eval pass (no_grad) every `validation_every_steps`.
         // step+1 because `step` here is 0-based; ValidationLoop::should_run
         // expects the 1-based completed-step number.
@@ -1891,4 +1952,149 @@ fn klein_encode_prompt(
     ids.resize(KLEIN_TXT_PAD_LEN, KLEIN_PAD_TOKEN_ID);
     let hidden = qwen.encode(&ids)?;
     Ok(hidden.to_dtype(DType::BF16)?)
+}
+
+// ── R2b: lint test ───────────────────────────────────────────────────────
+//
+// Static lint that re-reads `train_klein.rs` and asserts two invariants:
+//   1. The `for step in start_step..args.steps {` loop body opens with
+//      `let loss_val: f32 = {` followed immediately by
+//      `let _slab_step = flame_core::static_slab_v2::StepSlabGuard::enter(...)`.
+//      Catches future drift where someone inserts a tensor-creating local
+//      ABOVE the guard.
+//   2. Both validation (`if let Some(ref vloop) = validation_loop`) and
+//      save+sample (`if periodic && step_num %`) blocks live at a
+//      brace-depth STRICTLY LESS than the guard's brace. This catches
+//      future drift where someone re-nests them under the guard.
+//
+// This is a textual lint, not a semantic check. It does not exercise the
+// allocator or the slab — those live in `flame-core::static_slab_v2`
+// tests and the R2c smoke gates.
+#[cfg(test)]
+mod r2b_wiring_lint {
+    use std::path::PathBuf;
+
+    fn read_self() -> String {
+        // `file!()` is relative to the crate root in test builds.
+        let crate_dir = env!("CARGO_MANIFEST_DIR");
+        let path = PathBuf::from(crate_dir).join("src/bin/train_klein.rs");
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    /// 1. `StepSlabGuard::enter(...)` must be the first allocation-creating
+    ///    local in the loop body. We check that the SEQUENCE
+    ///    `for step in start_step..args.steps {` → `let loss_val: f32 = {`
+    ///    → `let _slab_step = flame_core::static_slab_v2::StepSlabGuard::enter`
+    ///    appears in order with no intervening `let` of any kind.
+    #[test]
+    fn guard_is_first_local_in_step_body() {
+        let src = read_self();
+        let loop_idx = src
+            .find("for step in start_step..args.steps {")
+            .expect("could not find the training for-loop header");
+        let after_loop = &src[loop_idx..];
+
+        // Find the outer `let loss_val: f32 = {` that opens the guard scope.
+        let outer_let_idx = after_loop
+            .find("let loss_val: f32 = {")
+            .expect("outer `let loss_val: f32 = {` not found after for-loop header — R2b wiring broken");
+
+        // Find the `let _slab_step = flame_core::static_slab_v2::StepSlabGuard::enter`
+        // that opens the guard.
+        let guard_idx = after_loop
+            .find("let _slab_step =")
+            .expect("`let _slab_step =` not found after for-loop header — R2b wiring broken");
+        assert!(
+            after_loop[guard_idx..].contains("flame_core::static_slab_v2::StepSlabGuard::enter"),
+            "`_slab_step` is not bound to `StepSlabGuard::enter` — R2b wiring broken",
+        );
+
+        // Outer wrapper must precede the guard.
+        assert!(
+            outer_let_idx < guard_idx,
+            "`let loss_val: f32 = {{` must precede `let _slab_step =` (got {} vs {})",
+            outer_let_idx,
+            guard_idx,
+        );
+
+        // Between the for-loop header and the outer wrapper, the only
+        // `let` permitted is the outer wrapper itself. Anything else means
+        // a tensor-creating local got inserted above the guard.
+        let before_wrapper = &after_loop[..outer_let_idx];
+        let stray_let = before_wrapper
+            .lines()
+            .find(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("let ") || trimmed.starts_with("let mut ")
+            });
+        assert!(
+            stray_let.is_none(),
+            "R2b wiring broken: found a `let` before the StepSlabGuard wrapper: {:?}",
+            stray_let,
+        );
+
+        // Between the wrapper and the guard, only comments + whitespace
+        // are permitted. Otherwise some other binding sneaked in.
+        let inside_wrapper_pre_guard =
+            &after_loop[outer_let_idx + "let loss_val: f32 = {".len()..guard_idx];
+        for line in inside_wrapper_pre_guard.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with("//") {
+                continue;
+            }
+            panic!(
+                "R2b wiring broken: non-comment, non-empty code between `let loss_val: f32 = {{` \
+                 and `let _slab_step = ...`: {:?}",
+                trimmed,
+            );
+        }
+    }
+
+    /// 2. Validation and save+sample blocks live at a brace-depth less than
+    ///    the guard's. We check this by locating the guard's opening `{`
+    ///    and matching to its closing `}`; the validation and sample
+    ///    blocks must start AFTER that closing brace.
+    #[test]
+    fn validation_and_sample_outside_guard_scope() {
+        let src = read_self();
+        let loop_idx = src
+            .find("for step in start_step..args.steps {")
+            .expect("training for-loop header not found");
+        let after_loop = &src[loop_idx..];
+
+        // The marker `// ── R2b: end of per-step transient slab scope`
+        // immediately precedes the closing `};` of the guard's inner
+        // block. Anchor on the marker, then find the `};` after it.
+        let end_marker = after_loop
+            .find("// ── R2b: end of per-step transient slab scope")
+            .expect("R2b end-marker not found — guard scope not properly closed");
+        let after_marker = &after_loop[end_marker..];
+        let close_idx = after_marker
+            .find("};")
+            .expect("`};` closing the guard scope not found after R2b end-marker");
+        let absolute_close = end_marker + close_idx + 2;
+
+        // Validation block must appear AFTER the guard's closing `};`.
+        let validation_idx = after_loop
+            .find("if let Some(ref vloop) = validation_loop {")
+            .expect("validation block not found");
+        assert!(
+            validation_idx > absolute_close,
+            "R2b wiring broken: validation block (offset {}) is INSIDE the guard scope (closes at offset {})",
+            validation_idx,
+            absolute_close,
+        );
+
+        // Save+sample block must appear AFTER the guard's closing `};`.
+        let sample_idx = after_loop
+            .find("if periodic && step_num %")
+            .expect("save+sample block not found");
+        assert!(
+            sample_idx > absolute_close,
+            "R2b wiring broken: save+sample block (offset {}) is INSIDE the guard scope (closes at offset {})",
+            sample_idx,
+            absolute_close,
+        );
+    }
 }
