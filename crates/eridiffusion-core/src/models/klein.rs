@@ -519,8 +519,6 @@ impl KleinModel {
             .map(|v| !matches!(v.as_str(), "0" | "" | "false" | "False"))
             .unwrap_or(false);
 
-        // native_layout=true: leave 2D .weight tensors in on-disk [Cout, Cin] layout.
-        // Klein model code calls `.transpose()` itself (via linear_3d) before matmul.
         let mut offloader = if use_streaming {
             log::info!("Klein BlockOffloader: streaming mode");
             crate::training::block_offload::BlockOffloader::load_streaming(
@@ -532,44 +530,10 @@ impl KleinModel {
                 &path_refs, &facilitator, self.device.clone(),
             )
         }
+        // native_layout=true: leave 2D .weight tensors in on-disk [Cout, Cin] layout.
+        // Klein model code calls `.transpose()` itself (via linear_3d) before matmul.
         .map(|o| o.with_native_layout(true))
         .map_err(|e| crate::EriDiffusionError::Model(format!("BlockOffloader: {e}")))?;
-
-        // Phase 4b (2026-05-13): opt-in `RingSlabAllocator` for slot
-        // weight allocations via `KLEIN_SLOT_RING=1` (default off until
-        // proven). Sized for two blocks' worth of Klein 9B weights at
-        // peak (~520 MB per block) plus headroom — 2 slabs × 1 GiB. Ring
-        // allocations register globally so `TensorStorage::Drop` routes
-        // their retire back to the ring instead of into the shared
-        // `cuda_alloc_pool`. This is the spec'd path to drop the
-        // `FLAME_ALLOC_POOL=0` workaround imposed by 4511140.
-        let use_slot_ring = std::env::var("KLEIN_SLOT_RING")
-            .ok()
-            .map(|v| !matches!(v.as_str(), "0" | "" | "false" | "False"))
-            .unwrap_or(false);
-        if use_slot_ring {
-            use flame_core::offload::ring_slab::RingSlabAllocator;
-            const RING_SLAB_BYTES: usize = 1usize << 30; // 1 GiB per slab
-            const RING_SLABS: usize = 2;
-            match RingSlabAllocator::new(self.device.clone(), RING_SLABS, RING_SLAB_BYTES) {
-                Ok(ring) => {
-                    let arc = std::sync::Arc::new(std::sync::Mutex::new(ring));
-                    log::info!(
-                        "Klein BlockOffloader: slot ring attached \
-                         (slabs={} × {} MiB; KLEIN_SLOT_RING=1)",
-                        RING_SLABS,
-                        RING_SLAB_BYTES / (1024 * 1024),
-                    );
-                    offloader = offloader.with_slot_ring(arc);
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Klein BlockOffloader: slot ring setup failed ({e}); \
-                         falling back to direct device.alloc"
-                    );
-                }
-            }
-        }
 
         // Phase 2 FlexTensor port: opt into Adaptive resident-set strategy via
         // FLAME_OFFLOAD_ADAPTIVE=1. Default (env unset / "0" / "false") preserves
@@ -1263,18 +1227,26 @@ impl KleinModel {
             let prefix_for_closure = prefix.clone();
 
             let block_out = if use_checkpoint {
-                // 2026-05-13 Phase 6: route through `checkpoint_offload_boundary`.
-                // Closure takes `&[Tensor]` (inputs[0]=img_in, inputs[1]=txt_in)
-                // so the original img_in/txt_in clones can drop after the cache
-                // push, freeing GPU between forward and backward. When the
-                // grow cache is installed via `set_grow_activation_cache`, the
-                // boundary inputs land in pinned RAM. When not installed,
-                // degrades to plain `checkpoint` semantics (autograd.rs).
-                flame_core::autograd::AutogradContext::checkpoint_offload_boundary(
+                // 2026-05-13 Gap 2: route through `checkpoint_offload` so the
+                // saved sub-tape goes to pinned RAM (via the global
+                // `ACTIVATION_POOL`) instead of being recomputed at backward
+                // time. Falls back to standard `checkpoint` when no pool is
+                // installed (see autograd.rs:2021-2024). Wiring in trainer:
+                // `setup_activation_offload(&device, &cfg)`.
+                flame_core::autograd::AutogradContext::checkpoint_offload(
                     &[img_in.clone(), txt_in.clone()],
-                    move |inputs: &[flame_core::Tensor]| {
-                        let img_in_b = inputs[0].clone();
-                        let txt_in_b = inputs[1].clone();
+                    move || {
+                        // 2026-05-11 perf: `await_block_handle` gates the
+                        // default stream on the slot's h2d_done event (no
+                        // host stall) when block bi was prefetched by the
+                        // previous iter's main-thread `prefetch_block(bi)`.
+                        // Backward replay misses the slot and falls into
+                        // await_block's slow path (sync prefetch+await) —
+                        // same as legacy `ensure_block`. Holding the
+                        // BlockHandle until the end of this closure means
+                        // its Drop records `compute_done` on the default
+                        // stream AFTER `Tensor::cat`, so the next prefetch
+                        // can reuse the slot via stream_wait_event.
                         let (lw, _handle): (HashMap<String, Tensor>, Option<crate::training::block_offload::BlockHandle>) =
                             if let Some(ref off) = offloader_for_closure {
                                 let handle = off.lock()
@@ -1292,11 +1264,16 @@ impl KleinModel {
                                 (layer_weights.clone(), None)
                             };
                         let (ni, nt) = double_block_forward_standalone(
-                            img_in_b, txt_in_b,
+                            img_in.clone(), txt_in.clone(),
                             (*img_mods_c).clone(), (*txt_mods_c).clone(),
                             pe_cos_c.clone(), pe_sin_c.clone(),
                             lw, lora.clone(), bi, nh, hd, inner,
                         )?;
+                        // Concat `(new_img, new_txt)` along the seq dim so
+                        // the checkpoint API (single output) works. We
+                        // narrow back to (img, txt) after the call.
+                        // `_handle` drops after this expression returns,
+                        // recording compute_done on the default stream.
                         Tensor::cat(&[&ni, &nt], 1)
                     },
                 )?
@@ -1476,11 +1453,18 @@ impl KleinModel {
             let prefix_for_closure = prefix.clone();
 
             x = if use_checkpoint {
-                // 2026-05-13 Phase 6: see double-block site for rationale.
-                flame_core::autograd::AutogradContext::checkpoint_offload_boundary(
+                // 2026-05-13 Gap 2: see double-block site for rationale.
+                flame_core::autograd::AutogradContext::checkpoint_offload(
                     &[x_in.clone()],
-                    move |inputs: &[flame_core::Tensor]| {
-                        let x_in_b = inputs[0].clone();
+                    move || {
+                        // 2026-05-11 perf: same async-prefetch protocol as
+                        // the double-block loop. `await_block_handle` gates
+                        // the default stream on h2d_done (no host stall) for
+                        // the block already prefetched by the prior iter's
+                        // main-thread `prefetch_block` call. Handle drops at
+                        // end of closure body — Tensor result has been
+                        // produced by then, kernels queued, so compute_done
+                        // is recorded AFTER all weight-reading kernels.
                         let (lw, _handle): (HashMap<String, Tensor>, Option<crate::training::block_offload::BlockHandle>) =
                             if let Some(ref off) = offloader_for_closure {
                                 let handle = off.lock()
@@ -1500,7 +1484,7 @@ impl KleinModel {
                                 (layer_weights.clone(), None)
                             };
                         single_block_forward_standalone(
-                            x_in_b, mods_c.clone(),
+                            x_in.clone(), mods_c.clone(),
                             pe_cos_c.clone(), pe_sin_c.clone(),
                             lw, lora.clone(),
                             i, nh, hd, inner, mlp,
