@@ -379,24 +379,16 @@ fn collect_klein_shards(path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> 
 
 fn main() -> anyhow::Result<()> {
     use rand::SeedableRng;
-    // Disable the flame-core CUDA alloc pool before any flame_core call.
-    // The pool is initialized via OnceLock on first read of FLAME_ALLOC_POOL,
-    // so this MUST be set before env_logger::init() (which itself doesn't
-    // touch the pool, but any subsequent flame_core call would lock it in).
-    //
-    // Why this matters for Klein 9B + --offload: empirical bisect (2026-05-13)
-    // showed Klein 9B + --offload hits `CUDA_ERROR_INVALID_VALUE` at step 2's
-    // `load_file` when the pool is enabled. Step 0 + 1 succeed; pool state
-    // gets corrupted somewhere between backward replay (which exercises the
-    // BlockOffloader) and step 2's first cudaMalloc. Disabling the pool
-    // (every drop → direct cudaFree) makes step 2+ run cleanly. Same root
-    // cause as the `feedback_prepare_bins_pool_off` memory and the
-    // HANDOFF_2026-05-08_KLEIN9B_TRAINING.md "FLAME_ALLOC_POOL=0 MANDATORY"
-    // note — we now enforce it in-trainer so users don't have to remember.
-    //
-    // Klein 4B without --offload still works either way (no offloader →
-    // no pool corruption), so this only changes behavior for the case
-    // that was broken without it.
+    // Klein 9B + --offload pool corruption: documented in memory
+    // `project_klein9b_step2_crash_isolation` and HANDOFF_2026-05-14.
+    // Failure mode is a CUDA driver mempool layer issue under offload
+    // fwd/bwd event/stream patterns — step-N+1 `cudaMalloc` returns
+    // `CUDA_ERROR_INVALID_VALUE`. Per-step `clear_pool_cache + trim`
+    // attempted 2026-05-14 produced NaN gradients at step 4 — the
+    // workaround is worse than the disease. The known-good fix is
+    // running with the pool off; the real flame-core-side fix
+    // (stream-event-aware pool reuse) is open work tracked at
+    // `flame-core/HANDOFF_2026-05-14_TRAINER_REGRESSION_FAILURE.md`.
     if std::env::var_os("FLAME_ALLOC_POOL").is_none() {
         // SAFETY: single-threaded at this point (before main's first action).
         unsafe { std::env::set_var("FLAME_ALLOC_POOL", "0"); }
