@@ -598,38 +598,60 @@ fn main() -> anyhow::Result<()> {
     // FP8 compression halves pinned bytes per slot (and roughly doubles
     // effective slot count); per-slot GPU staging is uncompressed BF16 size.
     // slots_per_block=2 keeps GPU staging within budget on 24 GB cards.
-    if args.activation_offload {
-        use eridiffusion_core::training::offload::{setup_activation_offload, OffloadConfig};
-        use flame_core::activation_offload::OffloadCompression;
-        let num_blocks = model.kconfig.num_double + model.kconfig.num_single;
-        let inner_dim = model.kconfig.inner_dim;
-        // Conservative max_seq: 1568 (44×24 image + 512 text) → 2048 padding.
-        // Klein 9B per-block MLP intermediate is `[1, seq, inner*9]` BF16 ≈
-        // 112 MB raw at seq=1520/inner=4096; observed via warning logs
-        // 2026-05-13. We size for inner*9 to fit; FP8 halves pinned cost.
-        let max_seq = 2048usize;
-        let mlp_factor = 9usize;
-        let max_activation_bytes = max_seq * inner_dim * mlp_factor * 2;
-        let slots_per_block = 2usize;
-        let total_slots = num_blocks * slots_per_block + 8;
-        let cfg = OffloadConfig {
-            num_blocks,
-            max_activation_bytes,
-            compression: OffloadCompression::FP8,
-            extra_slots: total_slots - num_blocks,
-        };
-        match setup_activation_offload(&device, &cfg) {
-            Ok((slots, bytes)) => log::info!(
-                "[activation_offload] {slots} slots, {:.2} GB pinned (FP8), slot={:.1} MB raw",
-                bytes as f64 / 1e9,
-                max_activation_bytes as f64 / 1e6,
-            ),
-            Err(e) => log::warn!(
-                "[activation_offload] setup failed ({e}); klein.rs:checkpoint_offload \
-                 will fall back to recompute (slower but no crash)"
-            ),
+    // Phase 6 (2026-05-13): Klein migrates to `OffloadCoordinator`. The
+    // coordinator owns the activation cache and installs it as the
+    // global cache for `checkpoint_offload_boundary`. Klein's
+    // BlockOffloader stays owned by the model (Phase 7b will collapse
+    // ownership into the coordinator).
+    //
+    // Boundary sizing — per-block input tensors:
+    //   double: [1, ~1520, inner] + [1, ~1520, inner]  ≈ 24 MB BF16
+    //   single: [1, ~1520, inner]                       ≈ 12 MB BF16
+    // Across 32 blocks: max ~768 MB BF16. A single 1 GB slab handles
+    // it; cache grows by appending if usage exceeds.
+    let _offload_coordinator = if args.activation_offload {
+        use flame_core::activation_offload::GrowOnDemandActivationCache;
+        use flame_core::offload::{BlockOffloadStrategy, HostRamBudget, OffloadCoordinator};
+        let slab_bytes = 1usize << 30; // 1 GB per slab
+        match GrowOnDemandActivationCache::new(device.clone(), slab_bytes) {
+            Ok(cache) => {
+                let strategy = BlockOffloadStrategy::all_resident();
+                let budget = HostRamBudget::unbounded();
+                match OffloadCoordinator::with_activation_cache_only(
+                    device.clone(),
+                    cache,
+                    strategy,
+                    budget,
+                ) {
+                    Ok(coord) => {
+                        log::info!(
+                            "[activation_offload] OffloadCoordinator installed \
+                             (slab={} MB, strategy=all_resident, budget=unbounded; \
+                             klein.rs:checkpoint_offload_boundary will push block I/O)",
+                            slab_bytes / (1024 * 1024)
+                        );
+                        Some(coord)
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "[activation_offload] OffloadCoordinator setup failed ({e}); \
+                             klein.rs:checkpoint_offload_boundary will fall back to plain checkpoint"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "[activation_offload] cache setup failed ({e}); \
+                     klein.rs:checkpoint_offload_boundary will fall back to plain checkpoint"
+                );
+                None
+            }
         }
-    }
+    } else {
+        None
+    };
 
     let params = model.parameters();
     log::info!("Loaded {} trainable LoRA tensors", params.len());
