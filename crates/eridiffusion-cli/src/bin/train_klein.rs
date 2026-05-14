@@ -1429,12 +1429,14 @@ fn main() -> anyhow::Result<()> {
             }
         }
         AutogradContext::clear();
-        // 2026-05-14 Phase A: reset the static load-scratch slab AFTER
-        // the autograd tape is cleared. Saved tensors in the tape may
-        // hold references to slab-resident F32 sample tensors; resetting
-        // before tape clear would alias the next step's data into
-        // backward's saved values and scramble grads. Now safe.
-        flame_core::static_slab::reset_load_scratch();
+        // 2026-05-14 Phase A+B: reset ALL static slabs AFTER the
+        // autograd tape is cleared. Saved tensors in the tape may hold
+        // references to slab-resident F32 buffers (sample-load,
+        // grad-scratch, activation); resetting before tape clear would
+        // alias the next step's data into backward's saved values.
+        // `reset_all_slabs` calls reset on all three Phase A+B slabs;
+        // each is a no-op when its slab is uninitialized.
+        flame_core::static_slab::reset_all_slabs();
 
         let _ = total_loss;
         eridiffusion_core::training::progress::log_step(
