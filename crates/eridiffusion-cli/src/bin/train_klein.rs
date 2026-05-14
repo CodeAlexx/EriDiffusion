@@ -590,48 +590,30 @@ fn main() -> anyhow::Result<()> {
     // FP8 compression halves pinned bytes per slot (and roughly doubles
     // effective slot count); per-slot GPU staging is uncompressed BF16 size.
     // slots_per_block=2 keeps GPU staging within budget on 24 GB cards.
-    // Phase 6 (2026-05-13): Klein migrates to `OffloadCoordinator`. The
-    // coordinator owns the activation cache and installs it as the
-    // global cache for `checkpoint_offload_boundary`. Klein's
-    // BlockOffloader stays owned by the model (Phase 7b will collapse
-    // ownership into the coordinator).
+    // Phase 6 wire-up (2026-05-14): Klein's `checkpoint_offload_boundary`
+    // call sites push block I/O activations into the global grow cache.
+    // `setup_grow_activation_cache` installs the cache via
+    // `flame_core::autograd::set_grow_activation_cache`; the returned
+    // Arc keeps the pinned slabs alive for the training run.
     //
     // Boundary sizing — per-block input tensors:
     //   double: [1, ~1520, inner] + [1, ~1520, inner]  ≈ 24 MB BF16
     //   single: [1, ~1520, inner]                       ≈ 12 MB BF16
-    // Across 32 blocks: max ~768 MB BF16. A single 1 GB slab handles
-    // it; cache grows by appending if usage exceeds.
-    let _offload_coordinator = if args.activation_offload {
-        use flame_core::activation_offload::GrowOnDemandActivationCache;
-        use flame_core::offload::{BlockOffloadStrategy, HostRamBudget, OffloadCoordinator};
-        let slab_bytes = 1usize << 30; // 1 GB per slab
-        match GrowOnDemandActivationCache::new(device.clone(), slab_bytes) {
-            Ok(cache) => {
-                let strategy = BlockOffloadStrategy::all_resident();
-                let budget = HostRamBudget::unbounded();
-                match OffloadCoordinator::with_activation_cache_only(
-                    device.clone(),
-                    cache,
-                    strategy,
-                    budget,
-                ) {
-                    Ok(coord) => {
-                        log::info!(
-                            "[activation_offload] OffloadCoordinator installed \
-                             (slab={} MB, strategy=all_resident, budget=unbounded; \
-                             klein.rs:checkpoint_offload_boundary will push block I/O)",
-                            slab_bytes / (1024 * 1024)
-                        );
-                        Some(coord)
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "[activation_offload] OffloadCoordinator setup failed ({e}); \
-                             klein.rs:checkpoint_offload_boundary will fall back to plain checkpoint"
-                        );
-                        None
-                    }
-                }
+    // Across 32 blocks: max ~768 MB BF16. A single 1 GB slab handles it;
+    // cache grows by appending if usage exceeds.
+    let _activation_cache = if args.activation_offload {
+        let slab_bytes = 1usize << 30; // 1 GB
+        match eridiffusion_core::training::offload::setup_grow_activation_cache(
+            &device,
+            slab_bytes,
+        ) {
+            Ok(arc) => {
+                log::info!(
+                    "[activation_offload] grow cache installed (slab={} MB); \
+                     klein.rs:checkpoint_offload_boundary will push block I/O",
+                    slab_bytes / (1024 * 1024)
+                );
+                Some(arc)
             }
             Err(e) => {
                 log::warn!(

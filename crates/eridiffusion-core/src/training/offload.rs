@@ -67,31 +67,28 @@ pub fn setup_activation_offload(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 7 helper: OffloadCoordinator setup for `checkpoint_offload_boundary`
+// Grow-on-demand activation cache setup for `checkpoint_offload_boundary`
 // ---------------------------------------------------------------------------
 
-/// Setup helper for trainers migrating to `checkpoint_offload_boundary`
-/// + `OffloadCoordinator`. Mirrors the boilerplate that train_klein wires
-/// inline today, so per-trainer Phase 7 migrations become a one-liner.
+/// Construct and install the global grow-on-demand activation cache used
+/// by `AutogradContext::checkpoint_offload_boundary`. Trainers that opt
+/// in via their `--activation-offload` CLI flag call this once after
+/// model load.
 ///
-/// Trainers that opt in via their `--activation-offload` CLI flag should
-/// call this once after model load. The returned coordinator is stashed
-/// by the caller; dropping it clears the global cache. The actual
-/// activation routing happens in the model's
-/// `AutogradContext::checkpoint_offload_boundary` call sites — this
-/// helper only installs the cache.
+/// `slab_bytes_hint` is the grow-cache's initial slab size. `0` uses
+/// the default (256 MB). For models with large per-block activations
+/// (Klein 9B, Wan22 14B-LoRA), `1 << 30` (1 GB) sizes a single slab to
+/// hold the working set without per-block grow events.
 ///
-/// `slab_bytes_hint` controls the grow-cache's slab size. Pass `0` to
-/// use the default (256 MB). For models with large per-block
-/// activations (Klein 9B, Wan22 14B), `1 << 30` (1 GB) is recommended
-/// so the cache grows a single slab rather than many small slabs.
+/// Returns the `Arc<Mutex<…>>` handle so the caller can keep it alive
+/// for the training run; dropping the Arc releases the pinned slabs.
+/// The handle is also installed as the global cache via
+/// `flame_core::autograd::set_grow_activation_cache`.
 pub fn setup_grow_activation_cache(
     device: &Arc<cudarc::driver::CudaDevice>,
     slab_bytes_hint: usize,
-    layer_offload_fraction: f32,
-) -> Result<flame_core::offload::OffloadCoordinator> {
+) -> Result<Arc<Mutex<flame_core::activation_offload::GrowOnDemandActivationCache>>> {
     use flame_core::activation_offload::GrowOnDemandActivationCache;
-    use flame_core::offload::{BlockOffloadStrategy, HostRamBudget, OffloadCoordinator};
 
     let slab_bytes = if slab_bytes_hint == 0 {
         256 * 1024 * 1024
@@ -100,8 +97,7 @@ pub fn setup_grow_activation_cache(
     };
 
     let cache = GrowOnDemandActivationCache::new(device.clone(), slab_bytes)?;
-    let strategy = BlockOffloadStrategy::new(layer_offload_fraction)?;
-    let budget = HostRamBudget::unbounded();
-
-    OffloadCoordinator::with_activation_cache_only(device.clone(), cache, strategy, budget)
+    let arc = Arc::new(Mutex::new(cache));
+    flame_core::autograd::set_grow_activation_cache(arc.clone())?;
+    Ok(arc)
 }
