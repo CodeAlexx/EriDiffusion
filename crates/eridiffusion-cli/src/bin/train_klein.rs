@@ -389,7 +389,14 @@ fn main() -> anyhow::Result<()> {
     // running with the pool off; the real flame-core-side fix
     // (stream-event-aware pool reuse) is open work tracked at
     // `flame-core/HANDOFF_2026-05-14_TRAINER_REGRESSION_FAILURE.md`.
-    if std::env::var_os("FLAME_ALLOC_POOL").is_none() {
+    // KLEIN_POOL_RING=1 opt-in: route pool cache-MISS allocations through a
+    // `flame_core::ring_alloc::RingAllocator` and SKIP the
+    // `FLAME_ALLOC_POOL=0` auto-disable. Phase 2a smoke gate. When unset,
+    // behavior is unchanged (pool off by default to avoid step-2 crash).
+    let klein_pool_ring = std::env::var("KLEIN_POOL_RING")
+        .map(|v| !v.is_empty() && v != "0" && v.to_ascii_lowercase() != "false")
+        .unwrap_or(false);
+    if !klein_pool_ring && std::env::var_os("FLAME_ALLOC_POOL").is_none() {
         // SAFETY: single-threaded at this point (before main's first action).
         unsafe { std::env::set_var("FLAME_ALLOC_POOL", "0"); }
     }
@@ -399,6 +406,34 @@ fn main() -> anyhow::Result<()> {
 
     flame_core::config::set_default_dtype(DType::BF16);
     let device = flame_core::global_cuda_device();
+
+    // Install ring as pool miss-allocator if opted in. Keep the Arc alive
+    // for the lifetime of `main` so the slabs (and any in-flight slice
+    // headers pointing into them) outlive the training loop. Per-step
+    // `clear_pool_cache + adapter.reset()` happens right after
+    // `AutogradContext::clear()` below.
+    let ring_adapter: Option<std::sync::Arc<flame_core::ring_alloc::RingPoolAdapter>> =
+        if klein_pool_ring {
+            // 8 slabs × 512 MiB = 4 GiB. Single-alloc cap = 512 MiB
+            // (Klein 9B's largest u16 buffers are ~302 MB at common
+            // batch/resolution).
+            let ring = flame_core::ring_alloc::RingAllocator::new(
+                device.clone(),
+                8,
+                512 * 1024 * 1024,
+            )?;
+            let adapter = std::sync::Arc::new(
+                flame_core::ring_alloc::RingPoolAdapter::new(ring),
+            );
+            flame_core::cuda_alloc_pool::install_miss_allocator(adapter.clone());
+            log::info!(
+                "KLEIN_POOL_RING=1: ring-backed cuda_alloc_pool miss path installed \
+                 (8 slabs × 512 MiB = 4 GiB; FLAME_ALLOC_POOL stays ON)"
+            );
+            Some(adapter)
+        } else {
+            None
+        };
 
     // ── LyCORIS bundle setup (Phase 2b — wired through KleinModel) ───────
     // Build a `LycorisBundleConfig` from the dedicated `--algo` flag set.
@@ -1289,6 +1324,10 @@ fn main() -> anyhow::Result<()> {
         let forward_only_bench = std::env::var("FLAME_FORWARD_ONLY_BENCH").is_ok();
         if forward_only_bench {
             AutogradContext::clear();
+            if let Some(ref adapter) = ring_adapter {
+                flame_core::cuda_alloc_pool::clear_pool_cache();
+                adapter.reset();
+            }
             eridiffusion_core::training::progress::log_step(
                 "Klein-fwd-only",
                 step, args.steps, dataset_len, args.batch_size.max(1),
@@ -1436,6 +1475,13 @@ fn main() -> anyhow::Result<()> {
             }
         }
         AutogradContext::clear();
+        // Phase 2a ring-pool: drain any free-list entries pointing into ring
+        // slabs (no cudaFree on external entries), then reset cursors so the
+        // next step's forward allocations start at offset 0.
+        if let Some(ref adapter) = ring_adapter {
+            flame_core::cuda_alloc_pool::clear_pool_cache();
+            adapter.reset();
+        }
 
         let _ = total_loss;
         eridiffusion_core::training::progress::log_step(
@@ -1509,6 +1555,10 @@ fn main() -> anyhow::Result<()> {
                         count += 1;
                     }
                     AutogradContext::clear();
+                    if let Some(ref adapter) = ring_adapter {
+                        flame_core::cuda_alloc_pool::clear_pool_cache();
+                        adapter.reset();
+                    }
                 }
                 if count > 0 {
                     let val_avg = sum / count as f32;
