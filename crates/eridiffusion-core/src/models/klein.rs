@@ -1175,8 +1175,8 @@ impl KleinModel {
         // kicks off `prefetch_block(i+1)` so the next iteration's H2D
         // overlaps with this iteration's default-stream compute. Without the
         // prime call, iter 0 would pay full sync H2D for block 0.
-        // Backward checkpoint replay does NOT use the pipeline (slot miss
-        // → sync fallback inside `await_block_handle`); same as pre-2026-05-11.
+        // Backward checkpoint replay uses the same idea in reverse inside
+        // each checkpoint closure (prefetch N-1 while recomputing N).
         if use_checkpoint {
             if let Some(ref off) = self.offloader {
                 off.lock()
@@ -1211,6 +1211,7 @@ impl KleinModel {
             let nh = self.kconfig.num_heads;
             let hd = self.kconfig.head_dim;
             let bi = i;
+            let backward_prefetch_idx = if bi > 0 { Some(bi - 1) } else { None };
 
             // Same closure-capture discipline as the single-block loop:
             // when offloading, capture only `(offloader, unified_idx,
@@ -1245,11 +1246,9 @@ impl KleinModel {
                         // 2026-05-11 perf: `await_block_handle` gates the
                         // default stream on the slot's h2d_done event (no
                         // host stall) when block bi was prefetched by the
-                        // previous iter's main-thread `prefetch_block(bi)`.
-                        // Backward replay misses the slot and falls into
-                        // await_block's slow path (sync prefetch+await) —
-                        // same as legacy `ensure_block`. Holding the
-                        // BlockHandle until the end of this closure means
+                        // prior forward iter or prior backward recompute.
+                        // Holding the BlockHandle until the end of this
+                        // closure means
                         // its Drop records `compute_done` on the default
                         // stream AFTER `Tensor::cat`, so the next prefetch
                         // can reuse the slot via stream_wait_event.
@@ -1261,6 +1260,16 @@ impl KleinModel {
                                     .await_block_handle(bi)
                                     .map_err(|e| flame_core::FlameError::InvalidInput(
                                         format!("Klein double {bi}: offloader await_block_handle({bi}): {e}")))?;
+                                if flame_core::autograd::AutogradContext::is_checkpoint_recompute() {
+                                    if let Some(next_idx) = backward_prefetch_idx {
+                                        off.lock()
+                                            .map_err(|e| flame_core::FlameError::InvalidInput(
+                                                format!("Klein double {bi}: offloader lock for backward prefetch: {e}")))?
+                                            .prefetch_block(next_idx)
+                                            .map_err(|e| flame_core::FlameError::InvalidInput(
+                                                format!("Klein double {bi}: backward prefetch_block({next_idx}): {e}")))?;
+                                    }
+                                }
                                 let mut m = HashMap::with_capacity(handle.weights().len());
                                 for (k, v) in handle.weights().iter() {
                                     if k.starts_with(&prefix_for_closure) { m.insert(k.clone(), v.clone()); }
@@ -1395,6 +1404,13 @@ impl KleinModel {
 
             let prefix = format!("single_blocks.{i}.");
             let unified_idx = self.kconfig.num_double + i;
+            let backward_prefetch_idx = if i > 0 {
+                Some(self.kconfig.num_double + i - 1)
+            } else if self.kconfig.num_double > 0 {
+                Some(self.kconfig.num_double - 1)
+            } else {
+                None
+            };
             let lora_base = self.kconfig.num_double * DOUBLE_LORA_SLOTS + i * SINGLE_LORA_SLOTS;
             let lora: Option<BlockAdapterSlice> = if self.is_lora {
                 if let Some(ref lyc) = self.lyc_adapters {
@@ -1482,6 +1498,16 @@ impl KleinModel {
                                     .await_block_handle(unified_idx)
                                     .map_err(|e| flame_core::FlameError::InvalidInput(
                                         format!("Klein single {i}: offloader await_block_handle({unified_idx}): {e}")))?;
+                                if flame_core::autograd::AutogradContext::is_checkpoint_recompute() {
+                                    if let Some(next_idx) = backward_prefetch_idx {
+                                        off.lock()
+                                            .map_err(|e| flame_core::FlameError::InvalidInput(
+                                                format!("Klein single {i}: offloader lock for backward prefetch: {e}")))?
+                                            .prefetch_block(next_idx)
+                                            .map_err(|e| flame_core::FlameError::InvalidInput(
+                                                format!("Klein single {i}: backward prefetch_block({next_idx}): {e}")))?;
+                                    }
+                                }
                                 let mut m = HashMap::with_capacity(handle.weights().len());
                                 for (k, v) in handle.weights().iter() {
                                     if k.starts_with(&prefix_for_closure) {
