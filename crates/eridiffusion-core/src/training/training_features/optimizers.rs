@@ -3,7 +3,9 @@
 //! API surface matches `flame_core::adam::AdamW` so callers just swap the
 //! type — `step(params)` and `zero_grad(params)` take `&[Parameter]` and
 //! the constructors take scalars (no `&[Parameter]` at construction time;
-//! state is allocated lazily on first `step`).
+//! most state is allocated lazily on first `step`). AdamW also exposes an
+//! explicit state prewarm hook for trainers that use transient per-step
+//! allocators.
 //!
 //! Tensor-level implementations (no fused CUDA kernels) — same path quality
 //! as the pre-fused PyTorch references. AdamW8bit is a partial port: state
@@ -197,6 +199,19 @@ impl Optimizer {
             Self::RAdamScheduleFree(o) => o.step(params),
             Self::AdamWScheduleFree(o) => o.step(params),
             Self::StableAdamWScheduleFree(o) => o.step(params),
+        }
+    }
+
+    /// Materialize persistent device-resident optimizer state before a
+    /// transient per-step allocator scope.
+    ///
+    /// R2b static-slab training relies on this for AdamW: its `m`/`v` tensors
+    /// intentionally live across steps, so they must not be first allocated
+    /// inside `StepSlabGuard`.
+    pub fn ensure_state_initialized(&mut self, params: &[Parameter]) -> Result<()> {
+        match self {
+            Self::AdamW(o) => o.ensure_state_initialized(params),
+            _ => Ok(()),
         }
     }
 
@@ -2625,4 +2640,3 @@ mod tests {
         );
     }
 }
-

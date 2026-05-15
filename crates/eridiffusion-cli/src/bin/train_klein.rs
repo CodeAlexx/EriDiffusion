@@ -978,14 +978,29 @@ fn main() -> anyhow::Result<()> {
     // is captured once for the bounds; reloads after that may change `cache_files.len()`.
     let mut last_epoch: Option<usize> = None;
 
+    // R2b Bug Fixer: AdamW's moment tensors are persistent optimizer state.
+    // Materialize them before any per-step `StepSlabGuard` can route
+    // allocations into the transient slab. Full-resume state is applied
+    // above; this call preserves loaded m/v and fills any missing entries.
+    {
+        let _g = AutogradContext::no_grad();
+        opt.ensure_state_initialized(&params)
+            .map_err(|e| anyhow::anyhow!("optimizer state prewarm failed: {e}"))?;
+    }
+    log::info!(
+        "[static-slab] optimizer={} state prewarm pass completed for {} trainable tensors before guarded step scope",
+        opt.kind().as_str(),
+        params.len(),
+    );
+
     // ── R2b: static-slab opt-in (post-load env-set) ──────────────────────
     // Default-enable `FLAME_USE_STATIC_SLAB=1` HERE — after all persistent
-    // allocations (model weights, LoRA params, optimizer state, sampler
-    // buffers) are done. The slab dispatch is gated on BOTH this env var
-    // AND an active `StepSlabGuard` on the calling thread, so any
-    // allocations that happened during model load went through the legacy
-    // pool path regardless. Setting it now communicates intent: from this
-    // point on, allocations made INSIDE a guard scope are slab-routed.
+    // allocations (model weights, LoRA params, AdamW state, sampler buffers)
+    // are done. The slab dispatch is gated on BOTH this env var AND an
+    // active `StepSlabGuard` on the calling thread, so any allocations that
+    // happened before the guarded step body went through the legacy pool path
+    // regardless. Setting it now communicates intent: from this point on,
+    // allocations made INSIDE a guard scope are slab-routed.
     //
     // We respect a pre-existing value: passing `FLAME_USE_STATIC_SLAB=0`
     // on the command line opts out and is the recommended regression test
